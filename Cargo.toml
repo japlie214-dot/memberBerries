@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/memb", "crates/memb-core", "crates/memb-store"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+redb = "2.6"
+regex = "1"

@@ -1,0 +1,10 @@
+/memd-phase*-windows/
+/phase_*.md
+/shared_cli_memory_design_plan.md
+/.claude/
+/target/
+/dist/
+/.env*
+*.redb
+*.gguf
+__pycache__/
