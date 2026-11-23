@@ -2,6 +2,7 @@
 /phase_*.md
 /shared_cli_memory_design_plan.md
 /.claude/
+/board/
 /target/
 /dist/
 /.env*

@@ -1,0 +1,9 @@
+{
+  "manifest_version": "0.3",
+  "name": "memb",
+  "version": "0.1.0",
+  "description": "Project-scoped local memory with explicit writes",
+  "author": {"name": "memberBerries contributors"},
+  "server": {"type":"binary","entry_point":"server/memb.exe","mcp_config":{"command":"${__dirname}/server/memb.exe","args":["mcp"]}},
+  "compatibility": {"platforms":["win32"]}
+}

@@ -1,0 +1,1 @@
+{"mcpServers":{"memb":{"command":"${CLAUDE_PLUGIN_ROOT}/server/memb.exe","args":["mcp"]}}}
