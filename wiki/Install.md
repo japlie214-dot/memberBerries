@@ -32,7 +32,7 @@ To uninstall, remove only the `memb` extension/plugin or configuration entry and
 
 ### Verification matrix
 
-The Windows runtime passed an actual stdio MCP handshake and tool round-trip across separate processes, including restart and logical deletion. Native Cowork import and access to the Windows executable, Desktop extension import, and end-to-end AGY/Codex plugin discovery and model-mediated tool use require separate host smoke tests. An installed CLI version or a valid archive alone does not prove integration.
+The Windows runtime and the executables extracted from all four archives passed actual stdio MCP tool round-trips from separate processes, including restart and logical deletion. Codex CLI 0.156.0 passed manual `mcp add`, `get`, and `remove` in an isolated `CODEX_HOME`; this did not launch the server through a Codex model session. AGY 1.5.14 was available for CLI syntax checks only. Native Cowork and Desktop import, AGY/Codex plugin discovery, and a cross-host round-trip inside the real clients remain unverified.
 
 ### Cross-client smoke test
 
