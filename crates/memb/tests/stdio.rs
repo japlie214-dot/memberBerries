@@ -85,7 +85,32 @@ fn shared_memory_scope_consent_and_graph() {
     let mut a = Client::start(&root, "alpha");
     let mut b = Client::start(&root, "alpha");
     let tools = a.rpc("tools/list", json!({}));
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 4);
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 6);
+    let opener = tools
+        .iter()
+        .find(|t| t["name"] == "open_inspector")
+        .unwrap();
+    let uri = &opener["_meta"]["ui"]["resourceUri"];
+    let page = a.rpc("resources/read", json!({"uri":uri}));
+    assert_eq!(
+        page["result"]["contents"][0]["mimeType"],
+        "text/html;profile=mcp-app"
+    );
+    let open = a.rpc(
+        "tools/call",
+        json!({"name":"open_inspector","arguments":{}}),
+    );
+    assert_eq!(
+        open["result"]["structuredContent"],
+        json!({"project":"alpha"})
+    );
+    let fresh = a.rpc(
+        "tools/call",
+        json!({"name":"inspector_snapshot","arguments":{}}),
+    );
+    assert_eq!(fresh["result"]["structuredContent"]["counts"]["total"], 0);
+    assert!(!root.exists());
     assert!(
         a.tool("remember", save("topic", "Orchard", json!([]), false))
             .0

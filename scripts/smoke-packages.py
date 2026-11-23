@@ -25,7 +25,7 @@ def call(exe, store, tool, args):
     assert not run.stderr, run.stderr
     init, tools, response = map(json.loads, run.stdout.splitlines())
     assert init["result"]["protocolVersion"] == "2025-06-18"
-    assert {t["name"] for t in tools["result"]["tools"]} == {"remember", "search", "inspect", "forget"}
+    assert {t["name"] for t in tools["result"]["tools"]} == {"remember", "search", "inspect", "forget", "open_inspector", "inspector_snapshot"}
     assert not response["result"]["isError"], response
     return json.loads(response["result"]["content"][0]["text"])
 
@@ -47,11 +47,11 @@ def main(temp_parent):
                 paths[name] = path
         store = tmp / "data"
         note = call(paths["memb.plugin"], store, "remember", {"title": "Orchard", "body": "Check the hose each Friday", "kind": "topic", "parents": [], "confirmed": True})["note"]
-        for name in ("memb.mcpb", "memb-agy.zip", "memb-codex.zip"):
+        for name in ("memb-agy.zip", "memb-codex.zip"):
             assert call(paths[name], store, "search", {"query": "orchard"})["notes"] == [note]
         assert call(paths["memb-codex.zip"], store, "forget", {"id": note["id"], "confirmed": True})["removed"]
         assert call(paths["memb.plugin"], store, "inspect", {"id": note["id"]})["note"] is None
-        print("PASS: all four packaged binaries shared memory from separate stdio processes")
+        print("PASS: all three packaged binaries shared memory from separate stdio processes")
 
 
 if __name__ == "__main__":

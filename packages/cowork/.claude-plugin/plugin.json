@@ -1,1 +1,1 @@
-{"name":"memb","version":"0.1.0","description":"Explicit, project-scoped local memory. Requires access to the Windows runtime."}
+{"name":"memb","version":"0.2.0","description":"Project-scoped local memory with a read-only inspector. Requires access to the Windows runtime."}

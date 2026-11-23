@@ -138,6 +138,23 @@ impl Store {
         })
     }
 
+    /// Current counts plus one bounded page; never begins a write transaction.
+    pub fn snapshot(&self, scope: &Scope, after: u64, query: &str) -> Result<serde_json::Value> {
+        if query.len() > 512 {
+            return Err("query exceeds 512 bytes".into());
+        }
+        let query = query.to_lowercase();
+        self.access(scope, false, |p| {
+            let mut counts = [0; 3];
+            for n in p.notes.values() {
+                counts[match n.kind { Kind::Topic => 0, Kind::Knowledge => 1, Kind::Claim => 2 }] += 1;
+            }
+            let mut page: Vec<_> = p.notes.values().filter(|n| n.id > after && (query.is_empty() || n.title.to_lowercase().contains(&query) || n.body.to_lowercase().contains(&query))).take(13).collect();
+            let next = if page.len() > 12 { page.pop(); Some(page[11].id.to_string()) } else { None };
+            Ok(serde_json::json!({"project":scope.as_str(), "counts":{"total":p.notes.len(),"topics":counts[0],"knowledge":counts[1],"claims":counts[2]}, "notes":page,"next":next}))
+        })
+    }
+
     pub fn inspect(&self, scope: &Scope, id: u64) -> Result<Option<Note>> {
         self.access(scope, false, |p| Ok(p.notes.get(&id).cloned()))
     }

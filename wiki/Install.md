@@ -1,11 +1,10 @@
 # Install and verify
 
-Windows x64 is the first target. The four archives contain the same executable. Use one Windows account and keep all clients on the same data directory; otherwise they cannot share notes. No archive installs a scheduled task, model, API client, or hook. Keep the executable in a stable directory; do not run it directly from the ZIP viewer.
+Windows x64 is the first target. The archives contain the same executable. Claude Cowork only needs `memb.plugin`. Use one Windows account and keep all clients on the same data directory; otherwise they cannot share notes. No archive installs a scheduled task, model, API client, or hook. Keep the executable in a stable directory; do not run it directly from the ZIP viewer.
 
 | Client | Package | Setup |
 |---|---|---|
 | Claude Desktop Cowork | `memb.plugin` | Use the Cowork plugin import UI if available. The skill and MCP registration are bundled. If tools do not appear, the current Cowork sandbox or policy may not let it launch a Windows process. Do not expose local memory to the network to bypass this. |
-| Claude Desktop Chat | `memb.mcpb` | Open the extension file in Claude Desktop, review its local MCP permissions, and enable it. If manual local MCP is supported, add `mcpServers.memb` to `%APPDATA%\Claude\claude_desktop_config.json`, then restart Desktop. |
 | Antigravity | `memb-agy.zip` | Extract to a stable directory. For the predictable manual route, merge `mcpServers.memb` into `.agents/mcp_config.json` in a trusted workspace or `~/.gemini/config/mcp_config.json` for the account. Use the absolute executable path. |
 | Codex | `memb-codex.zip` | Extract to a stable directory. Register it with `codex mcp add memb -- 'C:\Tools\memb\server\memb.exe' mcp`, or add `[mcp_servers.memb]` to a trusted project's `.codex/config.toml`. The ZIP is not consumed by Claude's import UI. |
 
@@ -32,7 +31,7 @@ To uninstall, remove only the `memb` extension/plugin or configuration entry and
 
 ### Verification matrix
 
-The Windows runtime and the executables extracted from all four archives passed actual stdio MCP tool round-trips from separate processes, including restart and logical deletion. Codex CLI 0.156.0 passed manual `mcp add`, `get`, and `remove` in an isolated `CODEX_HOME`; this did not launch the server through a Codex model session. AGY 1.5.14 was available for CLI syntax checks only. Native Cowork and Desktop import, AGY/Codex plugin discovery, and a cross-host round-trip inside the real clients remain unverified.
+The Windows runtime and packaged executables passed MCP round-trips, including restart and logical deletion. Cowork imported v0.1.0 and successfully invoked its native `search` tool. Cowork rendering the new v0.2.0 MCP App is not yet verified. Codex CLI 0.156.0 passed manual registration and removal in an isolated profile, not a model-driven call. AGY 1.5.14 was checked for CLI syntax only.
 
 ### Cross-client smoke test
 

@@ -4,7 +4,7 @@ A Windows-first, local project memory tool shared across assistants. Save a revi
 
 ## Get started
 
-Use `memb.plugin` for Claude Cowork, `memb.mcpb` for Claude Desktop Chat, and the separate AGY and Codex archives for those clients. See [installation and smoke tests](wiki/Install.md) for manual stdio setup and the verification status of each host. Native import is not implied by a working MCP runtime.
+Use `memb.plugin` for Claude Cowork; no `.mcpb` is needed. Separate AGY and Codex archives remain available for those clients. Run `memb.exe web` for the local read-only [Memory Inspector](wiki/Inspector.md), or open it in a compatible MCP Apps host. See [installation and smoke tests](wiki/Install.md) for manual stdio setup and the verification status of each host. Native import is not implied by a working MCP runtime.
 
 Start with a user-approved topic note, then add knowledge linked to a topic and claims linked to knowledge. Search, inspect, or explicitly forget a note under the same project slug. See the [tool guide](wiki/Memory.md) for examples and privacy limits.
 
