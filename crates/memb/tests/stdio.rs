@@ -92,6 +92,13 @@ fn shared_memory_scope_consent_and_graph() {
         .find(|t| t["name"] == "open_inspector")
         .unwrap();
     let uri = &opener["_meta"]["ui"]["resourceUri"];
+    assert_eq!(opener["_meta"]["ui"]["visibility"], json!(["model"]));
+    let snapshot_tool = tools
+        .iter()
+        .find(|t| t["name"] == "inspector_snapshot")
+        .unwrap();
+    assert_eq!(snapshot_tool["_meta"]["ui"]["visibility"], json!(["app"]));
+    assert_eq!(&snapshot_tool["_meta"]["ui"]["resourceUri"], uri);
     let page = a.rpc("resources/read", json!({"uri":uri}));
     assert_eq!(
         page["result"]["contents"][0]["mimeType"],
@@ -110,6 +117,7 @@ fn shared_memory_scope_consent_and_graph() {
         json!({"name":"inspector_snapshot","arguments":{}}),
     );
     assert_eq!(fresh["result"]["structuredContent"]["counts"]["total"], 0);
+    assert_eq!(fresh["result"]["content"][0]["type"], "text");
     assert!(!root.exists());
     assert!(
         a.tool("remember", save("topic", "Orchard", json!([]), false))

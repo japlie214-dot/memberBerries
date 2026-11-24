@@ -3,7 +3,7 @@ use memb_store::Store;
 use serde_json::{json, Value};
 
 pub const HTML: &str = include_str!("viewer.html");
-pub const URI: &str = "ui://memb/inspector.html";
+pub const URI: &str = "ui://memb/inspector-v0.2.1.html";
 const MIME: &str = "text/html;profile=mcp-app";
 
 pub fn resource() -> Value {
@@ -21,8 +21,8 @@ pub fn tools() -> [Value; 2] {
         "after":{"type":"string","pattern":"^[0-9]{1,20}$"}
     }});
     [
-        json!({"name":"open_inspector","description":"Open the human read-only memory inspector without sending any notes to the model. Use the requested project if supplied.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"project":schema["properties"]["project"]}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false},"_meta":{"ui":{"resourceUri":URI},"ui/resourceUri":URI}}),
-        json!({"name":"inspector_snapshot","description":"Get one bounded page for the inspector UI; read-only.","inputSchema":schema,"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false},"_meta":{"ui":{"visibility":["app"]}}}),
+        json!({"name":"open_inspector","description":"Open the human read-only memory inspector without sending any notes to the model. Use the requested project if supplied.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"project":schema["properties"]["project"]}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false},"_meta":{"ui":{"resourceUri":URI,"visibility":["model"]},"ui/resourceUri":URI}}),
+        json!({"name":"inspector_snapshot","description":"Get one bounded page for the inspector UI; read-only.","inputSchema":schema,"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false},"_meta":{"ui":{"resourceUri":URI,"visibility":["app"]}}}),
     ]
 }
 

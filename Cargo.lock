@@ -25,7 +25,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "memb"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "memb-core",
  "memb-store",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "memb-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "regex",
  "serde",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "memb-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "memb-core",
  "redb",

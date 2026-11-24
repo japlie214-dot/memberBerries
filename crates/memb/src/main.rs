@@ -166,7 +166,7 @@ impl Server {
                     let result = if name == "open_inspector" {
                         viewer::open(self.pinned.as_ref(), &p["arguments"])
                     } else {
-                        viewer::snapshot(&self.store, self.pinned.as_ref(), &p["arguments"]).map(|v| json!({"content":[],"structuredContent":v}))
+                        viewer::snapshot(&self.store, self.pinned.as_ref(), &p["arguments"]).map(|v| json!({"content":[{"type":"text","text":"Read-only memory snapshot available to inspector."}],"structuredContent":v}))
                     }.unwrap_or_else(|message| json!({"isError":true,"content":[{"type":"text","text":message}]}));
                     return Some(json!({"jsonrpc":"2.0","id":id,"result":result}));
                 }
