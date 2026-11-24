@@ -247,15 +247,18 @@ fn handle(
             );
             respond(stream, "200 OK", HTML, page.as_bytes(), &policy)
         }
-        "/api/snapshot" => {
+        "/api/snapshot" | "/api/projects" | "/api/graph" => {
             if request.header("x-memb-viewer") != Some(access_key) {
                 return reject(stream, "403 Forbidden");
             }
-            let (status, value) =
-                match args(query).and_then(|args| viewer::snapshot(store, pinned, &args)) {
-                    Ok(value) => ("200 OK", value),
-                    Err(message) => ("400 Bad Request", json!({"error":message})),
-                };
+            let (status, value) = match args(query).and_then(|args| match path {
+                "/api/projects" => viewer::projects(store, pinned, &args),
+                "/api/graph" => viewer::graph(store, pinned, &args),
+                _ => viewer::snapshot(store, pinned, &args),
+            }) {
+                Ok(value) => ("200 OK", value),
+                Err(message) => ("400 Bad Request", json!({"error":message})),
+            };
             respond(stream, status, JSON, value.to_string().as_bytes(), "")
         }
         _ => reject(stream, "404 Not Found"),
@@ -387,7 +390,17 @@ mod tests {
         assert!(html.contains(&format!("<script nonce=\"{nonce}\">")));
         assert!(html.contains(&format!("<style nonce=\"{nonce}\">")));
 
-        assert!(exchange("/api/snapshot", "").starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        for path in ["/api/snapshot", "/api/projects", "/api/graph"] {
+            assert!(exchange(path, "").starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        }
+        let projects = exchange("/api/projects", "X-Memb-Viewer: 1\r\n");
+        let data: Value = serde_json::from_str(projects.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(data["projects"], json!(["example"]));
+        let graph = exchange("/api/graph?project=example", "X-Memb-Viewer: 1\r\n");
+        let data: Value = serde_json::from_str(graph.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(data["notes"], json!([]));
+        assert!(exchange("/api/graph?project=wrong", "X-Memb-Viewer: 1\r\n")
+            .starts_with("HTTP/1.1 400 Bad Request\r\n"));
         let snapshot = exchange("/api/snapshot?after=0", "X-Memb-Viewer: 1\r\n");
         assert!(snapshot.starts_with("HTTP/1.1 200 OK\r\n"));
         let data: Value = serde_json::from_str(snapshot.split_once("\r\n\r\n").unwrap().1).unwrap();

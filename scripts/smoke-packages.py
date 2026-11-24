@@ -25,7 +25,7 @@ def call(exe, store, tool, args):
     assert not run.stderr, run.stderr
     init, tools, response = map(json.loads, run.stdout.splitlines())
     assert init["result"]["protocolVersion"] == "2025-06-18"
-    assert {t["name"] for t in tools["result"]["tools"]} == {"remember", "search", "inspect", "forget", "open_inspector", "inspector_snapshot"}
+    assert {t["name"] for t in tools["result"]["tools"]} == {"remember", "search", "inspect", "forget", "open_inspector", "inspector_snapshot", "inspector_projects", "inspector_graph"}
     assert not response["result"]["isError"], response
     return json.loads(response["result"]["content"][0]["text"])
 

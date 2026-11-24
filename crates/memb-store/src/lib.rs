@@ -43,31 +43,7 @@ impl Store {
         if !write && !path.try_exists()? {
             return f(&mut Project::default());
         }
-        fs::create_dir_all(&self.0)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(self.0.join("store.lock"))?;
-        // Windows file locking requires a file open for writing; keep the lock file stable.
-        let start = Instant::now();
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock)
-                    if start.elapsed() < Duration::from_secs(3) =>
-                {
-                    thread::sleep(Duration::from_millis(20))
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(
-                        io::Error::new(io::ErrorKind::TimedOut, "memory store is busy").into(),
-                    )
-                }
-                Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
-            }
-        }
+        let _lock = self.lock()?;
         if !write && !path.try_exists()? {
             return f(&mut Project::default());
         }
@@ -111,6 +87,62 @@ impl Store {
         }
     }
 
+    fn lock(&self) -> Result<fs::File> {
+        fs::create_dir_all(&self.0)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.0.join("store.lock"))?;
+        // Windows file locking requires a file open for writing; keep the lock file stable.
+        let start = Instant::now();
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock)
+                    if start.elapsed() < Duration::from_secs(3) =>
+                {
+                    thread::sleep(Duration::from_millis(20))
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(
+                        io::Error::new(io::ErrorKind::TimedOut, "memory store is busy").into(),
+                    )
+                }
+                Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
+            }
+        }
+        Ok(lock)
+    }
+
+    /// List existing project names without creating a database for an empty store.
+    pub fn projects(&self) -> Result<Vec<String>> {
+        let path = self.0.join("memory.redb");
+        if !path.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let _lock = self.lock()?;
+        if !path.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let db = Database::builder()
+            .set_cache_size(16 * 1024 * 1024)
+            .open(path)?;
+        let txn = db.begin_read()?;
+        let table = match txn.open_table(PROJECTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut names = Vec::new();
+        for item in table.iter()? {
+            let (key, _) = item?;
+            names.push(key.value().to_owned());
+        }
+        Ok(names)
+    }
+
     pub fn remember(&self, scope: &Scope, draft: Draft) -> Result<Note> {
         let mut note = draft.into_note(0)?;
         self.access(scope, true, |project| {
@@ -152,6 +184,19 @@ impl Store {
             let mut page: Vec<_> = p.notes.values().filter(|n| n.id > after && (query.is_empty() || n.title.to_lowercase().contains(&query) || n.body.to_lowercase().contains(&query))).take(13).collect();
             let next = if page.len() > 12 { page.pop(); Some(page[11].id.to_string()) } else { None };
             Ok(serde_json::json!({"project":scope.as_str(), "counts":{"total":p.notes.len(),"topics":counts[0],"knowledge":counts[1],"claims":counts[2]}, "notes":page,"next":next}))
+        })
+    }
+
+    /// Read one bounded project graph in a single consistent transaction.
+    pub fn graph(&self, scope: &Scope) -> Result<serde_json::Value> {
+        self.access(scope, false, |p| {
+            let mut counts = [0usize; 3];
+            let notes: Vec<_> = p.notes.values().map(|note| {
+                counts[match note.kind { Kind::Topic => 0, Kind::Knowledge => 1, Kind::Claim => 2 }] += 1;
+                // JSON numbers cannot represent all u64 IDs exactly in JavaScript.
+                serde_json::json!({"id":note.id.to_string(),"title":note.title,"body":note.body,"kind":note.kind,"parents":note.parents.iter().map(u64::to_string).collect::<Vec<_>>()})
+            }).collect();
+            Ok(serde_json::json!({"project":scope.as_str(),"notes":notes,"counts":{"total":p.notes.len(),"topics":counts[0],"knowledge":counts[1],"claims":counts[2]}}))
         })
     }
 

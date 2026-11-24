@@ -162,12 +162,21 @@ impl Server {
                 let Some(name) = p["name"].as_str() else {
                     return Some(error(id, -32602, "Missing tool name"));
                 };
-                if matches!(name, "open_inspector" | "inspector_snapshot") {
-                    let result = if name == "open_inspector" {
-                        viewer::open(self.pinned.as_ref(), &p["arguments"])
-                    } else {
-                        viewer::snapshot(&self.store, self.pinned.as_ref(), &p["arguments"]).map(|v| json!({"content":[{"type":"text","text":"Read-only memory snapshot available to inspector."}],"structuredContent":v}))
-                    }.unwrap_or_else(|message| json!({"isError":true,"content":[{"type":"text","text":message}]}));
+                if matches!(
+                    name,
+                    "open_inspector"
+                        | "inspector_snapshot"
+                        | "inspector_projects"
+                        | "inspector_graph"
+                ) {
+                    let args = &p["arguments"];
+                    let result = match name {
+                        "open_inspector" => viewer::open(self.pinned.as_ref(), args),
+                        "inspector_projects" => viewer::projects(&self.store, self.pinned.as_ref(), args),
+                        "inspector_graph" => viewer::graph(&self.store, self.pinned.as_ref(), args),
+                        _ => viewer::snapshot(&self.store, self.pinned.as_ref(), args),
+                    }.map(|v| if name == "open_inspector" { v } else { json!({"content":[{"type":"text","text":"Read-only inspector data available."}],"structuredContent":v}) })
+                     .unwrap_or_else(|message| json!({"isError":true,"content":[{"type":"text","text":message}]}));
                     return Some(json!({"jsonrpc":"2.0","id":id,"result":result}));
                 }
                 if !matches!(name, "remember" | "search" | "inspect" | "forget") {

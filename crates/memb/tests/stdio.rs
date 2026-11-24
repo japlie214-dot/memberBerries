@@ -86,7 +86,7 @@ fn shared_memory_scope_consent_and_graph() {
     let mut b = Client::start(&root, "alpha");
     let tools = a.rpc("tools/list", json!({}));
     let tools = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 8);
     let opener = tools
         .iter()
         .find(|t| t["name"] == "open_inspector")
@@ -147,6 +147,28 @@ fn shared_memory_scope_consent_and_graph() {
             .1["note"]["id"],
         3
     );
+    let projects = a.rpc(
+        "tools/call",
+        json!({"name":"inspector_projects","arguments":{}}),
+    );
+    assert_eq!(
+        projects["result"]["structuredContent"],
+        json!({"projects":["alpha"],"active":"alpha"})
+    );
+    let graph = a.rpc(
+        "tools/call",
+        json!({"name":"inspector_graph","arguments":{"project":"alpha"}}),
+    );
+    assert_eq!(graph["result"]["structuredContent"]["counts"]["total"], 3);
+    assert_eq!(
+        graph["result"]["structuredContent"]["notes"][2]["parents"],
+        json!(["2"])
+    );
+    let denied = a.rpc(
+        "tools/call",
+        json!({"name":"inspector_graph","arguments":{"project":"beta"}}),
+    );
+    assert_eq!(denied["result"]["isError"], true);
     let matches = b.tool("search", json!({"query":"cultivation"})).1;
     assert_eq!(matches["notes"].as_array().unwrap().len(), 2);
     assert_eq!(matches["notes"][1]["id"], 3);
