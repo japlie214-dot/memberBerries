@@ -12,4 +12,6 @@ memb-win = { path = "../memb-win" }
 memb-rag = { path = "../memb-rag" }
 memb-curator = { path = "../memb-curator" }
 memb-ops = { path = "../memb-ops" }
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true

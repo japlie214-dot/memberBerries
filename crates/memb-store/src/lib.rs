@@ -103,6 +103,7 @@ fn now_ms() -> u64 {
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
+    max_notes: usize,
 }
 
 impl Store {
@@ -110,11 +111,18 @@ impl Store {
         if !root.is_absolute() {
             return Err("MEMB_DATA_DIR must be an absolute path".into());
         }
-        let store = Self { root: root.to_path_buf() };
+        let store = Self { root: root.to_path_buf(), max_notes: MAX_NOTES };
         let _lock = acquire_os_lock(root)?;
         let db = store.open_db()?;
         Self::init_and_migrate_locked(&db)?;
         Ok(store)
+    }
+
+    /// Lower the note limit (config.toml `storage.max_notes`). It can never exceed
+    /// the built-in `MAX_NOTES`, and notes beyond a lowered limit are kept, not removed.
+    pub fn with_max_notes(mut self, max_notes: usize) -> Self {
+        self.max_notes = max_notes.clamp(1, MAX_NOTES);
+        self
     }
 
     fn open_db(&self) -> Result<Database, String> {
@@ -347,8 +355,8 @@ impl Store {
         let _lock = acquire_os_lock(&self.root)?;
         let db = self.open_db()?;
         let existing = Self::load_all_notes_locked(&db)?;
-        if existing.len() >= MAX_NOTES {
-            return Err(format!("store reached MAX_NOTES ({MAX_NOTES})"));
+        if existing.len() >= self.max_notes {
+            return Err(format!("store reached its note limit ({})", self.max_notes));
         }
         Self::verify_parents_exist(&existing, draft.kind, &draft.parents)?;
 
@@ -469,6 +477,34 @@ impl Store {
         Ok(revision)
     }
 
+    /// Newest-first revision history (read-only), optionally for one note. `limit` is capped at 200.
+    pub fn list_revisions(&self, note_id: Option<u64>, limit: usize) -> Result<Vec<Revision>, String> {
+        let limit = limit.clamp(1, 200);
+        let _lock = acquire_os_lock(&self.root)?;
+        let db = self.open_db()?;
+        let read = db.begin_read().map_err(|e| e.to_string())?;
+        let table = match read.open_table(REVISIONS_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.to_string()),
+        };
+        let mut found = Vec::new();
+        for entry in table.iter().map_err(|e| e.to_string())?.rev() {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            let revision: Revision = serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
+            if revision.rev_id != key.value() {
+                return Err("revision key/id mismatch".into());
+            }
+            if note_id.is_none_or(|id| id == revision.note_id) {
+                found.push(revision);
+                if found.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Reverse a single update if its after-image is still current. Operations
     /// involving creation, deletion, supersession or cascades are unsupported.
     pub fn rollback_revision(&self, revision_id: u64) -> Result<Note, String> {
@@ -537,7 +573,7 @@ impl Store {
             .cloned()
             .ok_or_else(|| format!("note {old_id} not found"))?;
         if old_note.status != NoteStatus::Active { return Err("cannot supersede non-active note".into()); }
-        if existing.len() >= MAX_NOTES { return Err("store reached MAX_NOTES".into()); }
+        if existing.len() >= self.max_notes { return Err(format!("store reached its note limit ({})", self.max_notes)); }
         if old_note.kind != Kind::Claim || draft.kind != Kind::Claim {
             return Err("supersede is restricted to claim notes".into());
         }
@@ -902,6 +938,41 @@ mod tests {
                 Err(e) => panic!("cannot create test directory: {e}"),
             }
         }
+    }
+
+    #[test]
+    fn revisions_list_newest_first_filter_by_note_and_respect_the_limit() {
+        let dir = temp_dir("revlist");
+        let store = Store::open(&dir).unwrap();
+        assert!(store.list_revisions(None, 10).unwrap().is_empty());
+        let topic = |title: &str| Draft { title: title.into(), desc: "text".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() };
+        let a = store.remember(topic("A")).unwrap();
+        let b = store.remember(topic("B")).unwrap();
+        store.update(a.id, NotePatch { desc: Some("edited".into()), ..Default::default() }).unwrap();
+        let all = store.list_revisions(None, 10).unwrap();
+        assert_eq!(all.iter().map(|r| r.rev_id).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert_eq!(all[0].op, "update");
+        assert_eq!(store.list_revisions(Some(a.id), 10).unwrap().iter().map(|r| r.rev_id).collect::<Vec<_>>(), vec![3, 1]);
+        assert_eq!(store.list_revisions(Some(b.id), 10).unwrap().len(), 1);
+        assert_eq!(store.list_revisions(None, 2).unwrap().len(), 2);
+        assert_eq!(store.list_revisions(Some(999), 10).unwrap().len(), 0);
+        assert_eq!(store.list_revisions(None, 0).unwrap().len(), 1); // limit is clamped to at least one
+    }
+
+    #[test]
+    fn configured_note_limit_applies_to_remember_and_supersede_but_never_exceeds_the_hard_cap() {
+        let dir = temp_dir("limit");
+        let store = Store::open(&dir).unwrap().with_max_notes(2);
+        let topic = |title: &str| Draft { title: title.into(), desc: "text".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() };
+        let a = store.remember(topic("A")).unwrap();
+        store.remember(topic("B")).unwrap();
+        assert!(store.remember(topic("C")).unwrap_err().contains("note limit (2)"));
+        assert!(store.supersede(a.id, topic("A2")).unwrap_err().contains("note limit (2)"));
+        // Existing notes stay readable and editable at the limit.
+        assert!(store.update(a.id, NotePatch { desc: Some("edited".into()), ..Default::default() }).is_ok());
+        // A larger configured value is clamped to the built-in cap; zero is clamped to one.
+        assert_eq!(Store::open(&dir).unwrap().with_max_notes(usize::MAX).max_notes, MAX_NOTES);
+        assert_eq!(Store::open(&dir).unwrap().with_max_notes(0).max_notes, 1);
     }
 
     #[test]

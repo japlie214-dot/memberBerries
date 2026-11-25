@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/server/memb.exe",
+            "args": [
+              "hook",
+              "prompt-submit",
+              "--cli",
+              "cc"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/server/memb.exe",
+            "args": [
+              "hook",
+              "assistant-stop",
+              "--cli",
+              "cc"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,47 @@
+# memb config.toml: optional. Copy to <data dir>\config.toml
+# (default data dir: %LOCALAPPDATA%\memberBerries, or the absolute MEMB_DATA_DIR).
+#
+# Every uncommented value below is the shipped default. Settings that are commented out
+# are off by default; the value shown for them is only an example.
+# Precedence: environment variable > this file > default.
+# A typo, an unknown key or an out-of-range value stops the command (a hook skips its
+# event instead) with a message that names the setting (or the line, for a syntax or
+# type error); nothing is silently ignored. Never put secrets in this file.
+# See wiki/Configuration.md.
+
+[storage]
+max_notes = 50000            # 1..=50000; lowers the note limit, never raises it
+
+[scroll]                     # opt-in chat capture (needs MEMB_SCROLL_CAPTURE=1; see wiki/Hooks.md)
+max_messages = 90            # 10..=1000: a scroll that reaches this many messages becomes a chunk
+retain_tail = 10             # 1..=max_messages/2: messages kept as overlap after a rollover
+min_prompt_chars = 100       # prompts shorter than this never trigger note retrieval
+dedup_reset_every_n_chunks = 7   # a note may be injected again once the chunk count crosses a multiple of this (1 to N new chunks later)
+ignore_dirs = []             # patterns such as "*/tmp/*": matching working directories are never captured
+
+[embeddings]
+enabled = true               # false forces lexical-only search
+# Off by default. Setting a port SENDS note text and queries to that loopback service
+# (a llama-server you start yourself; memb does not launch it).
+# port = 18432
+# model_id = "embeddinggemma-300m-q8"    # names the vector cache; required for a useful cache with a port
+# Off by default. In-process EmbeddingGemma 2 (ONNX); %VAR% is expanded, the path must be absolute.
+# gemma_model_dir = "%LOCALAPPDATA%\\memberBerries\\models\\embeddinggemma-2-onnx-q4"
+# mrl_dim = 256              # one of 128, 256, 512, 768: shorter vectors (Matryoshka); omit for full width
+
+# The kit's `binary` and `model_path` keys are rejected: memb never starts an embedding server.
+
+[curator]                    # reserved: only these default values are accepted until curation is wired
+backend = "cli"
+cli_command = "claude -p"
+chunk_to_chunk_threshold = 0.72
+chunk_to_node_threshold = 0.70
+staging_ttl_days = 30
+
+[scheduler]                  # used by `memb daemon`
+routine_wib_hour = 15        # 0..=23, Western Indonesia Time (UTC+7)
+routine_wib_minute = 45      # 0..=59
+cooldown_hours = 20          # 1..=168: minimum time between successful runs
+idle_sweep_hours = 24        # 1..=720: scrolls idle longer than this are chunked
+idle_sweep_min_messages = 45 # must exceed scroll.retain_tail
+# obsidian_mirror_dir = "%LOCALAPPDATA%\\memberBerries\\vault"   # absolute, existing; `daemon --mirror-out` overrides

@@ -6,6 +6,10 @@ use memb_store::Store;
 /// MEMB_EMBED_MODEL_ID to a stable model/version identifier to enable caches.
 pub fn search(store: &Store, query: &str) -> Result<Vec<Note>, String> {
     store.search_lexical_ids(query, 1)?;
+    // `embeddings.enabled = false` in config.toml (or MEMB_EMBED_DISABLE=1) forces lexical search.
+    if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1") {
+        return hybrid_search(store, query, None, &[]);
+    }
     if let Some(directory) = std::env::var_os("MEMB_GEMMA_MODEL_DIR").filter(|p| !p.is_empty()) {
         return search_with_gemma(store, query, std::path::PathBuf::from(directory));
     }

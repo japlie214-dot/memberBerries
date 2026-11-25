@@ -7,9 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LAYOUTS = {
-    "memb.plugin": ("cowork", (".claude-plugin/plugin.json", ".mcp.json", "skills/memb/SKILL.md")),
-    "memb-agy.zip": ("agy", ("plugin.json", "mcp_config.json")),
-    "memb-codex.zip": ("codex", (".codex-plugin/plugin.json", ".mcp.json")),
+    "memb.plugin": ("cowork", (".claude-plugin/plugin.json", ".mcp.json", "hooks/hooks.json", "skills/memb/SKILL.md")),
+    "memb-agy.zip": ("agy", ("plugin.json", "mcp_config.json", "hooks.json")),
+    "memb-codex.zip": ("codex", (".codex-plugin/plugin.json", ".mcp.json", "hooks/hooks.json")),
 }
 
 

@@ -1,5 +1,6 @@
 """Verify packaged executables exchange notes without touching live profiles."""
 import hashlib
+import shutil
 import json
 import os
 import subprocess
@@ -31,6 +32,40 @@ def call(exe, store, tool, args):
     return json.loads(response["result"]["content"][0]["text"])
 
 
+HOOK_FILES = {"memb.plugin": "hooks/hooks.json", "memb-codex.zip": "hooks/hooks.json", "memb-agy.zip": "hooks.json"}
+
+
+def hook_commands(name, archive):
+    """Every command string a package's hook file declares, as the host would run it."""
+    data = json.loads(archive.read(HOOK_FILES[name]))
+    if name == "memb-agy.zip":  # {"<group>": {"Stop": [{...}]}}
+        groups = [h for group in data.values() for event in group.values() if isinstance(event, list) for h in event]
+        events = {e for group in data.values() for e in group if e != "enabled"}
+    else:  # {"hooks": {"<Event>": [{"hooks": [{...}]}]}}
+        groups = [h for matcher in (m for v in data["hooks"].values() for m in v) for h in matcher["hooks"]]
+        events = set(data["hooks"])
+    return events, [" ".join([h["command"], *h.get("args", [])]) for h in groups]
+
+
+def check_hooks(name, archive, exe, tmp):
+    events, commands = hook_commands(name, archive)
+    want = {"memb-agy.zip": {"Stop"}}.get(name, {"UserPromptSubmit", "Stop"})
+    assert events == want, (name, events)
+    assert commands and all("server" in c and "memb.exe" in c and " hook " in f" {c} " and f"--cli" in c for c in commands), commands
+    # The packaged binary must treat a hook as a silent no-op unless capture is opted into.
+    cwd = tmp / "hook-cwd"
+    cwd.mkdir(exist_ok=True)
+    payload = json.dumps({"session_id": "smoke", "cwd": str(cwd), "prompt": "hello", "last_assistant_message": "hi"})
+    data = tmp / f"hook-data-{name}"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEMB_")}
+    for extra in ({}, {"MEMB_SCROLL_CAPTURE": "1"}):
+        for event in ("prompt-submit", "assistant-stop"):
+            run = subprocess.run([exe, "hook", event, "--cli", "cc"], input=payload, capture_output=True, text=True, timeout=30,
+                                 env={**env, "MEMB_DATA_DIR": str(data), **extra}, cwd=cwd)
+            assert run.returncode == 0 and run.stdout == "", (name, event, extra, run.returncode, run.stdout)
+    return len(commands)
+
+
 def main(temp_parent):
     dist = ROOT / "dist"
     with tempfile.TemporaryDirectory(prefix="memb package smoke ", dir=temp_parent) as tmp:
@@ -46,6 +81,12 @@ def main(temp_parent):
                 path.parent.mkdir()
                 path.write_bytes(archive.read("server/memb.exe"))
                 paths[name] = path
+                if name in HOOK_FILES:
+                    print(f"hooks ok: {name} ({check_hooks(name, archive, path, tmp)} commands)")
+                if name == "memb-agy.zip" and shutil.which("agy"):
+                    check = subprocess.run(["agy", "plugin", "validate", str(package), "--strict"], capture_output=True, text=True, timeout=60)
+                    assert check.returncode == 0, check.stdout + check.stderr
+                    print("agy plugin validate --strict: ok")
         store = tmp / "data"
         note = call(paths["memb.plugin"], store, "remember", {"title": "Orchard", "desc": "Check the hose each Friday", "kind": "topic", "parents": [], "confirmed": True})["note"]
         for name in ("memb-agy.zip", "memb-codex.zip"):

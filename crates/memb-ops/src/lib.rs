@@ -24,9 +24,43 @@ pub const IDLE_SWEEP_MIN_MESSAGES: usize = 45;
 /// Evaluate the phase-4 policy using caller-supplied WIB time and last success.
 /// Invalid clock fields and backwards wall-clock movement fail closed.
 pub fn should_run_daily_routine(now_ms: u64, last_run_ms: u64, hour: u8, minute: u8) -> bool {
+    should_run_daily_routine_with(&RoutinePolicy::default(), now_ms, last_run_ms, hour, minute)
+}
+
+/// When the daily routine is due (config.toml `[scheduler]`). `Default` is 15:45 WIB,
+/// a 20-hour cooldown and a 24-hour catch-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutinePolicy {
+    pub hour: u8,
+    pub minute: u8,
+    pub cooldown_ms: u64,
+    pub overdue_ms: u64,
+}
+
+impl Default for RoutinePolicy {
+    fn default() -> Self {
+        Self { hour: 15, minute: 45, cooldown_ms: MIN_COOLDOWN_MS, overdue_ms: OVERDUE_MS }
+    }
+}
+
+impl RoutinePolicy {
+    /// The catch-up window is the larger of 24 hours and the cooldown, so a longer
+    /// cooldown can never make a routine overdue before it is allowed to run.
+    pub fn new(hour: u8, minute: u8, cooldown_hours: u64) -> Result<Self, String> {
+        if hour > 23 || minute > 59 || !(1..=168).contains(&cooldown_hours) {
+            return Err("invalid routine time or cooldown".into());
+        }
+        let cooldown_ms = cooldown_hours * 3600 * 1000;
+        Ok(Self { hour, minute, cooldown_ms, overdue_ms: OVERDUE_MS.max(cooldown_ms) })
+    }
+}
+
+/// `hour`/`minute` are the current WIB clock; the policy holds the target time.
+pub fn should_run_daily_routine_with(policy: &RoutinePolicy, now_ms: u64, last_run_ms: u64, hour: u8, minute: u8) -> bool {
     if hour > 23 || minute > 59 || now_ms < last_run_ms { return false; }
     let elapsed = now_ms - last_run_ms;
-    elapsed >= MIN_COOLDOWN_MS && (elapsed >= OVERDUE_MS || hour > 15 || (hour == 15 && minute >= 45))
+    elapsed >= policy.cooldown_ms
+        && (elapsed >= policy.overdue_ms || hour > policy.hour || (hour == policy.hour && minute >= policy.minute))
 }
 
 /// Maximum lease is bounded to limit how long a crashed worker blocks recovery.
@@ -49,6 +83,10 @@ struct RoutineState {
 /// Expired workers are fenced from finishing, but callers must separately ensure
 /// their pipeline cannot keep writing after expiry; a lease is not a process kill.
 pub fn claim_daily_routine(db: &redb::Database, now_ms: u64, hour: u8, minute: u8, lease_ms: u64) -> Result<Option<RoutineClaim>, String> {
+    claim_daily_routine_with(&RoutinePolicy::default(), db, now_ms, hour, minute, lease_ms)
+}
+
+pub fn claim_daily_routine_with(policy: &RoutinePolicy, db: &redb::Database, now_ms: u64, hour: u8, minute: u8, lease_ms: u64) -> Result<Option<RoutineClaim>, String> {
     if lease_ms == 0 || lease_ms > MAX_ROUTINE_LEASE_MS || hour > 23 || minute > 59 {
         return Err("invalid routine time or lease duration".into());
     }
@@ -62,7 +100,7 @@ pub fn claim_daily_routine(db: &redb::Database, now_ms: u64, hour: u8, minute: u
         };
         if now_ms < state.last_observed_ms { return Err("clock moved backwards".into()); }
         state.last_observed_ms = now_ms;
-        let claim = if state.claim.is_some_and(|c| now_ms < c.expires_at_ms) || !should_run_daily_routine(now_ms, state.last_success_ms, hour, minute) {
+        let claim = if state.claim.is_some_and(|c| now_ms < c.expires_at_ms) || !should_run_daily_routine_with(policy, now_ms, state.last_success_ms, hour, minute) {
             None
         } else {
             state.generation = state.generation.checked_add(1).ok_or("claim generation exhausted")?;
@@ -177,6 +215,50 @@ mod tests {
     fn note(id: u64) -> Note {
         Note { id, title: "Synthetic".into(), desc: "Test".into(), kind: Kind::Topic, status: NoteStatus::Active, parents: vec![], properties: BTreeMap::new(), supersedes: None, created_at_ms: 1, updated_at_ms: 1 }
     }
+    #[test]
+    fn configured_policy_moves_the_target_time_cooldown_and_catch_up() {
+        let last = 1_000_000_000u64;
+        let h = 3600 * 1000;
+        let p = RoutinePolicy::new(9, 30, 12).unwrap();
+        assert_eq!(RoutinePolicy::default(), RoutinePolicy::new(15, 45, 20).unwrap());
+        // Before the target time and before the catch-up window: not due, even past the cooldown.
+        assert!(!should_run_daily_routine_with(&p, last + 12 * h, last, 9, 29));
+        assert!(should_run_daily_routine_with(&p, last + 12 * h, last, 9, 30));
+        assert!(should_run_daily_routine_with(&p, last + 13 * h, last, 23, 59));
+        // Cooldown still wins over the target time.
+        assert!(!should_run_daily_routine_with(&p, last + 12 * h - 1, last, 12, 0));
+        // 24-hour catch-up applies regardless of the clock.
+        assert!(should_run_daily_routine_with(&p, last + 24 * h, last, 3, 0));
+        // A cooldown longer than a day stretches the catch-up window to match it.
+        let long = RoutinePolicy::new(0, 0, 48).unwrap();
+        assert_eq!(long.overdue_ms, 48 * h);
+        assert!(!should_run_daily_routine_with(&long, last + 47 * h, last, 0, 0));
+        assert!(should_run_daily_routine_with(&long, last + 48 * h, last, 0, 0));
+        for bad in [(24, 0, 20), (0, 60, 20), (0, 0, 0), (0, 0, 169)] {
+            assert!(RoutinePolicy::new(bad.0, bad.1, bad.2).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn configured_policy_is_used_by_the_claim() {
+        let dir = std::env::temp_dir().join(format!("memb-ops-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let p = RoutinePolicy::new(9, 30, 12).unwrap();
+        let t0 = 5_000_000_000u64;
+        let h = 3600 * 1000;
+        // First ever run is overdue by definition; record it as a success.
+        let first = store.with_db(|db| claim_daily_routine_with(&p, db, t0, 9, 30, 1000)).unwrap().unwrap();
+        store.with_db(|db| finish_daily_routine(db, first, t0 + 10, true)).unwrap();
+        // 13h later: cooldown (12h) has passed, but 09:00 is before this policy's 09:30 target.
+        let now = t0 + 13 * h;
+        assert!(store.with_db(|db| claim_daily_routine_with(&p, db, now, 9, 0, 1000)).unwrap().is_none());
+        assert!(store.with_db(|db| claim_daily_routine_with(&p, db, now + 1, 9, 30, 1000)).unwrap().is_some());
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn scheduler_boundaries_and_bad_clocks() {
         let last = 100_000_000;

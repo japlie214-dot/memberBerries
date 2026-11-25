@@ -62,8 +62,32 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Tunable scroll limits (config.toml `[scroll]`); `Default` is the shipped behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollLimits {
+    pub max_messages: usize,
+    pub retain_tail: usize,
+    pub min_prompt_chars: usize,
+    pub dedup_reset_chunks: u32,
+}
+
+impl Default for ScrollLimits {
+    fn default() -> Self {
+        Self {
+            max_messages: SCROLL_MAX_MESSAGES,
+            retain_tail: SCROLL_RETAIN_TAIL,
+            min_prompt_chars: MIN_PROMPT_CHARS_FOR_RETRIEVAL,
+            dedup_reset_chunks: DEFAULT_DEDUP_RESET_CHUNKS,
+        }
+    }
+}
+
 pub fn should_retrieve_for_prompt(latest_user_msg: &str) -> bool {
-    latest_user_msg.trim().chars().count() >= MIN_PROMPT_CHARS_FOR_RETRIEVAL
+    should_retrieve_for_prompt_with(latest_user_msg, &ScrollLimits::default())
+}
+
+pub fn should_retrieve_for_prompt_with(latest_user_msg: &str, limits: &ScrollLimits) -> bool {
+    latest_user_msg.trim().chars().count() >= limits.min_prompt_chars
 }
 
 pub fn is_memory_disabled(cwd: Option<&str>, ignore_dirs: &[String]) -> bool {
@@ -92,6 +116,21 @@ pub fn append_message(
     content: String,
     capture_opt_in: bool,
 ) -> Result<Option<ScrollChunk>, String> {
+    append_message_with(db, session_id, cli, role, content, capture_opt_in, &ScrollLimits::default())
+}
+
+pub fn append_message_with(
+    db: &Database,
+    session_id: &str,
+    cli: &str,
+    role: Role,
+    content: String,
+    capture_opt_in: bool,
+    limits: &ScrollLimits,
+) -> Result<Option<ScrollChunk>, String> {
+    if limits.retain_tail == 0 || limits.retain_tail >= limits.max_messages {
+        return Err("invalid scroll limits".into());
+    }
     if !capture_opt_in || is_memory_disabled(None, &[]) {
         return Err("scroll capture is disabled".into());
     }
@@ -128,7 +167,7 @@ pub fn append_message(
             .unwrap_or_default();
         meta.last_active_ms = ts;
 
-        let emitted = if scroll.messages.len() >= SCROLL_MAX_MESSAGES {
+        let emitted = if scroll.messages.len() >= limits.max_messages {
             let chunk_index = meta.total_chunks;
             let chunk_id = format!("chk_{session_id}_{chunk_index:04}");
             let chunk = ScrollChunk {
@@ -143,7 +182,7 @@ pub fn append_message(
             let cbytes = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
             chunks.insert(chunk_id.as_str(), cbytes.as_slice()).map_err(|e| e.to_string())?;
 
-            let keep_from = scroll.messages.len().saturating_sub(SCROLL_RETAIN_TAIL);
+            let keep_from = scroll.messages.len().saturating_sub(limits.retain_tail);
             scroll.messages = scroll.messages.split_off(keep_from);
             meta.total_chunks += 1;
             Some(chunk)
@@ -164,6 +203,20 @@ pub fn append_message(
 /// Flush at most 100 idle sessions atomically. The last ten messages overlap the chunk.
 /// Strictly more than `idle_ms` must have elapsed, and 45 messages are required.
 pub fn sweep_idle_scrolls(db: &Database, now_ms: u64, idle_ms: u64) -> Result<Vec<ScrollChunk>, String> {
+    sweep_idle_scrolls_with(db, now_ms, idle_ms, IDLE_SWEEP_MIN_MESSAGES, SCROLL_RETAIN_TAIL)
+}
+
+/// `min_messages` must exceed `retain_tail`, otherwise nothing could be chunked.
+pub fn sweep_idle_scrolls_with(
+    db: &Database,
+    now_ms: u64,
+    idle_ms: u64,
+    min_messages: usize,
+    retain_tail: usize,
+) -> Result<Vec<ScrollChunk>, String> {
+    if retain_tail == 0 || min_messages <= retain_tail {
+        return Err("invalid sweep limits".into());
+    }
     let w = db.begin_write().map_err(|e| e.to_string())?;
     let emitted = {
         let mut scrolls = w.open_table(SCROLLS_TABLE).map_err(|e| e.to_string())?;
@@ -174,7 +227,7 @@ pub fn sweep_idle_scrolls(db: &Database, now_ms: u64, idle_ms: u64) -> Result<Ve
             let (key, value) = entry.map_err(|e| e.to_string())?;
             let scroll: ChatScroll = serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
             if scroll.session_id != key.value() { return Err("scroll session mismatch".into()); }
-            if scroll.messages.len() >= IDLE_SWEEP_MIN_MESSAGES
+            if scroll.messages.len() >= min_messages
                 && now_ms.checked_sub(scroll.updated_at_ms).is_some_and(|age| age > idle_ms) {
                 candidates.push(scroll);
                 if candidates.len() == MAX_CHUNK_LIST { break; }
@@ -194,7 +247,7 @@ pub fn sweep_idle_scrolls(db: &Database, now_ms: u64, idle_ms: u64) -> Result<Ve
             }
             let chunk = ScrollChunk { chunk_id: chunk_id.clone(), session_id: session.clone(), chunk_index: index,
                 messages: scroll.messages.clone(), summary: None, created_at_ms: now_ms, curated: false };
-            scroll.messages = scroll.messages.split_off(scroll.messages.len() - SCROLL_RETAIN_TAIL);
+            scroll.messages = scroll.messages.split_off(scroll.messages.len() - retain_tail);
             meta.total_chunks = next;
             let cb = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
             let sb = serde_json::to_vec(&scroll).map_err(|e| e.to_string())?;
@@ -252,6 +305,21 @@ pub fn stage_chunk_evidence(db: &Database, chunk_id: &str) -> Result<bool, Strin
     };
     w.commit().map_err(|e| e.to_string())?;
     Ok(inserted)
+}
+
+/// Read-only view of one live (not yet chunked) scroll. Used by hooks to avoid
+/// recording the same turn twice when a host fires its stop event repeatedly.
+pub fn read_scroll(db: &Database, session_id: &str) -> Result<Option<ChatScroll>, String> {
+    let r = db.begin_read().map_err(|e| e.to_string())?;
+    let table = match r.open_table(SCROLLS_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let Some(raw) = table.get(session_id).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(raw.value()).map(Some).map_err(|e| e.to_string())
 }
 
 pub fn should_inject_and_mark(
@@ -320,6 +388,43 @@ mod tests {
         assert!(should_retrieve_for_prompt(&"a".repeat(100)));
         assert!(!should_retrieve_for_prompt(&format!(" {} ", "a".repeat(99))));
         assert!(should_retrieve_for_prompt(&"é".repeat(100)));
+    }
+
+    #[test]
+    fn custom_limits_change_rollover_retrieval_gate_and_idle_sweep() {
+        let p = std::env::temp_dir().join(format!("memb_scroll_limits_{}.redb", now_ms()));
+        let db = Database::create(&p).unwrap();
+        let limits = ScrollLimits { max_messages: 20, retain_tail: 4, min_prompt_chars: 5, dedup_reset_chunks: 3 };
+        assert!(should_retrieve_for_prompt_with("12345", &limits));
+        assert!(!should_retrieve_for_prompt_with("1234", &limits));
+        assert!(!should_retrieve_for_prompt("12345")); // the default gate is still 100
+        let mut chunks = Vec::new();
+        for i in 0..40 {
+            if let Some(c) = append_message_with(&db, "s", "cc", Role::User, format!("m{i}"), true, &limits).unwrap() {
+                chunks.push(c);
+            }
+        }
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.messages.len() == 20));
+        assert_eq!(read_scroll(&db, "s").unwrap().unwrap().messages.len(), 40 - 2 * 16);
+        // Invalid combinations are rejected instead of misbehaving.
+        for bad in [ScrollLimits { retain_tail: 0, ..limits.clone() }, ScrollLimits { retain_tail: 20, ..limits.clone() }] {
+            assert!(append_message_with(&db, "x", "cc", Role::User, "hi".into(), true, &bad).is_err());
+        }
+        // Sweep: threshold and retained tail are parameters; 30 messages idle since `old`.
+        for i in 0..30 {
+            append_message_with(&db, "idle", "cc", Role::User, format!("i{i}"), true, &ScrollLimits::default()).unwrap();
+        }
+        let now = read_scroll(&db, "idle").unwrap().unwrap().updated_at_ms + 10_000;
+        assert!(sweep_idle_scrolls_with(&db, now, 5_000, 31, 3).unwrap().is_empty()); // below threshold
+        assert!(sweep_idle_scrolls_with(&db, now, 20_000, 30, 3).unwrap().is_empty()); // not idle long enough
+        assert!(sweep_idle_scrolls_with(&db, now, 5_000, 3, 3).is_err()); // threshold must exceed the tail
+        let swept = sweep_idle_scrolls_with(&db, now, 5_000, 30, 3).unwrap();
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].messages.len(), 30);
+        assert_eq!(read_scroll(&db, "idle").unwrap().unwrap().messages.len(), 3);
+        drop(db);
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]

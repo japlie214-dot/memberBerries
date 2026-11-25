@@ -1,0 +1,11 @@
+{
+  "memb-capture": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "server\\memb.exe hook assistant-stop --cli agy",
+        "timeout": 10
+      }
+    ]
+  }
+}

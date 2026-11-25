@@ -1,0 +1,555 @@
+//! `config.toml`: optional, strict, never a place for secrets.
+//!
+//! Precedence is environment variable, then config file, then built-in default.
+//! The file lives next to the database (`<data dir>/config.toml`). A missing file
+//! means defaults; an unreadable, oversized, unknown or out-of-range setting is an
+//! error rather than something silently ignored. Settings memb cannot honor yet
+//! are rejected with a message instead of being accepted and dropped.
+
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MRL_DIMS: [u32; 4] = [128, 256, 512, 768];
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub storage: Storage,
+    pub scroll: Scroll,
+    pub embeddings: Embeddings,
+    pub curator: Curator,
+    pub scheduler: Scheduler,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Storage {
+    pub max_notes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scroll {
+    pub max_messages: usize,
+    pub retain_tail: usize,
+    pub min_prompt_chars: usize,
+    pub dedup_reset_every_n_chunks: u32,
+    pub ignore_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Embeddings {
+    pub enabled: bool,
+    /// Loopback llama-server port. Setting it sends note text and queries to that local service.
+    pub port: Option<u16>,
+    pub model_id: Option<String>,
+    pub gemma_model_dir: Option<String>,
+    pub mrl_dim: Option<u32>,
+    // Accepted only to give a clear error: memb does not launch an embedding server.
+    pub binary: Option<String>,
+    pub model_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Curator {
+    pub backend: String,
+    pub cli_command: String,
+    pub chunk_to_chunk_threshold: f64,
+    pub chunk_to_node_threshold: f64,
+    pub staging_ttl_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scheduler {
+    pub routine_wib_hour: u8,
+    pub routine_wib_minute: u8,
+    pub cooldown_hours: u64,
+    pub idle_sweep_hours: u64,
+    pub idle_sweep_min_messages: usize,
+    pub obsidian_mirror_dir: Option<String>,
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self { max_notes: 50_000 }
+    }
+}
+
+impl Default for Scroll {
+    fn default() -> Self {
+        Self {
+            max_messages: 90,
+            retain_tail: 10,
+            min_prompt_chars: 100,
+            dedup_reset_every_n_chunks: 7,
+            ignore_dirs: Vec::new(),
+        }
+    }
+}
+
+impl Default for Embeddings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: None,
+            model_id: None,
+            gemma_model_dir: None,
+            mrl_dim: None,
+            binary: None,
+            model_path: None,
+        }
+    }
+}
+
+impl Default for Curator {
+    fn default() -> Self {
+        Self {
+            backend: "cli".into(),
+            cli_command: "claude -p".into(),
+            chunk_to_chunk_threshold: 0.72,
+            chunk_to_node_threshold: 0.70,
+            staging_ttl_days: 30,
+        }
+    }
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self {
+            routine_wib_hour: 15,
+            routine_wib_minute: 45,
+            cooldown_hours: 20,
+            idle_sweep_hours: 24,
+            idle_sweep_min_messages: 45,
+            obsidian_mirror_dir: None,
+        }
+    }
+}
+
+/// The parser quotes offending values in its messages (`"text"` or integer `42`); keep
+/// the kind of error and the expected type and drop the value, so file contents are never
+/// echoed. Key names (for example in "unknown field") are kept: they name the setting.
+fn safe_message(message: &str) -> String {
+    let first = message.lines().next().unwrap_or("syntax error");
+    if first.starts_with("unknown field") || !(first.contains('"') || first.contains('`')) {
+        return first.to_owned();
+    }
+    let kind = first.split(':').next().unwrap_or("invalid value");
+    match first.find(", expected ") {
+        Some(i) => format!("{kind}{}", &first[i..]),
+        None => kind.to_owned(),
+    }
+}
+
+fn line_of(text: &str, offset: usize) -> usize {
+    text.as_bytes()[..offset.min(text.len())]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
+        + 1
+}
+
+/// Expand `%NAME%` against the process environment. An unset variable is an error,
+/// and the result must be an absolute path.
+pub fn expand_path(raw: &str, key: &str) -> Result<PathBuf, String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start + 1..];
+        let end = tail.find('%').ok_or_else(|| format!("{key}: unmatched '%'"))?;
+        let name = &tail[..end];
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(format!("{key}: invalid variable name between '%' signs"));
+        }
+        let value = std::env::var(name)
+            .map_err(|_| format!("{key}: environment variable {name} is not set"))?;
+        out.push_str(&value);
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    let path = PathBuf::from(out);
+    if !path.is_absolute() {
+        return Err(format!("{key}: must be an absolute path"));
+    }
+    Ok(path)
+}
+
+fn within<T: PartialOrd + std::fmt::Display>(key: &str, v: T, lo: T, hi: T) -> Result<(), String> {
+    if v < lo || v > hi {
+        // The offending value is deliberately not repeated.
+        return Err(format!("{key} must be within {lo}..={hi}"));
+    }
+    Ok(())
+}
+
+impl Config {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let config: Config = toml::from_str(text).map_err(|e| {
+            let at = e
+                .span()
+                .map(|s| format!(" at line {}", line_of(text, s.start)))
+                .unwrap_or_default();
+            format!("config.toml is not valid{at}: {}", safe_message(e.message()))
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// `<root>/config.toml`; absent means defaults.
+    pub fn load(root: &Path) -> Result<Self, String> {
+        let path = root.join("config.toml");
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(_) => return Err("config.toml cannot be read".into()),
+        };
+        if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
+            return Err(format!(
+                "config.toml must be a regular file of at most {MAX_CONFIG_BYTES} bytes"
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|_| "config.toml cannot be read")?;
+        Self::parse(std::str::from_utf8(&bytes).map_err(|_| "config.toml is not UTF-8")?)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        within("storage.max_notes", self.storage.max_notes, 1, 50_000)?;
+        let s = &self.scroll;
+        within("scroll.max_messages", s.max_messages, 10, 1000)?;
+        within("scroll.retain_tail", s.retain_tail, 1, s.max_messages / 2)?;
+        within("scroll.min_prompt_chars", s.min_prompt_chars, 1, 10_000)?;
+        within("scroll.dedup_reset_every_n_chunks", s.dedup_reset_every_n_chunks, 1, 1000)?;
+        if s.ignore_dirs.len() > 64
+            || s.ignore_dirs.iter().any(|d| d.trim().is_empty() || d.len() > 512)
+        {
+            return Err("scroll.ignore_dirs: at most 64 non-empty patterns of at most 512 bytes".into());
+        }
+        let e = &self.embeddings;
+        if e.binary.is_some() || e.model_path.is_some() {
+            return Err("embeddings.binary and embeddings.model_path are not supported: memb does not start an embedding server. Run llama-server yourself and set embeddings.port, or set embeddings.gemma_model_dir for the in-process EmbeddingGemma 2 model".into());
+        }
+        if e.port == Some(0) {
+            return Err("embeddings.port must be 1..=65535".into());
+        }
+        if let Some(id) = &e.model_id {
+            if id.is_empty()
+                || id.len() > 128
+                || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:-@".contains(&b))
+            {
+                return Err("embeddings.model_id: 1 to 128 characters of letters, digits and . _ : - @".into());
+            }
+        }
+        if let Some(dir) = &e.gemma_model_dir {
+            expand_path(dir, "embeddings.gemma_model_dir")?;
+        }
+        if let Some(d) = e.mrl_dim {
+            if !MRL_DIMS.contains(&d) {
+                return Err(format!("embeddings.mrl_dim must be one of {MRL_DIMS:?}"));
+            }
+        }
+        // The curator pipeline is not wired to these settings yet: accept only the defaults
+        // so a changed value is never silently ignored.
+        if self.curator != Curator::default() {
+            return Err("curator settings are not supported yet; remove the [curator] section or keep the defaults".into());
+        }
+        let d = &self.scheduler;
+        within("scheduler.routine_wib_hour", d.routine_wib_hour, 0, 23)?;
+        within("scheduler.routine_wib_minute", d.routine_wib_minute, 0, 59)?;
+        within("scheduler.cooldown_hours", d.cooldown_hours, 1, 168)?;
+        within("scheduler.idle_sweep_hours", d.idle_sweep_hours, 1, 720)?;
+        within("scheduler.idle_sweep_min_messages", d.idle_sweep_min_messages, 1, 10_000)?;
+        if d.idle_sweep_min_messages <= self.scroll.retain_tail {
+            return Err("scheduler.idle_sweep_min_messages must exceed scroll.retain_tail".into());
+        }
+        if let Some(dir) = &d.obsidian_mirror_dir {
+            expand_path(dir, "scheduler.obsidian_mirror_dir")?;
+        }
+        Ok(())
+    }
+
+    /// Fill embedding settings into the process environment where the user has not
+    /// already set them (environment wins). Call once at startup, before other threads.
+    pub fn apply_embedding_env(&self) -> Result<(), String> {
+        let set = |name: &str, value: Option<String>| {
+            if let (Some(v), None) = (value, std::env::var_os(name)) {
+                std::env::set_var(name, v);
+            }
+        };
+        let e = &self.embeddings;
+        if !e.enabled {
+            set("MEMB_EMBED_DISABLE", Some("1".into()));
+            return Ok(());
+        }
+        set("MEMB_EMBED_PORT", e.port.map(|p| p.to_string()));
+        set("MEMB_EMBED_MODEL_ID", e.model_id.clone());
+        set("MEMB_EMBED_MRL_DIM", e.mrl_dim.map(|d| d.to_string()));
+        if let Some(dir) = &e.gemma_model_dir {
+            let dir = expand_path(dir, "embeddings.gemma_model_dir")?;
+            set("MEMB_GEMMA_MODEL_DIR", Some(dir.to_string_lossy().into_owned()));
+        }
+        Ok(())
+    }
+
+    /// The directory the daemon mirrors into: a command-line directory wins over the config.
+    pub fn mirror_root(&self, cli: Option<&Path>) -> Result<Option<PathBuf>, String> {
+        match cli {
+            Some(dir) => Ok(Some(dir.to_path_buf())),
+            None => self.mirror_dir(),
+        }
+    }
+
+    pub fn mirror_dir(&self) -> Result<Option<PathBuf>, String> {
+        self.scheduler
+            .obsidian_mirror_dir
+            .as_deref()
+            .map(|d| expand_path(d, "scheduler.obsidian_mirror_dir"))
+            .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const EMBED_VARS: [&str; 6] = [
+        "MEMB_EMBED_PORT",
+        "MEMB_EMBED_MODEL_ID",
+        "MEMB_EMBED_MRL_DIM",
+        "MEMB_GEMMA_MODEL_DIR",
+        "MEMB_EMBED_DISABLE",
+        "MEMB_CFG_TEST_ROOT",
+    ];
+
+    /// Tests that touch the process environment run one at a time and restore it.
+    fn with_clean_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = EMBED_VARS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in EMBED_VARS {
+            std::env::remove_var(k);
+        }
+        let out = f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
+    fn clear_embedding_vars() {
+        for k in EMBED_VARS.iter().filter(|k| **k != "MEMB_CFG_TEST_ROOT") {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn empty_and_missing_config_mean_defaults() {
+        assert_eq!(Config::parse("").unwrap(), Config::default());
+        assert!(Config::default().embeddings.enabled);
+        let dir = std::env::temp_dir().join(format!("memb-cfg-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(Config::load(&dir).unwrap(), Config::default());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn defaults_match_the_kit_example() {
+        let kit = Config::parse(
+            "[storage]\nmax_notes = 50000\n[scroll]\nmax_messages = 90\nretain_tail = 10\nmin_prompt_chars = 100\ndedup_reset_every_n_chunks = 7\nignore_dirs = [\"*/tmp/*\", \"*/playground/*\"]\n[curator]\nbackend = \"cli\"\ncli_command = \"claude -p\"\nchunk_to_chunk_threshold = 0.72\nchunk_to_node_threshold = 0.70\nstaging_ttl_days = 30\n[scheduler]\nroutine_wib_hour = 15\nroutine_wib_minute = 45\ncooldown_hours = 20\nidle_sweep_hours = 24\nidle_sweep_min_messages = 45\n",
+        )
+        .unwrap();
+        assert_eq!(kit.scroll.ignore_dirs.len(), 2);
+        let without_patterns = Config {
+            scroll: Scroll { ignore_dirs: vec![], ..kit.scroll.clone() },
+            ..kit
+        };
+        assert_eq!(without_patterns, Config::default());
+    }
+
+    #[test]
+    fn shipped_example_file_parses_to_the_defaults() {
+        let example = include_str!("../../../config.example.toml");
+        assert_eq!(Config::parse(example).unwrap(), Config::default());
+        // Every commented-out optional line must also be valid once uncommented.
+        const OPTIONAL: [&str; 5] =
+            ["port =", "model_id =", "gemma_model_dir =", "mrl_dim =", "obsidian_mirror_dir ="];
+        let uncommented: String = example
+            .lines()
+            .map(|l| match l.strip_prefix("# ") {
+                Some(rest) if OPTIONAL.iter().any(|k| rest.starts_with(k)) => format!("{rest}\n"),
+                _ => format!("{l}\n"),
+            })
+            .collect();
+        with_clean_env(|| {
+            std::env::set_var(
+                "LOCALAPPDATA",
+                if cfg!(windows) { r"C:\Users\x\AppData\Local" } else { "/x" },
+            );
+            let all = Config::parse(&uncommented).unwrap();
+            assert_eq!(all.embeddings.port, Some(18432));
+            assert_eq!(all.embeddings.mrl_dim, Some(256));
+            assert!(all.scheduler.obsidian_mirror_dir.is_some());
+            assert!(all.embeddings.gemma_model_dir.is_some());
+        });
+    }
+
+    #[test]
+    fn unknown_keys_and_wrong_types_fail_closed() {
+        for bad in [
+            "[storage]\nmax_noets = 1\n",
+            "[nope]\nx = 1\n",
+            "[storage]\nmax_notes = \"many\"\n",
+            "storage = 3\n",
+            "[[scroll]]\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ranges_are_enforced() {
+        for bad in [
+            "[storage]\nmax_notes = 0\n",
+            "[storage]\nmax_notes = 50001\n",
+            "[scroll]\nmax_messages = 9\n",
+            "[scroll]\nmax_messages = 20\nretain_tail = 11\n",
+            "[scroll]\nretain_tail = 0\n",
+            "[scroll]\nmin_prompt_chars = 0\n",
+            "[scroll]\ndedup_reset_every_n_chunks = 0\n",
+            "[scroll]\nignore_dirs = [\"\"]\n",
+            "[embeddings]\nport = 0\n",
+            "[embeddings]\nmrl_dim = 100\n",
+            "[embeddings]\nmodel_id = \"bad id\"\n",
+            "[scheduler]\nroutine_wib_hour = 24\n",
+            "[scheduler]\nroutine_wib_minute = 60\n",
+            "[scheduler]\ncooldown_hours = 0\n",
+            "[scheduler]\ncooldown_hours = 169\n",
+            "[scheduler]\nidle_sweep_hours = 0\n",
+            "[scheduler]\nidle_sweep_min_messages = 0\n",
+            "[scheduler]\nidle_sweep_min_messages = 10\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        assert!(Config::parse("[scroll]\nmax_messages = 20\nretain_tail = 10\n[scheduler]\nidle_sweep_min_messages = 11\n").is_ok());
+        assert!(Config::parse("[scheduler]\nroutine_wib_hour = 0\nroutine_wib_minute = 0\n").is_ok());
+    }
+
+    #[test]
+    fn unsupported_kit_keys_get_a_clear_error_not_silence() {
+        let e = Config::parse("[embeddings]\nbinary = \"llama-server.exe\"\n").unwrap_err();
+        assert!(e.contains("does not start an embedding server"), "{e}");
+        assert!(Config::parse("[embeddings]\nmodel_path = \"x\"\n").is_err());
+        let e = Config::parse("[curator]\nstaging_ttl_days = 7\n").unwrap_err();
+        assert!(e.contains("not supported yet"), "{e}");
+        assert!(Config::parse("[curator]\nstaging_ttl_days = 30\n").is_ok());
+    }
+
+    #[test]
+    fn errors_name_the_setting_but_never_echo_contents() {
+        let e = Config::parse("[storage]\nmax_notes = \"SECRET-VALUE-123\"\n").unwrap_err();
+        assert!(!e.contains("SECRET-VALUE-123"), "{e}");
+        assert!(e.contains("line 2"), "{e}");
+    }
+
+    #[test]
+    fn range_and_type_errors_never_repeat_the_value() {
+        for (text, value) in [
+            ("[storage]\nmax_notes = 98765\n", "98765"),
+            ("[embeddings]\nport = 70000\n", "70000"),
+            ("[scroll]\nignore_dirs = [42424]\n", "42424"),
+            ("[scroll]\nmax_messages = 5555\n", "5555"),
+            ("[scheduler]\ncooldown_hours = 31337\n", "31337"),
+            ("[embeddings]\nmrl_dim = 31415\n", "31415"),
+            ("[storage]\nmax_notes = 99999999999999999999999999\n", "99999999999999999999999999"),
+            ("[scroll]\nignore_dirs = [-4242]\n", "4242"),
+            ("[storage]\nmax_notes = 12.75\n", "12.75"),
+            ("[storage]\nmax_notes = \"sekrit\"\n", "sekrit"),
+            ("[embeddings]\nmodel_id = \"sekrit id\"\n", "sekrit"),
+        ] {
+            let e = Config::parse(text).unwrap_err();
+            assert!(!e.contains(value), "{text} -> {e}");
+        }
+    }
+
+    #[test]
+    fn path_expansion_requires_set_variables_and_absolute_results() {
+        with_clean_env(|| {
+            std::env::set_var("MEMB_CFG_TEST_ROOT", if cfg!(windows) { r"C:\data" } else { "/data" });
+            let p = expand_path("%MEMB_CFG_TEST_ROOT%/vault", "k").unwrap();
+            assert!(p.to_string_lossy().contains("vault") && p.is_absolute());
+            assert!(expand_path("%MEMB_CFG_TEST_UNSET_XYZ%/v", "k").is_err());
+            assert!(expand_path("relative/vault", "k").is_err());
+            assert!(expand_path("%unterminated", "k").is_err());
+            assert!(expand_path("%bad name%/v", "k").is_err());
+        });
+    }
+
+    #[test]
+    fn embedding_settings_reach_the_environment_and_the_environment_wins() {
+        with_clean_env(|| {
+            std::env::set_var("MEMB_CFG_TEST_ROOT", if cfg!(windows) { r"C:\models" } else { "/models" });
+            let cfg = Config::parse(
+                "[embeddings]\nport = 18432\nmodel_id = \"m-1\"\nmrl_dim = 256\ngemma_model_dir = \"%MEMB_CFG_TEST_ROOT%/gemma\"\n",
+            )
+            .unwrap();
+            cfg.apply_embedding_env().unwrap();
+            assert_eq!(std::env::var("MEMB_EMBED_PORT").unwrap(), "18432");
+            assert_eq!(std::env::var("MEMB_EMBED_MODEL_ID").unwrap(), "m-1");
+            assert_eq!(std::env::var("MEMB_EMBED_MRL_DIM").unwrap(), "256");
+            let dir = std::env::var("MEMB_GEMMA_MODEL_DIR").unwrap();
+            assert!(dir.contains("models") && dir.ends_with("gemma") && !dir.contains('%'), "{dir}");
+            assert!(std::env::var_os("MEMB_EMBED_DISABLE").is_none());
+
+            // A variable that is already set is never overwritten by the file.
+            clear_embedding_vars();
+            std::env::set_var("MEMB_EMBED_MRL_DIM", "128");
+            cfg.apply_embedding_env().unwrap();
+            assert_eq!(std::env::var("MEMB_EMBED_MRL_DIM").unwrap(), "128");
+            assert_eq!(std::env::var("MEMB_EMBED_PORT").unwrap(), "18432");
+
+            // enabled = false sets only the disable switch.
+            clear_embedding_vars();
+            Config::parse("[embeddings]\nenabled = false\nport = 18432\n")
+                .unwrap()
+                .apply_embedding_env()
+                .unwrap();
+            assert_eq!(std::env::var("MEMB_EMBED_DISABLE").unwrap(), "1");
+            assert!(std::env::var_os("MEMB_EMBED_PORT").is_none());
+
+            // An unset variable inside a path is an error, not a silent skip.
+            assert!(Config::parse("[embeddings]\ngemma_model_dir = \"%MEMB_CFG_NOT_SET_ANYWHERE%/x\"\n").is_err());
+        });
+    }
+
+    #[test]
+    fn mirror_directory_comes_from_config_unless_the_command_line_gives_one() {
+        with_clean_env(|| {
+            std::env::set_var("MEMB_CFG_TEST_ROOT", if cfg!(windows) { r"C:\vault" } else { "/vault" });
+            let cfg = Config::parse("[scheduler]\nobsidian_mirror_dir = \"%MEMB_CFG_TEST_ROOT%/out\"\n").unwrap();
+            let configured = cfg.mirror_root(None).unwrap().unwrap();
+            assert!(configured.is_absolute() && configured.ends_with("out") && configured.to_string_lossy().contains("vault"));
+            let cli = if cfg!(windows) { PathBuf::from(r"D:\cli") } else { PathBuf::from("/cli") };
+            assert_eq!(cfg.mirror_root(Some(&cli)).unwrap().unwrap(), cli);
+            assert_eq!(Config::default().mirror_root(None).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn oversized_or_non_regular_config_is_refused() {
+        let dir = std::env::temp_dir().join(format!("memb-cfg-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "#".repeat(MAX_CONFIG_BYTES as usize + 1)).unwrap();
+        assert!(Config::load(&dir).is_err());
+        std::fs::remove_file(dir.join("config.toml")).unwrap();
+        std::fs::create_dir(dir.join("config.toml")).unwrap();
+        assert!(Config::load(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
