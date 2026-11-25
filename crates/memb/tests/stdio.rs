@@ -11,11 +11,22 @@ struct Client {
     output: BufReader<ChildStdout>,
 }
 impl Client {
-    fn start(path: &Path, scope: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_memb"))
+    fn start(path: &Path) -> Self {
+        Self::start_with_capture(path, false)
+    }
+    fn start_with_capture(path: &Path, capture: bool) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_memb"));
+        if capture {
+            command.env("MEMB_SCROLL_CAPTURE", "1");
+        } else {
+            command.env_remove("MEMB_SCROLL_CAPTURE");
+        }
+        let mut child = command
             .arg("mcp")
             .env("MEMB_DATA_DIR", path)
-            .env("MEMB_PROJECT", scope)
+            .env_remove("MEMB_NO_MEMORY")
+            .env_remove("MEMB_INTERNAL")
+            .env_remove("MEMB_IGNORE_DIRS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -27,7 +38,8 @@ impl Client {
             input,
             output,
         };
-        assert_eq!(c.rpc("initialize", json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}))["result"]["protocolVersion"], "2025-06-18");
+        let init = c.rpc("initialize", json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}));
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
         writeln!(
             c.input,
             "{}",
@@ -45,9 +57,9 @@ impl Client {
         .unwrap();
         let mut line = String::new();
         self.output.read_line(&mut line).unwrap();
-        let value: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(value["id"], 10);
-        value
+        let result: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(result["id"], 10);
+        result
     }
     fn tool(&mut self, name: &str, args: Value) -> (bool, Value) {
         let result = self.rpc("tools/call", json!({"name":name,"arguments":args}));
@@ -72,7 +84,70 @@ impl Drop for Client {
 }
 
 #[test]
-fn shared_memory_scope_consent_and_graph() {
+fn cli_search_falls_back_when_embedding_server_is_absent() {
+    let root = std::env::temp_dir().join(format!(
+        "memb-cli-search-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut client = Client::start(&root);
+    let (error, _) = client.tool(
+        "remember",
+        json!({"title":"Synthetic apple", "desc":"red fruit", "kind":"topic", "confirmed":true}),
+    );
+    assert!(!error);
+    drop(client);
+    let output = Command::new(env!("CARGO_BIN_EXE_memb"))
+        .args(["search", "apple"])
+        .env("MEMB_DATA_DIR", &root)
+        .env("MEMB_EMBED_PORT", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["notes"][0]["title"], "Synthetic apple");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn supervisor_configuration_does_not_contact_unrelated_listener() {
+    let root = std::env::temp_dir().join(format!(
+        "memb-supervisor-negative-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut client = Client::start(&root);
+    let (error, _) = client.tool("remember", json!({"title":"Synthetic apple", "desc":"private synthetic text", "kind":"topic", "confirmed":true}));
+    assert!(!error);
+    drop(client);
+    // An unrelated service is already listening. Executable/model paths alone
+    // must not start supervision or send it the query or document text.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_memb"))
+        .args(["search", "apple"])
+        .env("MEMB_DATA_DIR", &root)
+        .env_remove("MEMB_EMBED_PORT")
+        .env("MEMB_EMBED_SERVER", env!("CARGO_BIN_EXE_memb"))
+        .env("MEMB_EMBED_MODEL", env!("CARGO_BIN_EXE_memb"))
+        .env("MEMB_EMBED_MODEL_ID", "synthetic-v1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["notes"][0]["title"], "Synthetic apple");
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unified_graph_requires_consent_for_mutations() {
     let root = std::env::temp_dir().join(format!(
         "memb-integration-{}-{}",
         std::process::id(),
@@ -81,122 +156,358 @@ fn shared_memory_scope_consent_and_graph() {
             .unwrap()
             .as_nanos()
     ));
-    let save = |kind: &str, title: &str, parents: Value, confirmed| json!({"title":title,"body":"Synthetic example","kind":kind,"parents":parents,"confirmed":confirmed});
-    let mut a = Client::start(&root, "alpha");
-    let mut b = Client::start(&root, "alpha");
+    let mut a = Client::start(&root);
+    let mut b = Client::start(&root);
     let tools = a.rpc("tools/list", json!({}));
-    let tools = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 8);
-    let opener = tools
+    let names: Vec<_> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|t| t["name"] == "open_inspector")
-        .unwrap();
-    let uri = &opener["_meta"]["ui"]["resourceUri"];
-    assert_eq!(opener["_meta"]["ui"]["visibility"], json!(["model"]));
-    let snapshot_tool = tools
-        .iter()
-        .find(|t| t["name"] == "inspector_snapshot")
-        .unwrap();
-    assert_eq!(snapshot_tool["_meta"]["ui"]["visibility"], json!(["app"]));
-    assert_eq!(&snapshot_tool["_meta"]["ui"]["resourceUri"], uri);
-    let page = a.rpc("resources/read", json!({"uri":uri}));
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        page["result"]["contents"][0]["mimeType"],
-        "text/html;profile=mcp-app"
-    );
-    let open = a.rpc(
-        "tools/call",
-        json!({"name":"open_inspector","arguments":{}}),
-    );
-    assert_eq!(
-        open["result"]["structuredContent"],
-        json!({"project":"alpha"})
-    );
-    let fresh = a.rpc(
-        "tools/call",
-        json!({"name":"inspector_snapshot","arguments":{}}),
-    );
-    assert_eq!(fresh["result"]["structuredContent"]["counts"]["total"], 0);
-    assert_eq!(fresh["result"]["content"][0]["type"], "text");
-    assert!(!root.exists());
-    assert!(
-        a.tool("remember", save("topic", "Orchard", json!([]), false))
-            .0
-    );
-    assert!(a.tool("remember", json!({"title":"Example","body":"api_key=synthetic-placeholder-123","kind":"topic","parents":[],"confirmed":true})).0);
-    assert!(!root.exists());
-    assert_eq!(
-        a.tool("remember", save("topic", "Orchard", json!([]), true))
-            .1["note"]["id"],
-        1
-    );
-    assert!(
-        b.tool("remember", save("claim", "Bad parent", json!([1]), true))
-            .0
-    );
-    assert_eq!(
-        b.tool(
+        names,
+        [
             "remember",
-            save("knowledge", "Cultivation", json!([1]), true)
+            "search",
+            "inspect",
+            "update",
+            "supersede",
+            "curator_evidence",
+            "curator_preview",
+            "curator_apply",
+            "scroll_chunk_read",
+            "retract"
+        ]
+    );
+    assert_eq!(
+        a.rpc("resources/list", json!({}))["result"]["resources"],
+        json!([])
+    );
+    let draft = json!({"title":"Orchard","desc":"Synthetic example","kind":"topic","parents":[],"properties":{"source":"test"}});
+    assert!(a.tool("remember", draft.clone()).0);
+    assert!(a.tool("remember", json!({"title":"secret","desc":"sk-1234567890abcdefghijkl","kind":"topic","confirmed":true})).0);
+    let mut approved = draft.clone();
+    approved["confirmed"] = json!(true);
+    let id = a.tool("remember", approved).1["note"]["id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        b.tool("inspect", json!({"id":id})).1["note"]["properties"]["source"],
+        "test"
+    );
+    assert!(a.tool("inspect", json!({"id":id,"project":"alpha"})).0);
+    assert!(a.tool("update", json!({"id":id,"title":"Changed"})).0);
+    assert_eq!(
+        a.tool(
+            "update",
+            json!({"id":id,"title":"Changed","confirmed":true})
         )
-        .1["note"]["id"],
-        2
+        .1["note"]["title"],
+        "Changed"
+    );
+    assert!(!b.tool("search", json!({"query":"Changed"})).1["notes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let knowledge = a.tool("remember", json!({"title":"Care","desc":"Synthetic","kind":"knowledge","parents":[id],"confirmed":true})).1["note"]["id"].as_u64().unwrap();
+    let denied = a.tool("retract", json!({"id":id,"confirmed":true}));
+    assert!(denied.0);
+    let message = denied.1.as_str().unwrap();
+    assert!(message.contains("migrate_to_topic_id"));
+    assert!(message.contains("force_cascade"));
+    assert!(!message.contains("Orchard"));
+    let claim = a.tool("remember", json!({"title":"Water","desc":"Synthetic","kind":"claim","parents":[knowledge],"confirmed":true})).1["note"]["id"].as_u64().unwrap();
+    assert!(a.tool("supersede", json!({"id":claim,"title":"Replacement","desc":"Synthetic","kind":"claim","parents":[knowledge]})).0);
+    let replacement = a.tool("supersede", json!({"id":claim,"title":"Replacement","desc":"Synthetic","kind":"claim","parents":[knowledge],"confirmed":true}));
+    assert!(!replacement.0);
+    let replacement_id = replacement.1["note"]["id"].as_u64().unwrap();
+    assert!(a.tool("retract", json!({"id":replacement_id})).0);
+    assert!(
+        !a.tool("retract", json!({"id":replacement_id,"confirmed":true}))
+            .0
     );
     assert_eq!(
-        a.tool("remember", save("claim", "Water weekly", json!([2]), true))
-            .1["note"]["id"],
-        3
+        a.tool("inspect", json!({"id":replacement_id})).1["note"]["status"],
+        "retracted"
     );
-    let projects = a.rpc(
-        "tools/call",
-        json!({"name":"inspector_projects","arguments":{}}),
+    drop(a);
+    drop(b);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn hooks_require_opt_in_honor_exclusions_and_deduplicate() {
+    let root = std::env::temp_dir().join(format!(
+        "memb-hook-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cwd = std::env::current_dir().unwrap();
+    let prompt = format!("orchard {}", "synthetic ".repeat(12));
+    let invoke = |enabled: bool, disabled: bool, excluded: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_memb"));
+        cmd.args(["hook", "prompt-submit", "--cli", "cc"])
+            .env("MEMB_DATA_DIR", &root)
+            .env_remove("MEMB_SCROLL_CAPTURE")
+            .env_remove("MEMB_NO_MEMORY")
+            .env_remove("MEMB_INTERNAL")
+            .env_remove("MEMB_IGNORE_DIRS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if enabled {
+            cmd.env("MEMB_SCROLL_CAPTURE", "1");
+        }
+        if disabled {
+            cmd.env("MEMB_NO_MEMORY", "1");
+        }
+        if excluded {
+            cmd.env("MEMB_IGNORE_DIRS", &cwd);
+        }
+        let mut child = cmd.spawn().unwrap();
+        write!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({"cwd":cwd,"session_id":"session1","prompt":prompt})
+        )
+        .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    assert!(invoke(false, false, false).stdout.is_empty());
+    assert!(!root.exists());
+    assert!(invoke(true, true, false).stdout.is_empty());
+    assert!(invoke(true, false, true).stdout.is_empty());
+    assert!(!root.exists());
+    let mut client = Client::start(&root);
+    assert!(
+        !client
+            .tool(
+                "remember",
+                json!({"title":"Orchard","desc":"Synthetic note","kind":"topic","confirmed":true})
+            )
+            .0
     );
+    let first = invoke(true, false, false);
+    assert!(first.status.success());
+    assert!(String::from_utf8(first.stdout)
+        .unwrap()
+        .contains("Synthetic note"));
+    let second = invoke(true, false, false);
+    assert!(second.stdout.is_empty());
+    assert!(
+        client
+            .tool(
+                "scroll_chunk_read",
+                json!({"chunk_id":"chk_cc_session1_0000"})
+            )
+            .0
+    );
+    drop(client);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn curator_proposals_require_preview_and_single_use_consent() {
+    let root = std::env::temp_dir().join(format!(
+        "memb-curator-runtime-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = memb_store::Store::open(&root).unwrap();
+    store
+        .with_db(|db| {
+            for _ in 0..90 {
+                memb_scroll::append_message(
+                    db,
+                    "synthetic",
+                    "cc",
+                    memb_scroll::Role::User,
+                    "Synthetic evidence".into(),
+                    true,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    drop(store);
+    let mut c = Client::start_with_capture(&root, true);
+    let evidence = c.tool("curator_evidence", json!({"chunks":[{"chunk_id":"a","session_id":"s1","summary":"synthetic","vec":{"scale":1.0,"data":[1,0]}},{"chunk_id":"b","session_id":"s2","summary":"synthetic","vec":{"scale":1.0,"data":[1,0]}}]}));
+    assert!(!evidence.0);
+    assert_eq!(evidence.1["packets"][0]["distinct_sessions"], 2);
+    let topic = c
+        .tool(
+            "remember",
+            json!({"title":"Topic","desc":"Synthetic","kind":"topic","confirmed":true}),
+        )
+        .1["note"]["id"]
+        .as_u64()
+        .unwrap();
+    let action = json!({"action":"KNOWLEDGE_UPSERT","title":"Proposed","desc":"Synthetic","parents":[topic]});
+    assert!(
+        c.tool("curator_apply", json!({"proposal_id":1,"confirmed":true}))
+            .0
+    );
+    assert!(
+        c.tool(
+            "curator_preview",
+            json!({"action":action,"source_chunks":[["wrong","chk_synthetic_0000"]]})
+        )
+        .0
+    );
+    let preview = c.tool(
+        "curator_preview",
+        json!({"action":action,"source_chunks":[["synthetic","chk_synthetic_0000"]]}),
+    );
+    assert!(!preview.0);
+    assert_eq!(preview.1["action"], action);
+    let id = preview.1["proposal_id"].as_u64().unwrap();
+    assert!(c.tool("curator_apply", json!({"proposal_id":id})).0);
     assert_eq!(
-        projects["result"]["structuredContent"],
-        json!({"projects":["alpha"],"active":"alpha"})
-    );
-    let graph = a.rpc(
-        "tools/call",
-        json!({"name":"inspector_graph","arguments":{"project":"alpha"}}),
-    );
-    assert_eq!(graph["result"]["structuredContent"]["counts"]["total"], 3);
-    assert_eq!(
-        graph["result"]["structuredContent"]["notes"][2]["parents"],
-        json!(["2"])
-    );
-    let denied = a.rpc(
-        "tools/call",
-        json!({"name":"inspector_graph","arguments":{"project":"beta"}}),
-    );
-    assert_eq!(denied["result"]["isError"], true);
-    let matches = b.tool("search", json!({"query":"cultivation"})).1;
-    assert_eq!(matches["notes"].as_array().unwrap().len(), 2);
-    assert_eq!(matches["notes"][1]["id"], 3);
-    assert_eq!(
-        b.tool("search", json!({"query":"orchard"})).1["notes"]
+        c.tool("search", json!({"query":"Proposed"})).1["notes"]
             .as_array()
             .unwrap()
             .len(),
-        1
+        0
     );
-    assert!(a.tool("inspect", json!({"project":"beta","id":1})).0);
-    assert!(Client::start(&root, "beta")
-        .tool("inspect", json!({"id":1}))
-        .1["note"]
-        .is_null());
-    drop(a);
-    drop(b);
-    let mut a = Client::start(&root, "alpha");
+    let applied = c.tool("curator_apply", json!({"proposal_id":id,"confirmed":true}));
+    assert!(!applied.0);
+    let note = c.tool("inspect", json!({"id":applied.1["note_id"]}));
     assert_eq!(
-        a.tool("inspect", json!({"id":3})).1["note"]["title"],
-        "Water weekly"
+        note.1["note"]["properties"]["source_chunks"][0]["chunk_id"],
+        "chk_synthetic_0000"
     );
-    assert!(a.tool("forget", json!({"id":2,"confirmed":true})).0);
+    assert!(
+        c.tool("curator_apply", json!({"proposal_id":id,"confirmed":true}))
+            .0
+    );
+    assert!(c.tool("curator_preview", json!({"action":{"action":"RETRACT","id":topic},"source_chunks":[["synthetic","chk_synthetic_0000"]]})).0);
+    drop(c);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mirror_is_create_only() {
+    let base = std::env::temp_dir().join(format!(
+        "memb-ops-cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let root = base.join("store");
+    let out = base.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let mut c = Client::start(&root);
+    assert!(
+        !c.tool(
+            "remember",
+            json!({"title":"Synthetic","desc":"Example","kind":"topic","confirmed":true})
+        )
+        .0
+    );
+    drop(c);
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_memb"))
+            .arg("mirror")
+            .arg("--out")
+            .arg(&out)
+            .env("MEMB_DATA_DIR", &root)
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success());
+    let file = out.join("topic-1.md");
+    assert!(std::fs::read_to_string(&file)
+        .unwrap()
+        .contains("Synthetic"));
+    std::fs::write(&file, "User-owned content").unwrap();
+    assert!(!run().status.success());
     assert_eq!(
-        a.tool("forget", json!({"id":3,"confirmed":true})).1["removed"],
-        true
+        std::fs::read_to_string(&file).unwrap(),
+        "User-owned content"
     );
-    assert!(a.tool("inspect", json!({"id":3})).1["note"].is_null());
-    drop(a);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn rollback_previews_requires_confirmation_and_rejects_conflicts() {
+    let root = std::env::temp_dir().join(format!(
+        "memb-rollback-cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut client = Client::start(&root);
+    assert!(
+        !client
+            .tool(
+                "remember",
+                json!({"title":"Original","desc":"Synthetic","kind":"topic","confirmed":true})
+            )
+            .0
+    );
+    assert!(
+        !client
+            .tool("update", json!({"id":1,"title":"Changed","confirmed":true}))
+            .0
+    );
+    let start = |rev: &str| {
+        Command::new(env!("CARGO_BIN_EXE_memb"))
+            .args(["rollback", "--rev", rev])
+            .env("MEMB_DATA_DIR", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut cancel = start("2");
+    writeln!(cancel.stdin.take().unwrap(), "no").unwrap();
+    let cancelled = cancel.wait_with_output().unwrap();
+    assert!(!cancelled.status.success());
+    let text = String::from_utf8(cancelled.stdout).unwrap();
+    assert!(text.contains("Original") && text.contains("Changed"));
+    assert_eq!(
+        client.tool("inspect", json!({"id":1})).1["note"]["title"],
+        "Changed"
+    );
+    let mut stale = start("2");
+    let mut stdout = BufReader::new(stale.stdout.take().unwrap());
+    let mut preview = String::new();
+    stdout.read_line(&mut preview).unwrap();
+    assert!(preview.contains("Original"));
+    assert!(
+        !client
+            .tool("update", json!({"id":1,"title":"Later","confirmed":true}))
+            .0
+    );
+    writeln!(stale.stdin.take().unwrap(), "ROLLBACK 2").unwrap();
+    assert!(!stale.wait().unwrap().success());
+    assert_eq!(
+        client.tool("inspect", json!({"id":1})).1["note"]["title"],
+        "Later"
+    );
+    let mut success = start("3");
+    writeln!(success.stdin.take().unwrap(), "ROLLBACK 3").unwrap();
+    let result = success.wait_with_output().unwrap();
+    assert!(result.status.success());
+    assert_eq!(
+        client.tool("inspect", json!({"id":1})).1["note"]["title"],
+        "Changed"
+    );
+    let unsupported = start("1").wait_with_output().unwrap();
+    assert!(!unsupported.status.success());
+    drop(client);
     std::fs::remove_dir_all(root).unwrap();
 }

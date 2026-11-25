@@ -1,0 +1,4 @@
+# Merge into ~/.codex/config.toml
+[hooks]
+prompt_submit = ["memb.exe", "hook", "prompt-submit", "--cli", "codex"]
+assistant_stop = ["memb.exe", "hook", "assistant-stop", "--cli", "codex"]

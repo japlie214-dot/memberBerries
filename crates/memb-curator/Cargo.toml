@@ -1,0 +1,12 @@
+[package]
+name = "memb-curator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+memb-core = { path = "../memb-core" }
+memb-store = { path = "../memb-store" }
+memb-embed = { path = "../memb-embed" }
+serde.workspace = true
+serde_json.workspace = true

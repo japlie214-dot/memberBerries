@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Memb Web Inspector</title>
+  <style>
+    :root {
+      --bg: #0b1020; --surface: #121933; --surface-2: #0f162c; --border: #243055;
+      --text: #e2e8f0; --muted: #94a3b8; --accent: #8b5cf6; --topic: #8b5cf6;
+      --knowledge: #0ea5e9; --claim: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); overflow: hidden; }
+    .app { display: flex; flex-direction: column; height: 100vh; }
+    header, .toolbar, footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface); flex-wrap: wrap; }
+    footer { border-bottom: 0; border-top: 1px solid var(--border); font: 11px ui-monospace, monospace; color: var(--muted); }
+    .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
+    .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
+    .btn { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+    .btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    input[type="text"] { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; min-width: 200px; flex: 1; max-width: 340px; }
+    main { flex: 1; display: flex; min-height: 0; position: relative; }
+    .canvas-wrap { flex: 1; position: relative; overflow: hidden; background-image: radial-gradient(rgba(148,163,184,.16) 1px, transparent 1px); background-size: 22px 22px; }
+    svg { width: 100%; height: 100%; display: block; }
+    aside { width: 340px; max-width: 100%; border-left: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; overflow: hidden; }
+    .drawer-head { padding: 12px; border-bottom: 1px solid var(--border); }
+    .drawer-body { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 14px; font-size: 12px; }
+    .label { font: 600 10px ui-monospace, monospace; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
+    .desc { line-height: 1.55; white-space: pre-wrap; margin: 0; }
+    table.props { width: 100%; border-collapse: collapse; font: 11px ui-monospace, monospace; }
+    table.props td { padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-word; }
+    table.props td:first-child { color: var(--muted); width: 40%; }
+    .link-btn { width: 100%; text-align: left; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; }
+    pre { margin: 0; padding: 8px; border-radius: 6px; background: var(--bg); border: 1px solid var(--border); font: 10px ui-monospace, monospace; overflow-x: auto; }
+    .list-wrap { flex: 1; overflow-y: auto; padding: 12px; display: none; }
+    .list-item { width: 100%; text-align: left; padding: 10px; margin-bottom: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; }
+    @media (max-width: 720px) { main { flex-direction: column; } aside { width: 100%; height: 46%; border-left: 0; border-top: 1px solid var(--border); } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand"><span>memb web inspector</span><span class="pill">Unified Graph</span></div>
+      <div style="display:flex;gap:6px;">
+        <button class="btn active" id="btn-graph">Graph</button>
+        <button class="btn" id="btn-list">List</button>
+        <button class="btn" id="btn-refresh">Refresh</button>
+      </div>
+    </header>
+    <div class="toolbar">
+      <input id="q" type="text" placeholder="Search title or desc..." />
+      <div style="display:flex;gap:4px;">
+        <button class="btn active" data-kind="all">all</button>
+        <button class="btn" data-kind="topic">topic</button>
+        <button class="btn" data-kind="knowledge">knowledge</button>
+        <button class="btn" data-kind="claim">claim</button>
+      </div>
+      <span class="pill" id="counts">0 notes</span>
+    </div>
+    <main>
+      <section class="canvas-wrap" id="graph-panel"><svg id="svg"><g id="vp"><g id="edges"></g><g id="nodes"></g></g></svg></section>
+      <section class="list-wrap" id="list-panel"></section>
+      <aside>
+        <div class="drawer-head"><div class="label" id="d-meta">Select a note</div><div id="d-title" style="font-weight:600;font-size:14px;">—</div></div>
+        <div class="drawer-body" id="d-body"><div style="color:var(--muted);">Click any node to inspect its <code>desc</code>, <code>properties</code>, and <code>parents</code>.</div></div>
+      </aside>
+    </main>
+    <footer><span id="status">Ready</span><span>Read-only · memb.exe web</span></footer>
+  </div>
+  <script>
+    const COLORS = { topic: '#8b5cf6', knowledge: '#0ea5e9', claim: '#f59e0b' };
+    const state = { notes: [], selectedId: null, kind: 'all', q: '', tx: 40, ty: 40, scale: 1 };
+    const $ = (id) => document.getElementById(id);
+
+    async function fetchGraph() {
+      $('status').textContent = 'Loading graph...';
+      const key = new URLSearchParams(location.hash.slice(1)).get('key') || '';
+      const res = await fetch('/api/graph', { headers: key ? { 'x-memb-viewer': key } : {} });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      state.notes = data.notes || [];
+      const tiers = { topic: [], knowledge: [], claim: [] };
+      state.notes.forEach((n) => (tiers[n.kind] || tiers.knowledge).push(n));
+      ['topic', 'knowledge', 'claim'].forEach((k, row) => {
+        tiers[k].forEach((n, idx) => { n._x = 110 + idx * 170; n._y = 90 + row * 145; });
+      });
+      const c = data.counts || { total: state.notes.length, topics: 0, knowledge: 0, claims: 0 };
+      $('counts').textContent = `${c.topics}T · ${c.knowledge}K · ${c.claims}C (${c.total})`;
+      $('status').textContent = `Loaded ${state.notes.length} notes`;
+      if (!state.selectedId && state.notes.length) state.selectedId = state.notes[0].id;
+      render();
+    }
+
+    function filtered() {
+      const q = state.q.trim().toLowerCase();
+      return state.notes.filter((n) => {
+        if (state.kind !== 'all' && n.kind !== state.kind) return false;
+        if (!q) return true;
+        return n.title.toLowerCase().includes(q) || (n.desc || '').toLowerCase().includes(q) || n.id === q;
+      });
+    }
+
+    function render() {
+      const list = filtered();
+      const map = new Map(list.map((n) => [n.id, n]));
+      $('vp').setAttribute('transform', `translate(${state.tx},${state.ty}) scale(${state.scale})`);
+      const edgesEl = $('edges'), nodesEl = $('nodes');
+      edgesEl.innerHTML = ''; nodesEl.innerHTML = '';
+
+      list.forEach((n) => {
+        (n.parents || []).forEach((pid) => {
+          const p = map.get(pid);
+          if (!p) return;
+          const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+          line.setAttribute('x1', n._x); line.setAttribute('y1', n._y);
+          line.setAttribute('x2', p._x); line.setAttribute('y2', p._y);
+          line.setAttribute('stroke', (n.id === state.selectedId || p.id === state.selectedId) ? '#a78bfa' : '#475569');
+          line.setAttribute('stroke-width', (n.id === state.selectedId || p.id === state.selectedId) ? '2' : '1.2');
+          edgesEl.appendChild(line);
+        });
+      });
+
+      list.forEach((n) => {
+        const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        g.setAttribute('transform', `translate(${n._x},${n._y})`);
+        g.style.cursor = 'pointer';
+        const r = n.kind === 'topic' ? 20 : (n.kind === 'knowledge' ? 15 : 11);
+        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        c.setAttribute('r', r);
+        c.setAttribute('fill', COLORS[n.kind] || '#0ea5e9');
+        c.setAttribute('stroke', n.id === state.selectedId ? '#fff' : '#1e293b');
+        c.setAttribute('stroke-width', n.id === state.selectedId ? '2.5' : '1.5');
+        g.appendChild(c);
+        const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        t.setAttribute('y', r + 14); t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('fill', '#e2e8f0'); t.setAttribute('font-size', '11');
+        t.textContent = n.title.length > 24 ? n.title.slice(0, 22) + '…' : n.title;
+        g.appendChild(t);
+        g.addEventListener('click', () => { state.selectedId = n.id; render(); });
+        nodesEl.appendChild(g);
+      });
+
+      const listEl = $('list-panel');
+      listEl.innerHTML = '';
+      list.forEach((n) => {
+        const b = document.createElement('button');
+        b.className = 'list-item';
+        b.innerHTML = `<div class="label">#${n.id} · ${n.kind} · ${n.status || 'active'}</div><div style="font-weight:600;margin-bottom:4px;"></div><div style="color:var(--muted);font-size:12px;"></div>`;
+        b.children[1].textContent = n.title;
+        b.children[2].textContent = n.desc || '';
+        b.addEventListener('click', () => { state.selectedId = n.id; render(); });
+        listEl.appendChild(b);
+      });
+
+      renderDetail();
+    }
+
+    function renderDetail() {
+      const n = state.notes.find((x) => x.id === state.selectedId);
+      if (!n) return;
+      $('d-meta').textContent = `id: ${n.id} · ${n.kind} · ${n.status || 'active'}`;
+      $('d-title').textContent = n.title;
+      const body = $('d-body');
+      body.innerHTML = '';
+
+      const addSection = (title, node) => {
+        const wrap = document.createElement('div');
+        const lbl = document.createElement('div');
+        lbl.className = 'label'; lbl.textContent = title;
+        wrap.appendChild(lbl); wrap.appendChild(node);
+        body.appendChild(wrap);
+      };
+
+      const descEl = document.createElement('p');
+      descEl.className = 'desc'; descEl.textContent = n.desc || '';
+      addSection('desc', descEl);
+
+      const props = n.properties || {};
+      const keys = Object.keys(props);
+      if (keys.length) {
+        const tbl = document.createElement('table');
+        tbl.className = 'props';
+        keys.forEach((k) => {
+          const tr = document.createElement('tr');
+          const td1 = document.createElement('td'); td1.textContent = k;
+          const td2 = document.createElement('td'); td2.textContent = typeof props[k] === 'string' ? props[k] : JSON.stringify(props[k]);
+          tr.appendChild(td1); tr.appendChild(td2); tbl.appendChild(tr);
+        });
+        addSection('properties', tbl);
+      } else {
+        const empty = document.createElement('div');
+        empty.style.color = 'var(--muted)'; empty.textContent = '{}';
+        addSection('properties', empty);
+      }
+
+      const parentsWrap = document.createElement('div');
+      (n.parents || []).forEach((pid) => {
+        const p = state.notes.find((x) => x.id === pid);
+        if (!p) return;
+        const btn = document.createElement('button');
+        btn.className = 'link-btn';
+        btn.innerHTML = `<span></span><span style="color:var(--muted)">#${p.id}</span>`;
+        btn.firstChild.textContent = p.title;
+        btn.addEventListener('click', () => { state.selectedId = p.id; render(); });
+        parentsWrap.appendChild(btn);
+      });
+      if (!parentsWrap.childElementCount) parentsWrap.textContent = '[]';
+      addSection('parents', parentsWrap);
+
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify({ id: n.id, kind: n.kind, status: n.status, title: n.title, desc: n.desc, parents: n.parents, properties: n.properties }, null, 2);
+      addSection('raw json', pre);
+    }
+
+    $('q').addEventListener('input', (e) => { state.q = e.target.value; render(); });
+    document.querySelectorAll('[data-kind]').forEach((b) => b.addEventListener('click', () => {
+      state.kind = b.dataset.kind;
+      document.querySelectorAll('[data-kind]').forEach((x) => x.classList.toggle('active', x === b));
+      render();
+    }));
+    $('btn-graph').addEventListener('click', () => { $('graph-panel').style.display = 'block'; $('list-panel').style.display = 'none'; $('btn-graph').classList.add('active'); $('btn-list').classList.remove('active'); });
+    $('btn-list').addEventListener('click', () => { $('graph-panel').style.display = 'none'; $('list-panel').style.display = 'block'; $('btn-list').classList.add('active'); $('btn-graph').classList.remove('active'); });
+    $('btn-refresh').addEventListener('click', () => fetchGraph().catch((e) => { $('status').textContent = e.message; }));
+    window.addEventListener('load', () => fetchGraph().catch((e) => { $('status').textContent = e.message; }));
+  </script>
+</body>
+</html>

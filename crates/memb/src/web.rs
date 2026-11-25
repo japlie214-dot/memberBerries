@@ -1,8 +1,7 @@
 //! Read-only, loopback-only HTTP transport for the shared inspector.
 
 use super::viewer;
-use memb_core::Scope;
-use memb_store::{Error, Store};
+use memb_store::Store;
 use serde_json::{json, Map, Value};
 use std::{
     collections::BTreeMap,
@@ -17,7 +16,7 @@ const HTML: &str = "text/html; charset=utf-8";
 const JSON: &str = "application/json";
 const TEXT: &str = "text/plain; charset=utf-8";
 
-pub fn serve(store: Store, pinned: Option<Scope>, port: u16) -> Result<(), Error> {
+pub fn serve(store: Store, port: u16) -> io::Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
     let host = listener.local_addr()?.to_string();
     let origin = format!("http://{host}");
@@ -32,14 +31,7 @@ pub fn serve(store: Store, pinned: Option<Scope>, port: u16) -> Result<(), Error
         match listener.accept() {
             Ok((mut stream, _)) => {
                 // Client disconnects and timeouts must not stop the listener.
-                let _ = handle(
-                    &mut stream,
-                    &host,
-                    &origin,
-                    &store,
-                    pinned.as_ref(),
-                    &access_key,
-                );
+                let _ = handle(&mut stream, &host, &origin, &store, &access_key);
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err.into()),
@@ -174,7 +166,7 @@ fn args(query: &str) -> Result<Value, &'static str> {
         for field in query.split('&') {
             let (name, value) = field.split_once('=').ok_or("invalid query parameter")?;
             let name = decode(name)?;
-            if !matches!(name.as_str(), "project" | "after" | "query") {
+            if !matches!(name.as_str(), "after" | "query") {
                 return Err("unexpected query parameter");
             }
             if args.insert(name, Value::String(decode(value)?)).is_some() {
@@ -215,7 +207,6 @@ fn handle(
     host: &str,
     origin: &str,
     store: &Store,
-    pinned: Option<&Scope>,
     access_key: &str,
 ) -> io::Result<()> {
     let mut buf = [0; MAX_HEADERS];
@@ -247,14 +238,13 @@ fn handle(
             );
             respond(stream, "200 OK", HTML, page.as_bytes(), &policy)
         }
-        "/api/snapshot" | "/api/projects" | "/api/graph" => {
+        "/api/snapshot" | "/api/graph" => {
             if request.header("x-memb-viewer") != Some(access_key) {
                 return reject(stream, "403 Forbidden");
             }
             let (status, value) = match args(query).and_then(|args| match path {
-                "/api/projects" => viewer::projects(store, pinned, &args),
-                "/api/graph" => viewer::graph(store, pinned, &args),
-                _ => viewer::snapshot(store, pinned, &args),
+                "/api/graph" => viewer::graph(store, &args),
+                _ => viewer::snapshot(store, &args),
             }) {
                 Ok(value) => ("200 OK", value),
                 Err(message) => ("400 Bad Request", json!({"error":message})),
@@ -358,7 +348,6 @@ mod tests {
             address.port()
         )))
         .unwrap();
-        let scope = Scope::parse("example").unwrap();
         let exchange = |target: &str, extra_headers: &str| {
             let mut client = TcpStream::connect(address).unwrap();
             client.set_read_timeout(Some(SOCKET_BUDGET)).unwrap();
@@ -368,7 +357,7 @@ mod tests {
             )
             .unwrap();
             let (mut server, _) = listener.accept().unwrap();
-            handle(&mut server, &host, &origin, &store, Some(&scope), "1").unwrap();
+            handle(&mut server, &host, &origin, &store, "1").unwrap();
             drop(server);
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
@@ -390,32 +379,25 @@ mod tests {
         assert!(html.contains(&format!("<script nonce=\"{nonce}\">")));
         assert!(html.contains(&format!("<style nonce=\"{nonce}\">")));
 
-        for path in ["/api/snapshot", "/api/projects", "/api/graph"] {
+        for path in ["/api/snapshot", "/api/graph"] {
             assert!(exchange(path, "").starts_with("HTTP/1.1 403 Forbidden\r\n"));
         }
-        let projects = exchange("/api/projects", "X-Memb-Viewer: 1\r\n");
-        let data: Value = serde_json::from_str(projects.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(data["projects"], json!(["example"]));
-        let graph = exchange("/api/graph?project=example", "X-Memb-Viewer: 1\r\n");
-        let data: Value = serde_json::from_str(graph.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(data["notes"], json!([]));
-        assert!(exchange("/api/graph?project=wrong", "X-Memb-Viewer: 1\r\n")
-            .starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        let snapshot = exchange("/api/snapshot?after=0", "X-Memb-Viewer: 1\r\n");
-        assert!(snapshot.starts_with("HTTP/1.1 200 OK\r\n"));
-        let data: Value = serde_json::from_str(snapshot.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(data["project"], "example");
+        assert!(exchange("/api/projects", "X-Memb-Viewer: 1\r\n")
+            .starts_with("HTTP/1.1 404 Not Found\r\n"));
         assert!(
-            exchange("/api/snapshot?project=wrong", "X-Memb-Viewer: 1\r\n")
+            exchange("/api/graph?project=example", "X-Memb-Viewer: 1\r\n")
                 .starts_with("HTTP/1.1 400 Bad Request\r\n")
         );
+        assert!(exchange("/api/graph", "X-Memb-Viewer: 1\r\n").starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(exchange("/api/snapshot?after=0", "X-Memb-Viewer: 1\r\n")
+            .starts_with("HTTP/1.1 200 OK\r\n"));
     }
 
     #[test]
     fn preserves_query_parameters_as_text() {
         assert_eq!(
-            args("project=example&after=18446744073709551615&query=a%2Bb+%C3%A9").unwrap(),
-            json!({"project":"example", "after":"18446744073709551615", "query":"a+b é"})
+            args("after=18446744073709551615&query=a%2Bb+%C3%A9").unwrap(),
+            json!({"after":"18446744073709551615", "query":"a+b é"})
         );
         assert_eq!(args("").unwrap(), json!({}));
         for query in [

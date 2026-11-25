@@ -1,0 +1,9 @@
+[package]
+name = "memb-rag"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memb-core = { path = "../memb-core" }
+memb-store = { path = "../memb-store" }
+memb-embed = { path = "../memb-embed" }

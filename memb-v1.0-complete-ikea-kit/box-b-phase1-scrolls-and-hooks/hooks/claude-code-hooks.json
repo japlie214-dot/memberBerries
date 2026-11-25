@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": "memb.exe hook prompt-submit --cli cc" }] }],
+    "Stop": [{ "matcher": "", "hooks": [{ "type": "command", "command": "memb.exe hook assistant-stop --cli cc" }] }]
+  }
+}

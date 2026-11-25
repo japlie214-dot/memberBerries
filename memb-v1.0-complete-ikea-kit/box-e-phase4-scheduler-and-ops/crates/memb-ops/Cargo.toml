@@ -1,0 +1,11 @@
+[package]
+name = "memb-ops"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memb-core = { path = "../memb-core" }
+memb-store = { path = "../memb-store" }
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true

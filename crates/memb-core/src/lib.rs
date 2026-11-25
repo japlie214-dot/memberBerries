@@ -1,32 +1,16 @@
-//! Project-scoped data and input policy. No network or host transcript access.
-
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Scope(String);
+pub const MAX_TITLE_BYTES: usize = 160;
+pub const MAX_DESC_BYTES: usize = 4096;
+pub const MAX_PARENTS: usize = 8;
+pub const MAX_PROPERTIES_BYTES: usize = 4096;
+pub const MAX_QUERY_BYTES: usize = 512;
 
-impl Scope {
-    pub fn parse(value: &str) -> Result<Self, &'static str> {
-        if value.is_empty()
-            || value.len() > 64
-            || !value.as_bytes()[0].is_ascii_alphanumeric()
-            || !value
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
-        {
-            return Err("project must be 1–64 lowercase ASCII letters, digits, hyphens or underscores and start with a letter or digit");
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Topic,
@@ -34,72 +18,201 @@ pub enum Kind {
     Claim,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteStatus {
+    #[default]
+    Active,
+    Superseded,
+    Retracted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Draft {
     pub title: String,
-    pub body: String,
+    #[serde(alias = "body")]
+    pub desc: String,
     pub kind: Kind,
+    #[serde(default)]
     pub parents: Vec<u64>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotePatch {
+    pub title: Option<String>,
+    #[serde(alias = "body")]
+    pub desc: Option<String>,
+    pub parents: Option<Vec<u64>>,
+    /// Merges keys into existing properties; null values remove the key.
+    pub properties: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub id: u64,
     pub title: String,
-    pub body: String,
+    pub desc: String,
     pub kind: Kind,
+    #[serde(default)]
+    pub status: NoteStatus,
+    #[serde(default)]
     pub parents: Vec<u64>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<u64>,
+    #[serde(default)]
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub updated_at_ms: u64,
 }
 
-static CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)-----BEGIN +(?:[A-Z0-9]+ +)*PRIVATE +KEY-----|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\b(?:gh[pousr]_|github_pat_|sk-(?:proj-|ant-)?|xox[baprs]-)[A-Z0-9_\-]{12,}|\b(?:bearer|api[_ -]?key|password|passwd|secret|access[_ -]?token)\s*[:= ]\s*\S{8,}").expect("constant credential detector")
-});
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError(pub String);
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for ValidationError {}
+
+fn secret_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)-----BEGIN +(?:[A-Z0-9]+ +)*PRIVATE +KEY-----|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\b(?:gh[pousr]_|github_pat_|sk-(?:proj-|ant-)?|xox[baprs]-)[A-Z0-9_\-]{12,}|\b(?:bearer|api[_ -]?key|password|passwd|secret|access[_ -]?token)\s*[:= ]\s*\S{8,}")
+            .expect("valid secret regex")
+    })
+}
+
+pub fn reject_secrets(text: &str) -> Result<(), ValidationError> {
+    if secret_regex().is_match(text) {
+        return Err(ValidationError(
+            "rejected: input appears to contain a credential or private key".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_title(title: &str) -> Result<String, ValidationError> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(ValidationError("title must not be empty".into()));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(ValidationError("title must be single-line".into()));
+    }
+    if trimmed.len() > MAX_TITLE_BYTES {
+        return Err(ValidationError(format!("title exceeds {MAX_TITLE_BYTES} UTF-8 bytes")));
+    }
+    reject_secrets(trimmed)?;
+    Ok(trimmed.to_string())
+}
+
+pub fn validate_desc(desc: &str) -> Result<String, ValidationError> {
+    let trimmed = desc.trim();
+    if trimmed.is_empty() {
+        return Err(ValidationError("desc must not be empty".into()));
+    }
+    if trimmed.len() > MAX_DESC_BYTES {
+        return Err(ValidationError(format!("desc exceeds {MAX_DESC_BYTES} UTF-8 bytes")));
+    }
+    if trimmed.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return Err(ValidationError("desc contains control characters".into()));
+    }
+    reject_secrets(trimmed)?;
+    Ok(trimmed.to_string())
+}
+
+pub fn validate_properties(props: &BTreeMap<String, Value>) -> Result<(), ValidationError> {
+    let serialized = serde_json::to_string(props)
+        .map_err(|e| ValidationError(format!("invalid properties JSON: {e}")))?;
+    if serialized.len() > MAX_PROPERTIES_BYTES {
+        return Err(ValidationError(format!(
+            "properties JSON exceeds {MAX_PROPERTIES_BYTES} bytes"
+        )));
+    }
+    fn check_value(value: &Value) -> Result<(), ValidationError> {
+        match value {
+            Value::String(text) => reject_secrets(text),
+            Value::Array(values) => { for value in values { check_value(value)?; } Ok(()) },
+            Value::Object(map) => {
+                for (key, value) in map {
+                    reject_secrets(key)?;
+                    if let Value::String(text) = value {
+                        reject_secrets(&format!("{key}={text}"))?;
+                    }
+                    check_value(value)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    for (key, value) in props {
+        reject_secrets(key)?;
+        if let Value::String(text) = value {
+            reject_secrets(&format!("{key}={text}"))?;
+        }
+        check_value(value)?;
+    }
+    Ok(())
+}
+
+pub fn validate_parents_shape(kind: Kind, parents: &[u64]) -> Result<Vec<u64>, ValidationError> {
+    if parents.len() > MAX_PARENTS { return Err(ValidationError("too many parents".into())); }
+    let mut dedup = Vec::with_capacity(parents.len());
+    for &p in parents {
+        if dedup.contains(&p) { return Err(ValidationError("duplicate parent".into())); }
+        dedup.push(p);
+    }
+    match kind {
+        Kind::Topic => {
+            if !dedup.is_empty() {
+                return Err(ValidationError("topic notes must not have parents".into()));
+            }
+        }
+        Kind::Knowledge | Kind::Claim => {
+            if dedup.is_empty() || dedup.len() > MAX_PARENTS {
+                return Err(ValidationError(format!(
+                    "{:?} notes require 1..={MAX_PARENTS} parents",
+                    kind
+                )));
+            }
+        }
+    }
+    Ok(dedup)
+}
 
 impl Draft {
-    pub fn into_note(mut self, id: u64) -> Result<Note, &'static str> {
-        self.title = self.title.trim().to_owned();
-        self.body = self.body.trim().to_owned();
-        if self.title.is_empty()
-            || self.title.len() > 160
-            || self.title.chars().any(char::is_control)
-        {
-            return Err("title must contain 1–160 bytes of single-line text");
-        }
-        if self.body.is_empty()
-            || self.body.len() > 4096
-            || self
-                .body
-                .chars()
-                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-        {
-            return Err("body must contain 1–4096 bytes of text");
-        }
-        if CREDENTIAL.is_match(&self.title) || CREDENTIAL.is_match(&self.body) {
-            return Err("possible credential detected; remove it before saving");
-        }
-        self.parents.sort_unstable();
-        if self.parents.len() > 8 || self.parents.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err("at most eight distinct parent IDs are allowed");
-        }
-        if (self.kind == Kind::Topic) != self.parents.is_empty() {
-            return Err("topics have no parents; knowledge and claims require parents");
-        }
-        Ok(Note {
-            id,
-            title: self.title,
-            body: self.body,
+    pub fn validate(self) -> Result<Self, ValidationError> {
+        let title = validate_title(&self.title)?;
+        let desc = validate_desc(&self.desc)?;
+        let parents = validate_parents_shape(self.kind, &self.parents)?;
+        validate_properties(&self.properties)?;
+        Ok(Self {
+            title,
+            desc,
             kind: self.kind,
-            parents: self.parents,
+            parents,
+            properties: self.properties,
         })
     }
 }
 
-pub fn words(value: &str) -> impl Iterator<Item = String> + '_ {
-    value
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
+pub fn validate_query(query: &str) -> Result<String, ValidationError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(ValidationError("query must not be empty".into()));
+    }
+    if trimmed.len() > MAX_QUERY_BYTES {
+        return Err(ValidationError(format!("query exceeds {MAX_QUERY_BYTES} bytes")));
+    }
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -107,21 +220,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scope_cannot_be_a_path() {
-        assert!(Scope::parse("project-2").is_ok());
-        for bad in ["", "..", "foo/bar", "Some", "-foo", "foo "] {
-            assert!(Scope::parse(bad).is_err());
-        }
+    fn validates_draft_with_desc_and_properties() {
+        let mut props = BTreeMap::new();
+        props.insert("confidence".into(), serde_json::json!(0.92));
+        let d = Draft {
+            title: "Unified Graph".into(),
+            desc: "Single redb store without project scoping.".into(),
+            kind: Kind::Topic,
+            parents: vec![],
+            properties: props,
+        };
+        assert!(d.validate().is_ok());
     }
 
     #[test]
-    fn credential_is_refused_before_note_construction() {
-        let draft = Draft {
-            title: "Example".into(),
-            body: "api_key=synthetic-placeholder-123".into(),
+    fn rejects_nested_credential_fields_and_unescaped_values() {
+        for value in [serde_json::json!({"password": "synthetic-value-123"}),
+                      serde_json::json!([{"api_key": "synthetic-value-123"}]),
+                      serde_json::json!({"text": "password=synthetic-value-123"})] {
+            let props = BTreeMap::from([("nested".to_string(), value)]);
+            assert!(validate_properties(&props).is_err());
+        }
+        assert!(validate_properties(&BTreeMap::from([("confidence".into(), serde_json::json!(0.9))])).is_ok());
+    }
+
+    #[test]
+    fn rejects_secret_in_properties() {
+        let mut props = BTreeMap::new();
+        props.insert("token".into(), serde_json::json!("sk-1234567890abcdefghijkl"));
+        let d = Draft {
+            title: "Bad Note".into(),
+            desc: "Clean desc".into(),
             kind: Kind::Topic,
             parents: vec![],
+            properties: props,
         };
-        assert!(draft.into_note(1).is_err());
+        assert!(d.validate().is_err());
     }
 }

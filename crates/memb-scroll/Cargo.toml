@@ -1,0 +1,10 @@
+[package]
+name = "memb-scroll"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memb-core = { path = "../memb-core" }
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true

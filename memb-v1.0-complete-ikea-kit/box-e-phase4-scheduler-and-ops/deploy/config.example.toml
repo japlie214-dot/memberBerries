@@ -1,0 +1,32 @@
+# %LOCALAPPDATA%\memberBerries\config.toml
+[storage]
+max_notes = 50000
+
+[scroll]
+max_messages = 90
+retain_tail = 10
+min_prompt_chars = 100
+dedup_reset_every_n_chunks = 7
+ignore_dirs = ["*/tmp/*", "*/playground/*"]
+
+[embeddings]
+enabled = true
+binary = "llama-server.exe"
+model_path = "%LOCALAPPDATA%\\memberBerries\\models\\embeddinggemma-2.gguf"
+port = 18432
+mrl_dim = 256
+
+[curator]
+backend = "cli"
+cli_command = "claude -p"
+chunk_to_chunk_threshold = 0.72
+chunk_to_node_threshold = 0.70
+staging_ttl_days = 30
+
+[scheduler]
+routine_wib_hour = 15
+routine_wib_minute = 45
+cooldown_hours = 20
+idle_sweep_hours = 24
+idle_sweep_min_messages = 45
+obsidian_mirror_dir = "%LOCALAPPDATA%\\memberBerries\\vault"

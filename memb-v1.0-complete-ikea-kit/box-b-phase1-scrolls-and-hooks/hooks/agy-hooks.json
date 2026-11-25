@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "UserPromptSubmit": ["memb.exe hook prompt-submit --cli agy"],
+    "Stop": ["memb.exe hook assistant-stop --cli agy"]
+  }
+}
