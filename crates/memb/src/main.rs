@@ -1,4 +1,5 @@
 mod config;
+mod curate;
 mod viewer;
 mod web;
 
@@ -92,6 +93,80 @@ fn main() {
         eprintln!("Usage: memb rollback --rev <positive-revision-id>");
         std::process::exit(2);
     }
+    if args.first().is_some_and(|a| a == "curate") {
+        let dry_run = match args.as_slice() {
+            [_] => false,
+            [_, flag] if flag == "--dry-run" => true,
+            _ => {
+                eprintln!("{}", curate::CURATE_USAGE);
+                std::process::exit(2);
+            }
+        };
+        let result = settings_with_config().and_then(|(store, cfg)| {
+            let backend = curate::backend_for(&cfg, store.root())?;
+            curate::run_curate(&store, &cfg, &backend, now_ms()?, dry_run, &mut io::stderr())
+        });
+        match result {
+            Ok(summary) => {
+                println!("{}", summary.to_json());
+                return;
+            }
+            Err(reason) => {
+                // Reasons are fixed strings; nothing the model or a note wrote.
+                eprintln!("memb: curate failed: {reason}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.first().is_some_and(|a| a == "proposals") {
+        let Some(command) = curate::parse_proposals(&args[1..]) else {
+            eprintln!("{}", curate::PROPOSALS_USAGE);
+            std::process::exit(2);
+        };
+        // Deciding on a proposal is for the user. The model command `memb curate` starts
+        // has MEMB_INTERNAL=1; refuse there so it cannot approve its own proposals.
+        if matches!(command, curate::ProposalsCommand::Apply(_) | curate::ProposalsCommand::Reject(_))
+            && env::var("MEMB_INTERNAL").ok().as_deref() == Some("1")
+        {
+            eprintln!("memb: proposals failed: refusing to decide a proposal from inside a curation session");
+            std::process::exit(1);
+        }
+        let result = settings_with_config().and_then(|(store, cfg)| {
+            let now = now_ms()?;
+            match command {
+                curate::ProposalsCommand::List(status, limit) => {
+                    curate::expire_old(&store, &cfg, now)?;
+                    for row in curate::list(&store, status, limit)? {
+                        println!("{row}");
+                    }
+                    Ok(true)
+                }
+                curate::ProposalsCommand::Show(id) => {
+                    println!("{}", curate::show(&store, id)?);
+                    Ok(true)
+                }
+                curate::ProposalsCommand::Reject(id) => {
+                    curate::reject(&store, id, now)?;
+                    println!("Rejected proposal {id}.");
+                    Ok(true)
+                }
+                curate::ProposalsCommand::Apply(id) => {
+                    curate::apply_interactive(&store, &cfg, id, now, &mut io::stdin().lock(), &mut io::stdout().lock())
+                }
+            }
+        });
+        match result {
+            Ok(true) => return,
+            Ok(false) => {
+                eprintln!("memb: cancelled; nothing was changed");
+                std::process::exit(1);
+            }
+            Err(reason) => {
+                eprintln!("memb: proposals failed: {reason}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().is_some_and(|a| a == "daemon") {
         let mirror_root = match args.as_slice() {
             [_] => None,
@@ -155,7 +230,7 @@ fn main() {
     }
     if args != ["mcp"] {
         eprintln!(
-            "Usage: memb mcp | memb search <query> | memb web [--port PORT] | memb mirror --out <dir> | memb revisions [--note <id>] | memb rollback --rev <id> | memb daemon [--mirror-out <dir>] | memb --version"
+            "Usage: memb mcp | memb search <query> | memb web [--port PORT] | memb mirror --out <dir> | memb revisions [--note <id>] | memb rollback --rev <id> | memb daemon [--mirror-out <dir>] | memb curate [--dry-run] | memb proposals [...] | memb --version"
         );
         std::process::exit(2);
     }
@@ -270,7 +345,8 @@ fn now_ms() -> Result<u64, String> {
     u64::try_from(ms).map_err(|_| "invalid clock".to_string())
 }
 
-/// One maintenance pass. Never curates: proposals still need user approval.
+/// One maintenance pass: sweep, stage, mirror, expire and, only if `curator.daemon_enabled`
+/// is set, curate. Proposals never apply themselves.
 /// Returns None when no routine was due or another process holds the claim.
 fn daemon_once(store: &Store, cfg: &config::Config, now: u64, mirror_root: Option<&Path>) -> Result<Option<(usize, usize)>, String> {
     let d = &cfg.scheduler;
@@ -293,6 +369,19 @@ fn daemon_once(store: &Store, cfg: &config::Config, now: u64, mirror_root: Optio
             let dir = root.join(format!("mirror-{now}"));
             std::fs::create_dir(&dir).map_err(|_| "mirror directory exists or is not creatable")?;
             mirror_snapshot(store, &dir)?;
+        }
+        curate::expire_old(store, cfg, now)?;
+        // Opt-in only: this sends conversation text to the configured command with nobody
+        // at the keyboard. A failing or unavailable model never fails the routine (the
+        // sweep, staging and mirror succeeded, and the chunks stay staged for the next
+        // run); it only produces pending proposals that wait for the user.
+        if cfg.curator.daemon_enabled {
+            let curated = curate::backend_for(cfg, store.root())
+                .and_then(|b| curate::run_curate(store, cfg, &b, now, false, &mut io::stderr()));
+            match curated {
+                Ok(summary) => eprintln!("memb: curation done; {} proposal(s) now await review", summary.proposals.len()),
+                Err(reason) => eprintln!("memb: curation skipped: {reason}"),
+            }
         }
         Ok((swept, staged))
     })();
@@ -1242,6 +1331,89 @@ cooldown_hours = 1
         let live = store.with_db(|db| memb_scroll::read_scroll(db, "s1")).unwrap().unwrap();
         assert_eq!(live.messages.len(), 5, "the configured retain_tail stays in the live scroll");
         drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_pass_enforces_the_staging_time_limit() {
+        let dir = std::env::temp_dir().join(format!("memb-daemon-ttl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        store.with_db(|db| {
+            for i in 0..45 {
+                memb_scroll::append_message(db, "s1", "test", memb_scroll::Role::User, format!("message {i}"), true)?;
+            }
+            Ok(())
+        }).unwrap();
+        let day = 24 * 3600 * 1000u64;
+        let now = (now_ms().unwrap() / day + 2) * day + 9 * 3600 * 1000;
+        let cfg = config::Config::default();
+        assert_eq!(daemon_once(&store, &cfg, now, None).unwrap(), Some((1, 1)));
+        assert_eq!(store.with_db(|db| memb_scroll::list_staged_chunks(db, 10)).unwrap().len(), 1);
+        // Staging is stamped with the real clock and `now` here is a day or two ahead of it:
+        // about three weeks on the chunk is still waiting; past the 30-day limit it is gone.
+        daemon_once(&store, &cfg, now + 20 * day, None).unwrap();
+        assert_eq!(store.with_db(|db| memb_scroll::list_staged_chunks(db, 10)).unwrap().len(), 1);
+        daemon_once(&store, &cfg, now + 60 * day, None).unwrap();
+        assert!(store.with_db(|db| memb_scroll::list_staged_chunks(db, 10)).unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The daemon curates only when `curator.daemon_enabled` is set, never applies a
+    /// proposal, and a failing model never fails the routine or loses the evidence.
+    #[cfg(windows)]
+    #[test]
+    fn daemon_curation_is_opt_in_never_applies_and_survives_a_failing_model() {
+        let dir = std::env::temp_dir().join(format!("memb-daemon-cur-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reply = dir.join("reply.json");
+        if reply.to_str().is_none_or(|p| p.contains(char::is_whitespace)) {
+            return; // the command line is split on spaces; a spaced temp path cannot be used
+        }
+        std::fs::write(&reply, r#"[{"action":"KNOWLEDGE_UPSERT","title":"From the daemon","desc":"Needs review","parents":[1],"source_chunks":["chk_s1_0000"]}]"#).unwrap();
+        let day = 24 * 3600 * 1000u64;
+        let seeded = |name: &str| {
+            let root = dir.join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            let store = Store::open(&root).unwrap();
+            // Note 1: the topic the proposal below hangs under.
+            store.remember(memb_core::Draft { title: "Topic".into(), desc: "A topic".into(), kind: memb_core::Kind::Topic, parents: vec![], properties: Default::default() }).unwrap();
+            store.with_db(|db| {
+                for i in 0..45 {
+                    memb_scroll::append_message(db, "s1", "test", memb_scroll::Role::User, format!("message {i}"), true)?;
+                }
+                Ok(())
+            }).unwrap();
+            store
+        };
+        let now = (now_ms().unwrap() / day + 2) * day + 9 * 3600 * 1000;
+        let pending = |store: &Store| store.with_db(|db| memb_curator::ledger::list(db, Some(&memb_curator::ledger::Status::Pending), 10)).unwrap().len();
+        let command = format!("cmd /C type {}", reply.display());
+
+        // Default (off): the chunk is staged, no model is run, nothing is proposed.
+        let off = seeded("off");
+        assert_eq!(daemon_once(&off, &config::Config::default(), now, None).unwrap(), Some((1, 1)));
+        assert_eq!(pending(&off), 0);
+        assert_eq!(off.with_db(|db| memb_scroll::list_staged_chunks(db, 5)).unwrap().len(), 1);
+
+        // On: one pending proposal, no note written, the chunk leaves staging.
+        let on = seeded("on");
+        // A TOML literal string (single quotes) keeps the backslashes of the path as they are.
+        let cfg = config::Config::parse(&format!("[curator]\ndaemon_enabled = true\ncli_command = '{command}'\n")).unwrap();
+        assert_eq!(daemon_once(&on, &cfg, now, None).unwrap(), Some((1, 1)));
+        assert_eq!(pending(&on), 1);
+        assert_eq!(on.load_all_notes().unwrap().len(), 1, "the daemon never applies a proposal (only the seeded topic exists)");
+        assert!(on.with_db(|db| memb_scroll::list_staged_chunks(db, 5)).unwrap().is_empty());
+
+        // On with a model that cannot start: the routine still succeeds and the chunk stays staged.
+        let broken = seeded("broken");
+        let cfg = config::Config::parse("[curator]\ndaemon_enabled = true\ncli_command = \"memb-no-such-program-xyz\"\n").unwrap();
+        assert_eq!(daemon_once(&broken, &cfg, now, None).unwrap(), Some((1, 1)));
+        assert_eq!(pending(&broken), 0);
+        assert_eq!(broken.with_db(|db| memb_scroll::list_staged_chunks(db, 5)).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

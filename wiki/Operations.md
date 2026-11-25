@@ -1,6 +1,6 @@
 # Operations: daemon, mirror, history and rollback
 
-These commands run on your machine against the local database. None of them contacts a network service on its own and none installs itself. The daemon, the mirror and `revisions` never change a note; the only command here that does is `rollback`, and only after you type its confirmation.
+These commands run on your machine against the local database. None of them starts a network service, and none installs itself. The one exception to "no network" is the model command you configure: `memb curate` (and the daemon, only if you set `curator.daemon_enabled`) runs it, and that program may itself contact a network. The daemon, the mirror, `revisions` and `curate` never change a note; the commands that do are `rollback` and `proposals apply`, each only after you type its confirmation.
 
 ## `memb daemon`
 
@@ -8,7 +8,7 @@ These commands run on your machine against the local database. None of them cont
 .\memb.exe daemon [--mirror-out <existing-directory>]
 ```
 
-A foreground loop for a background process or a scheduled task. **memb does not install the scheduled task** (see "Not done yet" below); you start the process yourself.
+A foreground loop for a background process or a scheduled task. **memb does not install the scheduled task itself**; you start the process yourself or run the reviewed installer yourself (see "Scheduled task" below).
 
 - **Start:** applies Windows' 2 GiB job-object memory cap to itself, reads [config.toml](Configuration.md), opens the store, waits 30 seconds, then checks once a minute.
 - **When it runs:** once a day, at or after the configured WIB time (default 15:45, UTC+7), at least `cooldown_hours` (default 20) after the last *successful* run, and in any case once 24 hours (or the cooldown, if longer) have passed since then. The very first run is due immediately.
@@ -17,14 +17,49 @@ A foreground loop for a background process or a scheduled task. **memb does not 
   1. **Sweep:** scrolls idle longer than `idle_sweep_hours` (default 24) with at least `idle_sweep_min_messages` (default 45) messages become chunks; the last `scroll.retain_tail` messages stay live. At most 100 scrolls per run.
   2. **Stage:** up to 100 uncurated chunks are recorded as staged evidence. This only marks them; it does not summarize, embed or write notes.
   3. **Mirror** (only if a directory is configured): writes a new `mirror-<timestamp>` folder under it (see below).
-- **Success is recorded only if every step succeeded.** After a failure the daemon waits 15 minutes before trying again, because a failed run does not start the cooldown.
+  4. **Expire:** staged chunks and pending proposals older than `curator.staging_ttl_days` (default 30) expire (see "Curation").
+  5. **Curate** (only if `curator.daemon_enabled = true`, which is **off by default**): the same as `memb curate` (see "Curation"). This sends private conversation text to `curator.cli_command` with nobody at the keyboard, so it is an explicit opt-in. It only produces pending proposals; the daemon never applies one. A model that fails, is missing or is refused (for example when too many proposals are pending) is reported as `curation skipped: <reason>` and does **not** fail the routine: the sweep, staging and mirror already succeeded and the chunks stay staged for the next run.
+- **Success is recorded only if every step through Expire succeeded** (a curation problem does not count). After a failure the daemon waits 15 minutes before trying again, because a failed run does not start the cooldown.
 - **Messages** go to stderr as one-line status notes (`routine done; swept N, staged M`); they never contain note text.
+
+### Scheduled task
+
+`scripts/install-daemon-task.ps1` (in the source repository, not in the packages) registers a per-user task that runs `memb.exe daemon` at your logon. It replaces the original kit's installer, which Windows would have stopped after three days (the default execution limit) and which had no dry run.
+
+```powershell
+.\scripts\install-daemon-task.ps1 -ExePath C:\Tools\memb\memb.exe -WhatIf   # prints the task, registers nothing
+.\scripts\install-daemon-task.ps1 -ExePath C:\Tools\memb\memb.exe           # registers it
+.\scripts\uninstall-daemon-task.ps1                                         # stops and removes it
+```
+
+The task runs as you, interactively and not elevated, with no execution time limit, a second instance ignored (`MultipleInstances IgnoreNew`), up to 3 restarts 2 minutes apart, and `StartWhenAvailable`. An existing task is never overwritten without `-Replace`; `-ExePath` must be an absolute path to an existing `memb.exe`; `-MirrorOut` (optional) must be an existing directory. Verified here: both scripts parse, `-WhatIf` prints the definition and registers nothing, bad paths are refused, and the settings object has `ExecutionTimeLimit PT0S` (unlimited). The installer was run for real once on the development machine (task registered, state Ready, the settings above confirmed with `Get-ScheduledTask`). **Not verified: a run at logon, and a long unattended run.** The task points at a stable copy of `memb.exe`, so rebuilding in the source folder does not collide with a running daemon; to update it, stop the task, replace the copy and start it again.
 
 ### Not done yet
 
-- **No curation step.** The manual's "Layer 2 curation" (model-written proposals from staged chunks) is not part of the daemon; curator tools exist for a person to preview and approve one change at a time. This is tracked as a separate ticket.
-- **No scheduled task.** The kit's `install-windows-task.ps1` has not been adopted: it needs review (for example, Windows' default three-day execution limit on a task would stop a long-running daemon) and your explicit approval before anything is registered.
+- **No scheduled task is installed by memb or by the packages.** Whether the daemon runs unattended on a schedule is your decision.
 - **No consolidation or compaction.** Retraction and deletion are logical; the database file is not shrunk.
+
+## Curation: `memb curate` and `memb proposals`
+
+```powershell
+.\memb.exe curate --dry-run         # how much text would be sent; sends nothing
+.\memb.exe curate                   # ask your configured model command for proposals
+.\memb.exe proposals                # list (newest first); --status pending|applied|rejected|expired|applying
+.\memb.exe proposals show 3         # the exact action, its sources and the current note
+.\memb.exe proposals apply 3        # asks you to type APPLY 3
+.\memb.exe proposals reject 3
+```
+
+`memb curate` is the only command that starts a model, and only the command you set in `curator.cli_command` (default `claude -p`; see [Configuration](Configuration.md)). **It sends private conversation text to that command.** It stages any new chunks and then makes two kinds of model calls: first **summaries** (one call per staged chunk that has none, at most 20 per run, each sending that chunk's text cut at 24 KiB), then **one curation call** with up to about 96 KiB of staged chunk text (each chunk cut at 12 KiB, with its summary) plus a list of your active notes (id, kind, title). Everything goes to the command's standard input, with `MEMB_INTERNAL=1` in its environment. Run `--dry-run` first to see the chunk count, size and how many summaries it would ask for. The command is run in a dedicated `curator-sandbox` directory under the data directory (created by memb, so the model session starts with no project files; memb does not keep it empty afterwards), without a shell, with a 3-minute limit and a 64 KiB limit on what it may write back (on timeout or overflow memb stops the command and, on Windows, the processes it started while it is still running, such as the real program behind a `cmd /C` wrapper; a program the command deliberately left running after it exited, for example `start /B`, is not stopped, only abandoned, and `memb curate` then reports a timeout); its raw reply is never printed or logged (the proposals parsed from it are shown by `proposals show` and the apply preview). Only the first 200 active notes are listed to it, with titles cut to 120 characters.
+
+- **Summaries (Layer 1):** the reply to each summary call must be one JSON object with 1 to 10 bullets (at most 300 characters each) and an optional `explicit_signal` flag (a standing user directive such as "always use"). A reply that cannot be used skips only that chunk, which is asked again next run; a command that fails or cannot start stops the run before anything is recorded for that chunk. The summary and flag are stored on the chunk, once. If an embedding backend is configured (EmbeddingGemma 2 in process, or a loopback server with `MEMB_EMBED_MODEL_ID` set), the **summary only, never the conversation text,** is embedded and the vector is stored on the chunk tagged with the model identity (and truncation size); with no backend the chunk has no vector. Summaries and vectors cover only staged chunks. Nothing uses the vectors yet: linking chunks to each other and to notes is T016.
+- **What the model can propose:** create knowledge, add or supersede a claim, update a note, or retract a note (never with a cascade), each citing chunk ids from the evidence it was sent. A proposal that cites any other chunk, does not parse, or fails validation is dropped (counted as `skipped`). The host, not the model, records the session id of each source. At most 8 proposals are kept per run.
+- **At most 200 proposals can be pending.** `memb curate` refuses to send anything while fewer than 8 slots remain; apply, reject or let some expire first.
+- **It changes no note.** Valid proposals are saved as `pending` in the database, shared by every process, and listed by `memb proposals`. The chunks sent leave staging once the reply parsed, whatever it proposed (the Phase 3 plan instead keeps deferred chunks staged until the 30-day limit; T016); if the command fails or its reply is unusable, nothing is recorded and the chunks stay staged for the next run.
+- **Applying needs your typed confirmation** of that exact proposal, and works once. `proposals apply` and `proposals reject` refuse to run when `MEMB_INTERNAL=1` is set (the environment the model command gets), so a command that runs shell commands cannot simply approve its own proposal; this is a guard against accident, not a security boundary, because a program can remove an environment variable. Choose a command without tool or shell access (for example `claude -p` without tools enabled). The proposal is claimed before the change is made: the proposal is claimed before the change is made, so a second process or a repeat cannot apply it again. If the change cannot be made as proposed (for example the note changed meanwhile) the proposal is marked `rejected` with the reason printed. A run that is killed between the claim and the result leaves the proposal `applying`; it is never applied twice, and you can `reject` it.
+- **Provenance:** a created note, or an updated note, gets `properties.source_chunks` (session and chunk ids), added by memb in the same write as the change; an update keeps the note's earlier sources. A retracted note cannot carry a source, so the record of what supported a retraction is the proposal itself (`proposals show`). `source_chunks` is reserved: a model that sets it is rejected.
+- **Staging limit:** chunks staged, and proposals pending, for longer than `curator.staging_ttl_days` (default 30) expire. This happens on every `curate`, on `proposals` (list and apply) and in each daemon routine run. Expiry marks them; **raw chunk text is not deleted**, only no longer offered for curation.
+- **Not done:** the Phase 3/4 plan applies the curator's output automatically, with rollback as the safety net, and builds it from linked evidence packets; here every proposal waits for your typed confirmation, rollback only covers single-note updates, and `memb curate` does not yet link chunks by similarity or build evidence packets (T016, T017; the clustering in `curator_evidence` works on vectors the caller supplies); the curation call sees the staged chunk text and its summary directly. From the daemon it runs only if you set `curator.daemon_enabled`. `claude -p`, `codex exec` and `agy -p` are the intended commands, but only the generic command runner is tested here, with a fake command; whether each real CLI accepts the prompt on standard input and answers with JSON only has not been verified.
 
 ## Obsidian mirror
 

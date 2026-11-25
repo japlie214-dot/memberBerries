@@ -8,7 +8,7 @@ Hooks let memb record short rolling "scrolls" of your conversations and, on supp
 |---|---|
 | `MEMB_SCROLL_CAPTURE=1` | Required to capture anything. Set it in the environment the host is started from. |
 | `MEMB_NO_MEMORY=1` | Kill switch: the hook exits without reading input. |
-| `MEMB_INTERNAL=1` | Reserved for memb's own future background model calls (the curator) so they are never captured. Nothing sets it today; the hook honors it if you or a script do. |
+| `MEMB_INTERNAL=1` | Set by `memb curate` in the environment of the model command it starts, so that command's own session is never captured (provided its host runs memb's hooks with that environment, which depends on the host and has not been verified). The hook exits without reading input when it is set, and `memb curate` refuses to run when it is set. |
 | `scroll.ignore_dirs` (config.toml) | Patterns such as `*/tmp/*`: a working directory whose lower-cased path contains the pattern (without `*`) is never captured. See [Configuration](Configuration.md). |
 | `MEMB_IGNORE_DIRS` | Absolute directories (OS path separator between them). Prompts from a working directory inside one are not captured. A relative or unresolvable entry disables capture, because the exclusion cannot be trusted. |
 

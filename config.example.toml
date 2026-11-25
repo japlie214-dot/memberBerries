@@ -31,12 +31,14 @@ enabled = true               # false forces lexical-only search
 
 # The kit's `binary` and `model_path` keys are rejected: memb never starts an embedding server.
 
-[curator]                    # reserved: only these default values are accepted until curation is wired
-backend = "cli"
-cli_command = "claude -p"
-chunk_to_chunk_threshold = 0.72
-chunk_to_node_threshold = 0.70
-staging_ttl_days = 30
+[curator]                    # used by `memb curate` (you run it; see wiki/Operations.md)
+backend = "cli"              # the only supported backend
+cli_command = "claude -p"    # run WITHOUT a shell, split on whitespace; it receives conversation text on stdin
+chunk_to_chunk_threshold = 0.72   # fixed: any other value is rejected
+chunk_to_node_threshold = 0.70    # fixed: any other value is rejected
+staging_ttl_days = 30        # 1..=365: staged evidence and unanswered proposals expire after this
+daemon_enabled = false       # true: `memb daemon` runs curation once a day, i.e. sends staged conversation
+                             # text to cli_command with nobody at the keyboard. Proposals still wait for you.
 
 [scheduler]                  # used by `memb daemon`
 routine_wib_hour = 15        # 0..=23, Western Indonesia Time (UTC+7)

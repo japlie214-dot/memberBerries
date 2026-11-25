@@ -25,6 +25,11 @@ memb runs without any configuration. To change a limit, put a `config.toml` next
 | `embeddings.model_id` | not set | up to 128 characters of letters, digits and `. _ : - @` | Names the vector cache for the server path. Same as `MEMB_EMBED_MODEL_ID`. |
 | `embeddings.gemma_model_dir` | not set | absolute path | In-process EmbeddingGemma 2 (ONNX q4) directory. Same as `MEMB_GEMMA_MODEL_DIR`. |
 | `embeddings.mrl_dim` | full width | 128, 256, 512, 768 | Shorter Matryoshka vectors. Same as `MEMB_EMBED_MRL_DIM`; see [Internals](Architecture.md). |
+| `curator.cli_command` | `claude -p` | 1 to 16 words of at most 256 bytes | The command `memb curate` runs, with conversation text on its standard input. It is split on whitespace and started **without a shell** (no quoting or pipes), so a program that is not an `.exe` on the search path (for example an npm `.cmd` shim) must be given as `cmd /C ...`. **Whatever it is, memb sends it private conversation text**; use a command you trust. See [Operations](Operations.md). |
+| `curator.daemon_enabled` | false | true, false | Lets `memb daemon` run curation once per routine run. **Off by default**: turning it on means conversation text is sent to `curator.cli_command` without you running a command. Proposals still wait for your approval. |
+| `curator.backend` | `cli` | `cli` | The only supported backend. |
+| `curator.staging_ttl_days` | 30 | 1 to 365 | Staged evidence and pending proposals older than this expire. Raw chunk text is not deleted. |
+| `curator.chunk_to_chunk_threshold`, `curator.chunk_to_node_threshold` | 0.72, 0.70 | fixed | Accepted only at these values (the setting is checked but never read: the `curator_evidence` tool uses built-in constants of the same value, and `memb curate` does not cluster). |
 | `scheduler.routine_wib_hour`, `routine_wib_minute` | 15, 45 | 0 to 23, 0 to 59 | WIB (UTC+7) time of day from which the daily routine becomes due, once the cooldown has passed. After the catch-up window (24 hours, or the cooldown if longer) it is due at any hour. |
 | `scheduler.cooldown_hours` | 20 | 1 to 168 | Minimum gap after the last successful run. The catch-up window is 24 hours or the cooldown, whichever is longer. |
 | `scheduler.idle_sweep_hours` | 24 | 1 to 720 | Scrolls idle longer than this are chunked by the daemon. |
@@ -36,7 +41,7 @@ memb runs without any configuration. To change a limit, put a `config.toml` next
 | Kit key | Why |
 |---|---|
 | `embeddings.binary`, `embeddings.model_path` | memb never starts an embedding server. Start `llama-server` yourself and set `embeddings.port`, or use `embeddings.gemma_model_dir`. These keys fail with a message saying so. |
-| `[curator]` with any non-default value | The curator is not driven by configuration yet. Only the default values are accepted, so a changed value is never silently ignored. |
+| `curator.backend` other than `cli`, or curator thresholds other than 0.72 and 0.70 | Only the command-line backend exists, and the thresholds are fixed. Other values fail with a message instead of being ignored. |
 | `storage.max_notes` above 50000 | The built-in limit is a hard cap. |
 
 ## Privacy

@@ -99,7 +99,9 @@ fn invalid_config_stops_startup_with_a_message_that_never_echoes_values() {
         ("[storage]\nmax_noets = 5\n", "unknown field"),
         ("[scroll]\nmax_messages = 5\n", "scroll.max_messages"),
         ("[embeddings]\nbinary = \"C:\\\\secret-path\\\\llama-server.exe\"\n", "does not start an embedding server"),
-        ("[curator]\nstaging_ttl_days = 7\n", "not supported yet"),
+        ("[curator]\nstaging_ttl_days = 7777\n", "curator.staging_ttl_days"),
+        ("[curator]\nchunk_to_chunk_threshold = 0.5\n", "thresholds are fixed"),
+        ("[curator]\ncli_command = \"  \"\n", "curator.cli_command"),
         ("[scheduler]\nidle_sweep_min_messages = 5\n", "must exceed scroll.retain_tail"),
     ] {
         let d = Dir::new("bad", Some(text));
@@ -107,7 +109,7 @@ fn invalid_config_stops_startup_with_a_message_that_never_echoes_values() {
         assert!(!ok, "{text}");
         assert!(responses.is_empty(), "no protocol output on a startup failure: {text}");
         assert!(stderr.contains(setting), "{text} -> {stderr}");
-        assert!(!stderr.contains("SECRET-VALUE-123") && !stderr.contains("secret-path") && !stderr.contains("98765") && !stderr.contains("70000"), "{stderr}");
+        assert!(!stderr.contains("SECRET-VALUE-123") && !stderr.contains("secret-path") && !stderr.contains("98765") && !stderr.contains("70000") && !stderr.contains("7777"), "{stderr}");
         assert!(!d.0.join("memory.redb").exists(), "a bad config must not create a database");
     }
 }

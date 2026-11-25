@@ -387,7 +387,12 @@ fn curator_proposals_require_preview_and_single_use_consent() {
         c.tool("curator_apply", json!({"proposal_id":id,"confirmed":true}))
             .0
     );
-    assert!(c.tool("curator_preview", json!({"action":{"action":"RETRACT","id":topic},"source_chunks":[["synthetic","chk_synthetic_0000"]]})).0);
+    // Update and retract proposals are previewable now; a model may not ask for a cascade
+    // or set provenance itself.
+    assert!(!c.tool("curator_preview", json!({"action":{"action":"RETRACT","id":topic},"source_chunks":[["synthetic","chk_synthetic_0000"]]})).0);
+    assert!(!c.tool("curator_preview", json!({"action":{"action":"UPDATE","id":topic,"patch":{"desc":"A revised description"}},"source_chunks":[["synthetic","chk_synthetic_0000"]]})).0);
+    assert!(c.tool("curator_preview", json!({"action":{"action":"RETRACT","id":topic,"force_cascade":true},"source_chunks":[["synthetic","chk_synthetic_0000"]]})).0);
+    assert!(c.tool("curator_preview", json!({"action":{"action":"UPDATE","id":topic,"patch":{"properties":{"source_chunks":[]}}},"source_chunks":[["synthetic","chk_synthetic_0000"]]})).0);
     drop(c);
     std::fs::remove_dir_all(root).unwrap();
 }

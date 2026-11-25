@@ -29,21 +29,65 @@ pub fn search(store: &Store, query: &str) -> Result<Vec<Note>, String> {
     hybrid_search(store, query, None, &[])
 }
 
+/// One loaded EmbeddingGemma 2 model per directory for the life of the process.
+fn gemma_model(
+    directory: std::path::PathBuf,
+) -> Option<std::sync::Arc<memb_embed::gemma::GemmaEmbedder>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static MODELS: OnceLock<
+        Mutex<std::collections::HashMap<std::path::PathBuf, Arc<memb_embed::gemma::GemmaEmbedder>>>,
+    > = OnceLock::new();
+    let mut models = MODELS.get_or_init(Default::default).lock().ok()?;
+    Some(
+        models
+            .entry(directory.clone())
+            .or_insert_with(|| Arc::new(memb_embed::gemma::GemmaEmbedder::new(directory)))
+            .clone(),
+    )
+}
+
+/// Embeds one text with the configured backend, the same selection `search` uses
+/// (`MEMB_EMBED_DISABLE`, then `MEMB_GEMMA_MODEL_DIR`, then `MEMB_EMBED_PORT`).
+/// Returns the vector with a tag naming the exact model and truncation, so vectors from
+/// different models are never compared. `Ok(None)` means no usable backend is
+/// configured (lexical-only), which is not an error. The loopback-server path needs
+/// `MEMB_EMBED_MODEL_ID`, because without a stable identity the vector cannot be tagged.
+pub fn embed_text(text: &str, is_query: bool) -> Result<Option<(String, QuantizedVec)>, String> {
+    if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1") {
+        return Ok(None);
+    }
+    let mrl = memb_embed::mrl_dim_from_env()?;
+    if let Some(directory) = std::env::var_os("MEMB_GEMMA_MODEL_DIR").filter(|p| !p.is_empty()) {
+        let model = gemma_model(std::path::PathBuf::from(directory)).ok_or("embedding model unavailable")?;
+        let (tag, v) = model.embed_tagged(text, is_query)?;
+        return Ok(Some((
+            memb_embed::mrl_tag(&tag, mrl),
+            QuantizedVec::from_f32(&memb_embed::apply_mrl(v, mrl)?),
+        )));
+    }
+    let port = std::env::var("MEMB_EMBED_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|p| *p != 0);
+    let model = std::env::var("MEMB_EMBED_MODEL_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty() && s.len() <= 512);
+    match (port, model) {
+        (Some(port), Some(model)) => {
+            let v = memb_embed::local_embedding(port, text)?;
+            Ok(Some((memb_embed::mrl_tag(&model, mrl), v)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn search_with_gemma(
     store: &Store,
     query: &str,
     directory: std::path::PathBuf,
 ) -> Result<Vec<Note>, String> {
-    use std::sync::{Arc, Mutex, OnceLock};
-    static MODELS: OnceLock<
-        Mutex<std::collections::HashMap<std::path::PathBuf, Arc<memb_embed::gemma::GemmaEmbedder>>>,
-    > = OnceLock::new();
-    let model = match MODELS.get_or_init(Default::default).lock() {
-        Ok(mut models) => models
-            .entry(directory.clone())
-            .or_insert_with(|| Arc::new(memb_embed::gemma::GemmaEmbedder::new(directory)))
-            .clone(),
-        Err(_) => return hybrid_search(store, query, None, &[]),
+    let Some(model) = gemma_model(directory) else {
+        return hybrid_search(store, query, None, &[]);
     };
     // An unsupported MEMB_EMBED_MRL_DIM or a failed embedding degrades to lexical search.
     let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
@@ -197,6 +241,39 @@ mod tests {
     use super::*;
     use memb_core::{Draft, Kind};
     use std::collections::BTreeMap;
+
+    /// The environment is process-wide: serialize the tests that change it.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn embed_text_is_none_without_a_usable_backend_and_rejects_a_bad_truncation() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = ["MEMB_EMBED_DISABLE", "MEMB_GEMMA_MODEL_DIR", "MEMB_EMBED_PORT", "MEMB_EMBED_MODEL_ID", "MEMB_EMBED_MRL_DIM"];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        // No backend configured: lexical-only, not an error.
+        assert!(embed_text("hello", false).unwrap().is_none());
+        // A port without a model identity cannot produce a tagged vector, and nothing is sent.
+        std::env::set_var("MEMB_EMBED_PORT", "1");
+        assert!(embed_text("hello", false).unwrap().is_none());
+        // Disabled wins over everything.
+        std::env::set_var("MEMB_EMBED_MODEL_ID", "m");
+        std::env::set_var("MEMB_EMBED_DISABLE", "1");
+        assert!(embed_text("hello", false).unwrap().is_none());
+        // An unsupported truncation is an error rather than a silently different vector.
+        std::env::remove_var("MEMB_EMBED_DISABLE");
+        std::env::set_var("MEMB_EMBED_MRL_DIM", "999");
+        assert!(embed_text("hello", false).is_err());
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires MEMB_TEST_GEMMA_DIR and MEMB_TEST_SCRATCH"]
     fn real_gemma_synthetic_retrieval_and_fallback() {

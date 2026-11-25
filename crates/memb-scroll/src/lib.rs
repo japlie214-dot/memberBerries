@@ -44,9 +44,25 @@ pub struct ScrollChunk {
     pub session_id: String,
     pub chunk_index: u32,
     pub messages: Vec<ScrollMessage>,
+    /// Layer 1 summary, written by the configured model after the chunk exists.
     pub summary: Option<String>,
     pub created_at_ms: u64,
     pub curated: bool,
+    /// True when the summarizer saw an explicit user directive ("always use", ...).
+    #[serde(default)]
+    pub explicit_signal: Option<bool>,
+    /// Quantized embedding of `summary`, tagged with the embedding model's identity.
+    #[serde(default)]
+    pub summary_vec: Option<ChunkVec>,
+}
+
+/// An i8-quantized vector plus the identity of the model that made it. Vectors with
+/// different tags are never compared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChunkVec {
+    pub model: String,
+    pub scale: f32,
+    pub data: Vec<i8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -178,6 +194,8 @@ pub fn append_message_with(
                 summary: None,
                 created_at_ms: ts,
                 curated: false,
+                explicit_signal: None,
+                summary_vec: None,
             };
             let cbytes = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
             chunks.insert(chunk_id.as_str(), cbytes.as_slice()).map_err(|e| e.to_string())?;
@@ -246,7 +264,7 @@ pub fn sweep_idle_scrolls_with(
                 return Err("chunk already exists".into());
             }
             let chunk = ScrollChunk { chunk_id: chunk_id.clone(), session_id: session.clone(), chunk_index: index,
-                messages: scroll.messages.clone(), summary: None, created_at_ms: now_ms, curated: false };
+                messages: scroll.messages.clone(), summary: None, created_at_ms: now_ms, curated: false, explicit_signal: None, summary_vec: None };
             scroll.messages = scroll.messages.split_off(scroll.messages.len() - retain_tail);
             meta.total_chunks = next;
             let cb = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
@@ -301,10 +319,171 @@ pub fn stage_chunk_evidence(db: &Database, chunk_id: &str) -> Result<bool, Strin
         let chunk: ScrollChunk = serde_json::from_slice(raw.value()).map_err(|e| e.to_string())?;
         if chunk.chunk_id != chunk_id { return Err("chunk id mismatch".into()); }
         if staged.get(chunk_id).map_err(|e| e.to_string())?.is_some() { false }
-        else { staged.insert(chunk_id, b"1".as_slice()).map_err(|e| e.to_string())?; true }
+        else { staged.insert(chunk_id, now_ms().to_string().as_bytes()).map_err(|e| e.to_string())?; true }
     };
     w.commit().map_err(|e| e.to_string())?;
     Ok(inserted)
+}
+
+/// Staged, not yet curated chunks in chunk-id order (not time order), capped at `limit` (at most 100).
+pub fn list_staged_chunks(db: &Database, limit: usize) -> Result<Vec<ScrollChunk>, String> {
+    let r = db.begin_read().map_err(|e| e.to_string())?;
+    let (chunks, staged) = match (r.open_table(CHUNKS_TABLE), r.open_table(EVIDENCE_TABLE)) {
+        (Ok(c), Ok(s)) => (c, s),
+        (Err(redb::TableError::TableDoesNotExist(_)), _) | (_, Err(redb::TableError::TableDoesNotExist(_))) => return Ok(Vec::new()),
+        (Err(e), _) | (_, Err(e)) => return Err(e.to_string()),
+    };
+    let mut result = Vec::new();
+    for entry in staged.iter().map_err(|e| e.to_string())? {
+        if result.len() >= limit.min(MAX_CHUNK_LIST) { break; }
+        let (key, _) = entry.map_err(|e| e.to_string())?;
+        let Some(raw) = chunks.get(key.value()).map_err(|e| e.to_string())? else { continue };
+        let chunk: ScrollChunk = serde_json::from_slice(raw.value()).map_err(|e| e.to_string())?;
+        if chunk.chunk_id != key.value() { return Err("chunk id mismatch".into()); }
+        if !chunk.curated { result.push(chunk); }
+    }
+    Ok(result)
+}
+
+/// Marks chunks as curated (handled) and removes their staging rows. The raw chunk
+/// text is kept; it is simply no longer offered for curation. Unknown ids are skipped.
+pub fn mark_chunks_curated(db: &Database, chunk_ids: &[String]) -> Result<usize, String> {
+    let w = db.begin_write().map_err(|e| e.to_string())?;
+    let mut done = 0;
+    {
+        let mut chunks = w.open_table(CHUNKS_TABLE).map_err(|e| e.to_string())?;
+        let mut staged = w.open_table(EVIDENCE_TABLE).map_err(|e| e.to_string())?;
+        for id in chunk_ids {
+            let raw = chunks.get(id.as_str()).map_err(|e| e.to_string())?.map(|v| v.value().to_vec());
+            let Some(raw) = raw else { continue };
+            let mut chunk: ScrollChunk = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+            chunk.curated = true;
+            let bytes = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
+            chunks.insert(id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+            staged.remove(id.as_str()).map_err(|e| e.to_string())?;
+            done += 1;
+        }
+    }
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(done)
+}
+
+/// Enforces the staging time limit: chunks staged longer than `ttl_ms` ago (and not
+/// curated) leave staging and are marked curated, so they are no longer offered. Raw
+/// chunk text is not deleted. A legacy staging row without a timestamp is aged from
+/// the chunk's creation time. Returns how many chunks expired.
+pub fn expire_staged_chunks(db: &Database, now_ms: u64, ttl_ms: u64) -> Result<usize, String> {
+    let expired: Vec<String> = {
+        let r = db.begin_read().map_err(|e| e.to_string())?;
+        let (chunks, staged) = match (r.open_table(CHUNKS_TABLE), r.open_table(EVIDENCE_TABLE)) {
+            (Ok(c), Ok(s)) => (c, s),
+            (Err(redb::TableError::TableDoesNotExist(_)), _) | (_, Err(redb::TableError::TableDoesNotExist(_))) => return Ok(0),
+            (Err(e), _) | (_, Err(e)) => return Err(e.to_string()),
+        };
+        let mut out = Vec::new();
+        for entry in staged.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            let staged_at = std::str::from_utf8(value.value()).ok().and_then(|t| t.parse::<u64>().ok()).filter(|&t| t > 1);
+            let at = match staged_at {
+                Some(t) => t,
+                None => match chunks.get(key.value()).map_err(|e| e.to_string())? {
+                    Some(raw) => serde_json::from_slice::<ScrollChunk>(raw.value()).map_err(|e| e.to_string())?.created_at_ms,
+                    None => 0,
+                },
+            };
+            if now_ms.saturating_sub(at) > ttl_ms { out.push(key.value().to_string()); }
+        }
+        out
+    };
+    if expired.is_empty() { return Ok(0); }
+    let w = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut chunks = w.open_table(CHUNKS_TABLE).map_err(|e| e.to_string())?;
+        let mut staged = w.open_table(EVIDENCE_TABLE).map_err(|e| e.to_string())?;
+        for id in &expired {
+            let raw = chunks.get(id.as_str()).map_err(|e| e.to_string())?.map(|v| v.value().to_vec());
+            if let Some(raw) = raw {
+                let mut chunk: ScrollChunk = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+                chunk.curated = true;
+                let bytes = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
+                chunks.insert(id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+            }
+            staged.remove(id.as_str()).map_err(|e| e.to_string())?;
+        }
+    }
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(expired.len())
+}
+
+/// Chunks that have no summary yet, in chunk-id order, at most `limit` (at most 100).
+pub fn list_unsummarized_chunks(db: &Database, limit: usize) -> Result<Vec<ScrollChunk>, String> {
+    list_chunks_where(db, limit, |c| c.summary.is_none())
+}
+
+/// Chunks that have a summary but no vector yet (for example the embedding backend was
+/// off when they were summarized).
+pub fn list_unembedded_chunks(db: &Database, limit: usize) -> Result<Vec<ScrollChunk>, String> {
+    list_chunks_where(db, limit, |c| c.summary.is_some() && c.summary_vec.is_none())
+}
+
+fn list_chunks_where(
+    db: &Database,
+    limit: usize,
+    keep: impl Fn(&ScrollChunk) -> bool,
+) -> Result<Vec<ScrollChunk>, String> {
+    let r = db.begin_read().map_err(|e| e.to_string())?;
+    let chunks = match r.open_table(CHUNKS_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut out = Vec::new();
+    for entry in chunks.iter().map_err(|e| e.to_string())? {
+        if out.len() >= limit.min(MAX_CHUNK_LIST) { break; }
+        let (key, value) = entry.map_err(|e| e.to_string())?;
+        let chunk: ScrollChunk = serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
+        if chunk.chunk_id != key.value() { return Err("chunk id mismatch".into()); }
+        if keep(&chunk) { out.push(chunk); }
+    }
+    Ok(out)
+}
+
+/// Stores a summary (and the explicit-directive flag) on an existing chunk. A chunk that
+/// already has a summary keeps it: false means nothing was written.
+pub fn set_chunk_summary(db: &Database, chunk_id: &str, summary: &str, explicit_signal: bool) -> Result<bool, String> {
+    update_chunk(db, chunk_id, |c| {
+        if c.summary.is_some() { return false; }
+        c.summary = Some(summary.to_string());
+        c.explicit_signal = Some(explicit_signal);
+        true
+    })
+}
+
+/// Stores the summary vector on a chunk that has a summary but no vector.
+pub fn set_chunk_vector(db: &Database, chunk_id: &str, vector: ChunkVec) -> Result<bool, String> {
+    update_chunk(db, chunk_id, |c| {
+        if c.summary.is_none() || c.summary_vec.is_some() { return false; }
+        c.summary_vec = Some(vector);
+        true
+    })
+}
+
+fn update_chunk(db: &Database, chunk_id: &str, change: impl FnOnce(&mut ScrollChunk) -> bool) -> Result<bool, String> {
+    let w = db.begin_write().map_err(|e| e.to_string())?;
+    let changed = {
+        let mut chunks = w.open_table(CHUNKS_TABLE).map_err(|e| e.to_string())?;
+        let raw = chunks.get(chunk_id).map_err(|e| e.to_string())?.map(|v| v.value().to_vec()).ok_or("chunk not found")?;
+        let mut chunk: ScrollChunk = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+        if chunk.chunk_id != chunk_id { return Err("chunk id mismatch".into()); }
+        let changed = change(&mut chunk);
+        if changed {
+            let bytes = serde_json::to_vec(&chunk).map_err(|e| e.to_string())?;
+            chunks.insert(chunk_id, bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        changed
+    };
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
 }
 
 /// Read-only view of one live (not yet chunked) scroll. Used by hooks to avoid
@@ -423,6 +602,103 @@ mod tests {
         assert_eq!(swept.len(), 1);
         assert_eq!(swept[0].messages.len(), 30);
         assert_eq!(read_scroll(&db, "idle").unwrap().unwrap().messages.len(), 3);
+        drop(db);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn staged_evidence_is_listed_curated_and_expires_after_the_limit() {
+        let p = std::env::temp_dir().join(format!("memb_scroll_stage_{}.redb", now_ms()));
+        let db = Database::create(&p).unwrap();
+        let limits = ScrollLimits { max_messages: 10, retain_tail: 2, min_prompt_chars: 5, dedup_reset_chunks: 3 };
+        let mut ids = Vec::new();
+        for i in 0..30 {
+            if let Some(c) = append_message_with(&db, "s", "cc", Role::User, format!("m{i}"), true, &limits).unwrap() {
+                ids.push(c.chunk_id);
+            }
+        }
+        assert_eq!(ids.len(), 3);
+        assert!(list_staged_chunks(&db, 10).unwrap().is_empty(), "nothing is staged yet");
+        for id in &ids { assert!(stage_chunk_evidence(&db, id).unwrap()); }
+        assert!(!stage_chunk_evidence(&db, &ids[0]).unwrap(), "staging twice is a no-op");
+        assert_eq!(list_staged_chunks(&db, 10).unwrap().len(), 3);
+        assert_eq!(list_staged_chunks(&db, 2).unwrap().len(), 2);
+        assert!(list_uncurated_chunks(&db, 10).unwrap().is_empty(), "staged chunks are not offered for staging again");
+
+        // Curating one removes it from staging; the raw chunk stays readable.
+        assert_eq!(mark_chunks_curated(&db, &[ids[0].clone(), "chk_missing_0000".into()]).unwrap(), 1);
+        assert_eq!(list_staged_chunks(&db, 10).unwrap().len(), 2);
+        assert!(read_chunk(&db, &ids[0], 0, 1).unwrap().is_some());
+
+        // Expiry: not yet at the limit, then past it. Expired chunks are not offered again.
+        let day = 24 * 60 * 60 * 1000;
+        let now = now_ms();
+        assert_eq!(expire_staged_chunks(&db, now + 29 * day, 30 * day).unwrap(), 0);
+        assert_eq!(expire_staged_chunks(&db, now + 31 * day, 30 * day).unwrap(), 2);
+        assert!(list_staged_chunks(&db, 10).unwrap().is_empty());
+        assert!(list_uncurated_chunks(&db, 10).unwrap().is_empty());
+        assert!(read_chunk(&db, &ids[1], 0, 1).unwrap().is_some(), "expiry never deletes raw text");
+        assert_eq!(expire_staged_chunks(&db, now + 60 * day, 30 * day).unwrap(), 0);
+
+        // A legacy staging row (no timestamp) is aged from the chunk's creation time.
+        let legacy = {
+            let w = db.begin_write().unwrap();
+            let id = "chk_legacy_0000";
+            {
+                let chunk = ScrollChunk { chunk_id: id.into(), session_id: "legacy".into(), chunk_index: 0, messages: vec![], summary: None, created_at_ms: 1_000, curated: false, explicit_signal: None, summary_vec: None };
+                let mut chunks = w.open_table(CHUNKS_TABLE).unwrap();
+                chunks.insert(id, serde_json::to_vec(&chunk).unwrap().as_slice()).unwrap();
+                w.open_table(EVIDENCE_TABLE).unwrap().insert(id, b"1".as_slice()).unwrap();
+            }
+            w.commit().unwrap();
+            id
+        };
+        assert_eq!(list_staged_chunks(&db, 10).unwrap().len(), 1);
+        assert_eq!(expire_staged_chunks(&db, 1_000 + 31 * day, 30 * day).unwrap(), 1);
+        assert!(list_staged_chunks(&db, 10).unwrap().is_empty());
+        let _ = legacy;
+        drop(db);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn summaries_and_vectors_are_stored_once_and_old_chunks_still_read() {
+        let p = std::env::temp_dir().join(format!("memb_scroll_sum_{}.redb", now_ms()));
+        let db = Database::create(&p).unwrap();
+        let limits = ScrollLimits { max_messages: 10, retain_tail: 2, min_prompt_chars: 5, dedup_reset_chunks: 3 };
+        for i in 0..10 {
+            append_message_with(&db, "s", "cc", Role::User, format!("m{i}"), true, &limits).unwrap();
+        }
+        // A chunk written by an older build has none of the new fields.
+        {
+            let w = db.begin_write().unwrap();
+            {
+                let mut t = w.open_table(CHUNKS_TABLE).unwrap();
+                let old = r#"{"chunk_id":"chk_old_0000","session_id":"old","chunk_index":0,"messages":[],"summary":null,"created_at_ms":5,"curated":false}"#;
+                t.insert("chk_old_0000", old.as_bytes()).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        assert_eq!(list_unsummarized_chunks(&db, 10).unwrap().len(), 2);
+        assert!(list_unembedded_chunks(&db, 10).unwrap().is_empty());
+        assert!(set_chunk_summary(&db, "chk_s_0000", "- a bullet", true).unwrap());
+        assert!(!set_chunk_summary(&db, "chk_s_0000", "- another", false).unwrap(), "a summary is written once");
+        let unsummarized = list_unsummarized_chunks(&db, 10).unwrap();
+        assert_eq!(unsummarized.len(), 1);
+        assert_eq!(unsummarized[0].chunk_id, "chk_old_0000");
+        assert_eq!(list_unembedded_chunks(&db, 10).unwrap().len(), 1);
+        let v = ChunkVec { model: "m1".into(), scale: 0.5, data: vec![1, -2, 3] };
+        assert!(!set_chunk_vector(&db, "chk_old_0000", v.clone()).unwrap(), "no vector without a summary");
+        assert!(set_chunk_vector(&db, "chk_s_0000", v.clone()).unwrap());
+        assert!(!set_chunk_vector(&db, "chk_s_0000", ChunkVec { model: "m2".into(), ..v.clone() }).unwrap());
+        assert!(list_unembedded_chunks(&db, 10).unwrap().is_empty());
+        assert!(set_chunk_summary(&db, "chk_missing_0000", "x", false).is_err());
+        let r = db.begin_read().unwrap();
+        let t = r.open_table(CHUNKS_TABLE).unwrap();
+        let c: ScrollChunk = serde_json::from_slice(t.get("chk_s_0000").unwrap().unwrap().value()).unwrap();
+        assert_eq!((c.summary.as_deref(), c.explicit_signal, c.summary_vec), (Some("- a bullet"), Some(true), Some(v)));
+        drop(t);
+        drop(r);
         drop(db);
         std::fs::remove_file(&p).unwrap();
     }

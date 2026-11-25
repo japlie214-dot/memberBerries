@@ -479,7 +479,9 @@ version = "0.4.0"
 dependencies = [
  "memb-core",
  "memb-embed",
+ "memb-scroll",
  "memb-store",
+ "redb",
  "serde",
  "serde_json",
 ]

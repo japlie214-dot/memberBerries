@@ -1,4 +1,9 @@
-//! Offline curation proposals. This crate never launches a model or transmits data.
+//! Curation proposals. Building and validating a proposal is offline and never changes a
+//! store. [`backend`] runs the user's configured command-line model (and nothing else
+//! starts a model); [`ledger`] keeps proposals durably until the user decides.
+pub mod backend;
+pub mod ledger;
+
 use memb_core::{Draft, Kind, NotePatch};
 use memb_embed::QuantizedVec;
 use memb_store::Store;
@@ -180,11 +185,27 @@ impl Proposal {
             {
                 return Err("source_chunks is reserved".into())
             }
-            CuratorAction::Update { .. } | CuratorAction::Retract { .. } => {
-                return Err(
-                    "update and retract require atomic provenance support and are not enabled"
-                        .into(),
-                )
+            CuratorAction::Update { patch, .. } => {
+                if patch
+                    .properties
+                    .as_ref()
+                    .is_some_and(|p| p.contains_key("source_chunks"))
+                {
+                    return Err("source_chunks is reserved".into());
+                }
+                if patch.title.is_none()
+                    && patch.desc.is_none()
+                    && patch.parents.is_none()
+                    && patch.properties.is_none()
+                {
+                    return Err("update changes nothing".into());
+                }
+            }
+            CuratorAction::Retract { force_cascade, .. } => {
+                // A model may never remove a note together with others.
+                if *force_cascade {
+                    return Err("force_cascade is not allowed in a curator proposal".into());
+                }
             }
             _ => {}
         }
@@ -206,7 +227,8 @@ impl Proposal {
     }
     fn draft(&self) -> Result<Option<(Draft, Option<u64>)>, String> {
         let (kind, title, desc, parents, properties, old) = match &self.action {
-            CuratorAction::Defer {} => return Ok(None),
+            // Update and retract carry no new note; they are applied in place.
+            CuratorAction::Defer {} | CuratorAction::Update { .. } | CuratorAction::Retract { .. } => return Ok(None),
             CuratorAction::KnowledgeUpsert {
                 title,
                 desc,
@@ -226,7 +248,6 @@ impl Proposal {
                 parents,
                 properties,
             } => (Kind::Claim, title, desc, parents, properties, Some(*old_id)),
-            _ => return Err("unsupported action".into()),
         };
         let mut properties = properties.clone();
         properties.insert(
@@ -252,10 +273,46 @@ impl Proposal {
     /// Call only after the user explicitly approves this exact proposal. Store
     /// validation is repeated under its write lock; approval cannot be reused.
     pub fn apply_after_user_approval(self, store: &Store) -> Result<Option<u64>, String> {
-        match self.draft()? {
-            None => Ok(None),
-            Some((draft, Some(old))) => store.supersede(old, draft).map(|n| Some(n.id)),
-            Some((draft, None)) => store.remember(draft).map(|n| Some(n.id)),
+        match &self.action {
+            CuratorAction::Update { id, patch } => {
+                let id = *id;
+                let existing = store
+                    .inspect(id)?
+                    .filter(|n| n.status == memb_core::NoteStatus::Active)
+                    .ok_or("note not found or not active")?;
+                // Provenance is stamped in the same write as the edit: the note's
+                // earlier sources plus the ones that support this change.
+                let mut merged = existing
+                    .properties
+                    .get("source_chunks")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for (s, c) in &self.source_chunks {
+                    let entry = json!({"session_id":s,"chunk_id":c});
+                    if !merged.contains(&entry) {
+                        merged.push(entry);
+                    }
+                }
+                let mut patch = patch.clone();
+                patch
+                    .properties
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert("source_chunks".into(), Value::Array(merged));
+                store.update(id, patch).map(|n| Some(n.id))
+            }
+            CuratorAction::Retract {
+                id,
+                migrate_to_topic_id,
+                ..
+            } => store
+                .retract(*id, *migrate_to_topic_id, false)
+                .map(|_| Some(*id)),
+            _ => match self.draft()? {
+                None => Ok(None),
+                Some((draft, Some(old))) => store.supersede(old, draft).map(|n| Some(n.id)),
+                Some((draft, None)) => store.remember(draft).map(|n| Some(n.id)),
+            },
         }
     }
 }
@@ -360,11 +417,66 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn rejects_untrusted_provenance_and_unimplemented_mutations() {
+    fn approved_update_and_retract_stamp_provenance_and_never_cascade() {
+        let root = std::env::temp_dir().join(format!(
+            "memb-curator-upd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let store = Store::open(&root).unwrap();
+        let draft = |kind, title: &str, parents: Vec<u64>| Draft {
+            title: title.into(), desc: "Synthetic description".into(), kind, parents, properties: BTreeMap::new(),
+        };
+        let topic = store.remember(draft(Kind::Topic, "Topic", vec![])).unwrap();
+        let know = store.remember(draft(Kind::Knowledge, "Knowledge", vec![topic.id])).unwrap();
+        let first = Proposal::prepare(
+            serde_json::from_value(json!({"action":"UPDATE","id":know.id,"patch":{"desc":"Better description"}})).unwrap(),
+            &[("s1".into(), "c1".into())],
+        ).unwrap();
+        assert_eq!(first.apply_after_user_approval(&store).unwrap(), Some(know.id));
+        let second = Proposal::prepare(
+            serde_json::from_value(json!({"action":"UPDATE","id":know.id,"patch":{"properties":{"k":"v"}}})).unwrap(),
+            &[("s2".into(), "c2".into()), ("s1".into(), "c1".into())],
+        ).unwrap();
+        second.apply_after_user_approval(&store).unwrap();
+        let note = store.inspect(know.id).unwrap().unwrap();
+        assert_eq!(note.desc, "Better description");
+        assert_eq!(note.properties["k"], "v");
+        let sources = note.properties["source_chunks"].as_array().unwrap();
+        assert_eq!(sources.len(), 2, "earlier sources are kept and duplicates are not repeated");
+        // A retracted topic that still has a sole-linked child is refused, and a model
+        // cannot ask for a cascade.
+        let retract_topic = Proposal::prepare(
+            serde_json::from_value(json!({"action":"RETRACT","id":topic.id})).unwrap(),
+            &[("s".into(), "c".into())],
+        ).unwrap();
+        assert!(retract_topic.apply_after_user_approval(&store).is_err());
+        assert_eq!(store.inspect(topic.id).unwrap().unwrap().status, memb_core::NoteStatus::Active);
+        let retract_knowledge = Proposal::prepare(
+            serde_json::from_value(json!({"action":"RETRACT","id":know.id})).unwrap(),
+            &[("s".into(), "c".into())],
+        ).unwrap();
+        assert_eq!(retract_knowledge.apply_after_user_approval(&store).unwrap(), Some(know.id));
+        assert_eq!(store.inspect(know.id).unwrap().unwrap().status, memb_core::NoteStatus::Retracted);
+        // An update to a retracted note is refused.
+        let late = Proposal::prepare(
+            serde_json::from_value(json!({"action":"UPDATE","id":know.id,"patch":{"desc":"x y z"}})).unwrap(),
+            &[("s".into(), "c".into())],
+        ).unwrap();
+        assert!(late.apply_after_user_approval(&store).is_err());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rejects_untrusted_provenance_and_unsafe_mutations() {
         assert!(serde_json::from_str::<CuratorAction>(r#"{"action":"DEFER","extra":1}"#).is_err());
         let a: CuratorAction = serde_json::from_str(r#"{"action":"KNOWLEDGE_UPSERT","title":"x","desc":"y","parents":[1],"properties":{"source_chunks":[]}}"#).unwrap();
         assert!(Proposal::prepare(a, &[("s".into(), "c".into())]).is_err());
-        let a: CuratorAction = serde_json::from_str(r#"{"action":"RETRACT","id":1}"#).unwrap();
+        let a: CuratorAction = serde_json::from_str(r#"{"action":"RETRACT","id":1,"force_cascade":true}"#).unwrap();
+        assert!(Proposal::prepare(a, &[("s".into(), "c".into())]).is_err());
+        let a: CuratorAction = serde_json::from_str(r#"{"action":"UPDATE","id":1,"patch":{"properties":{"source_chunks":[]}}}"#).unwrap();
+        assert!(Proposal::prepare(a, &[("s".into(), "c".into())]).is_err());
+        let a: CuratorAction = serde_json::from_str(r#"{"action":"UPDATE","id":1,"patch":{}}"#).unwrap();
         assert!(Proposal::prepare(a, &[("s".into(), "c".into())]).is_err());
     }
 }

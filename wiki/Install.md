@@ -1,6 +1,6 @@
 # Install and verify
 
-Windows x64 is the first target. The archives contain the same executable. Claude Cowork only needs `memb.plugin`. Use one Windows account and keep all clients on the same data directory; otherwise they cannot share notes. No archive installs a scheduled task, model, or API client. Hooks ship inside the packages but stay inert until you set `MEMB_SCROLL_CAPTURE=1` (see [Hooks](Hooks.md)); the `memb daemon` command is part of `memb.exe`, but no scheduled task or installer is packaged or registered (see [Operations](Operations.md)); an optional [configuration file](Configuration.md) changes limits. Keep the executable in a stable directory; do not run it directly from the ZIP viewer.
+Windows x64 is the first target. The archives contain the same executable. Claude Cowork only needs `memb.plugin`. Use one Windows account and keep all clients on the same data directory; otherwise they cannot share notes. No archive installs a scheduled task, model, or API client, and memb starts a model only when you run `memb curate` (see [Operations](Operations.md)). Hooks ship inside the packages but stay inert until you set `MEMB_SCROLL_CAPTURE=1` (see [Hooks](Hooks.md)); the `memb daemon` command is part of `memb.exe`, but no scheduled task or installer is packaged or registered (see [Operations](Operations.md)); an optional [configuration file](Configuration.md) changes limits. Keep the executable in a stable directory; do not run it directly from the ZIP viewer.
 
 | Client | Package | Setup |
 |---|---|---|

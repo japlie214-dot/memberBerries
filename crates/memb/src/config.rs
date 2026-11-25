@@ -60,6 +60,8 @@ pub struct Curator {
     pub chunk_to_chunk_threshold: f64,
     pub chunk_to_node_threshold: f64,
     pub staging_ttl_days: u32,
+    /// Opt-in: let `memb daemon` run curation (sends conversation text to `cli_command`).
+    pub daemon_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -113,6 +115,7 @@ impl Default for Curator {
             chunk_to_chunk_threshold: 0.72,
             chunk_to_node_threshold: 0.70,
             staging_ttl_days: 30,
+            daemon_enabled: false,
         }
     }
 }
@@ -252,11 +255,19 @@ impl Config {
                 return Err(format!("embeddings.mrl_dim must be one of {MRL_DIMS:?}"));
             }
         }
-        // The curator pipeline is not wired to these settings yet: accept only the defaults
-        // so a changed value is never silently ignored.
-        if self.curator != Curator::default() {
-            return Err("curator settings are not supported yet; remove the [curator] section or keep the defaults".into());
+        let c = &self.curator;
+        if c.backend != "cli" {
+            return Err("curator.backend must be \"cli\", the only supported backend".into());
         }
+        memb_curator::backend::Backend::from_command(&c.cli_command)
+            .map_err(|e| format!("curator.cli_command: {e}"))?;
+        let fixed = Curator::default();
+        if c.chunk_to_chunk_threshold != fixed.chunk_to_chunk_threshold
+            || c.chunk_to_node_threshold != fixed.chunk_to_node_threshold
+        {
+            return Err("curator thresholds are fixed at 0.72 and 0.70; remove those settings".into());
+        }
+        within("curator.staging_ttl_days", c.staging_ttl_days, 1, 365)?;
         let d = &self.scheduler;
         within("scheduler.routine_wib_hour", d.routine_wib_hour, 0, 23)?;
         within("scheduler.routine_wib_minute", d.routine_wib_minute, 0, 59)?;
@@ -446,9 +457,28 @@ mod tests {
         let e = Config::parse("[embeddings]\nbinary = \"llama-server.exe\"\n").unwrap_err();
         assert!(e.contains("does not start an embedding server"), "{e}");
         assert!(Config::parse("[embeddings]\nmodel_path = \"x\"\n").is_err());
-        let e = Config::parse("[curator]\nstaging_ttl_days = 7\n").unwrap_err();
-        assert!(e.contains("not supported yet"), "{e}");
-        assert!(Config::parse("[curator]\nstaging_ttl_days = 30\n").is_ok());
+        let e = Config::parse("[curator]\nchunk_to_chunk_threshold = 0.5\n").unwrap_err();
+        assert!(e.contains("thresholds are fixed"), "{e}");
+        assert!(Config::parse("[curator]\nchunk_to_node_threshold = 0.71\n").is_err());
+        let e = Config::parse("[curator]\nbackend = \"api\"\n").unwrap_err();
+        assert!(e.contains("curator.backend"), "{e}");
+    }
+
+    #[test]
+    fn curator_command_and_staging_limit_are_configurable_and_checked() {
+        let c = Config::parse("[curator]\ncli_command = \"codex exec\"\nstaging_ttl_days = 7\n").unwrap();
+        assert_eq!((c.curator.cli_command.as_str(), c.curator.staging_ttl_days), ("codex exec", 7));
+        assert!(Config::parse("[curator]\nstaging_ttl_days = 365\n").is_ok());
+        for bad in ["0", "366", "99999"] {
+            let e = Config::parse(&format!("[curator]\nstaging_ttl_days = {bad}\n")).unwrap_err();
+            assert!(e.contains("curator.staging_ttl_days"), "{e}");
+            assert!(!e.contains("99999"), "{e}");
+        }
+        let e = Config::parse("[curator]\ncli_command = \"   \"\n").unwrap_err();
+        assert!(e.contains("curator.cli_command"), "{e}");
+        let long = format!("[curator]\ncli_command = \"{}\"\n", "SECRETWORD".repeat(40));
+        let e = Config::parse(&long).unwrap_err();
+        assert!(!e.contains("SECRETWORD"), "{e}");
     }
 
     #[test]

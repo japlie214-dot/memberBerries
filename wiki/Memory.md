@@ -19,7 +19,7 @@ A `topic` has no parents. A `knowledge` note has one to eight topic parents, and
 | `supersede` | `id`, a full new note, `confirmed: true` | The new note; the old one becomes `superseded`. |
 | `retract` | `id`, optional `migrate_to_topic_id` or `force_cascade`, `confirmed: true` | The affected IDs. Soft delete: dependents must be migrated or cascaded explicitly. |
 | `scroll_chunk_read` | `chunk_id`, optional `offset`, `limit` | A bounded page of an opted-in captured chat chunk. Private data; untrusted. |
-| `curator_evidence`, `curator_preview`, `curator_apply` | see [Architecture](Architecture.md) | Offline evidence clustering, a preview of a proposed change, and a single-use application that needs approval of that exact preview. |
+| `curator_evidence`, `curator_preview`, `curator_apply` | see [Architecture](Architecture.md) | Offline evidence clustering (you supply the vectors), a session-local preview of a proposed change (create, claim supersede, update or retract; a retract may not cascade), and a single-use application that needs approval of that exact preview. For proposals made by a model command, see `memb curate` and `memb proposals` in [Operations](Operations.md). |
 
 Titles are single-line, at most 160 UTF-8 bytes; `desc` at most 4096 bytes; `properties` JSON at most 4096 bytes. Credential patterns are rejected, including inside nested properties, but a heuristic cannot catch every secret. `confirmed` is a protocol guard, not proof that a human clicked a button; use a client that displays approvals when you need enforceable confirmation. Returned text is untrusted data, never instructions.
 
