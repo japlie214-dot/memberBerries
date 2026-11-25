@@ -233,6 +233,69 @@ pub fn build_prompt(chunks: &[PromptChunk], notes: &[PromptNote]) -> (String, Ve
     (prompt, included)
 }
 
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control() || *c == '\n').collect()
+}
+
+/// Builds the curation prompt from evidence packets (Layer 2) within
+/// [`MAX_PROMPT_BYTES`]: for each packet its chunk summaries, shared entities, related
+/// notes and conflict hint. Returns the prompt and the indexes of the packets that fit
+/// (the rest are left for a later run).
+pub fn build_packet_prompt(
+    packets: &[crate::packets::LinkedPacket],
+    notes: &[PromptNote],
+) -> (String, Vec<usize>) {
+    let (mut prompt, _) = build_prompt(&[], notes);
+    let mut included = Vec::new();
+    for (n, p) in packets.iter().enumerate() {
+        let mut s = format!(
+            "\n=== packet {}: {}; distinct sessions {}; conflict hint {} ===\n",
+            n + 1,
+            p.reason,
+            p.distinct_sessions,
+            p.conflict_hint
+        );
+        if !p.shared_entities.is_empty() {
+            s.push_str(&format!("shared entities: {}\n", clean(&p.shared_entities.join(", "))));
+        }
+        if !p.related_nodes.is_empty() {
+            s.push_str("related notes (id kind title: description, similarity):\n");
+            for r in &p.related_nodes {
+                s.push_str(&format!(
+                    "  {} {} {}: {} ({:.2})\n",
+                    r.id,
+                    r.kind,
+                    clean(&r.title),
+                    clean(&r.desc).replace('\n', " "),
+                    r.score
+                ));
+            }
+        }
+        s.push_str("chunks:\n");
+        for c in &p.chunks {
+            s.push_str(&format!(
+                "- chunk {} (session {}){}\n",
+                c.chunk_id,
+                c.session_id,
+                if c.explicit_directive { " [explicit directive]" } else { "" }
+            ));
+            match (&c.summary, &c.excerpt) {
+                (Some(summary), _) => s.push_str(&format!("{}\n", clean(summary))),
+                (None, Some(excerpt)) => {
+                    s.push_str(&format!("  (no summary) the user wrote:\n{}\n", clean(excerpt)))
+                }
+                (None, None) => {}
+            }
+        }
+        if prompt.len() + s.len() > MAX_PROMPT_BYTES {
+            break;
+        }
+        prompt.push_str(&s);
+        included.push(n);
+    }
+    (prompt, included)
+}
+
 /// Largest conversation text accepted for one summary prompt.
 pub const MAX_SUMMARY_INPUT_BYTES: usize = 24 * 1024;
 const MAX_SUMMARY_BULLETS: usize = 10;

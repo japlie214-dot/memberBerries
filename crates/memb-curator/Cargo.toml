@@ -10,5 +10,6 @@ memb-store = { path = "../memb-store" }
 memb-embed = { path = "../memb-embed" }
 memb-scroll = { path = "../memb-scroll" }
 redb.workspace = true
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true

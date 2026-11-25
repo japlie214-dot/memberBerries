@@ -81,6 +81,47 @@ pub fn embed_text(text: &str, is_query: bool) -> Result<Option<(String, Quantize
     }
 }
 
+/// Vectors of every active knowledge and claim note, embedded with the configured
+/// backend, for linking chunks to notes. Uses and fills the same durable document cache
+/// as search, so unchanged notes are never embedded twice. Returns the model tag the
+/// vectors carry (chunk summary vectors with the same tag are comparable), or `Ok(None)`
+/// when no embedding backend is configured. A note that fails to embed is skipped.
+pub fn note_vectors(store: &Store) -> Result<Option<(String, Vec<(u64, QuantizedVec)>)>, String> {
+    // The tag depends on the model and truncation, so ask the backend once with a tiny text.
+    let Some((tag, probe)) = embed_text("memb", false)? else {
+        return Ok(None);
+    };
+    let cached = store
+        .with_db(|db| memb_embed::read_document_cache(db, &tag))
+        .unwrap_or_default();
+    let mut fresh = Vec::new();
+    let mut out = Vec::new();
+    for note in store.load_all_notes()?.values().filter(|n| {
+        n.status == memb_core::NoteStatus::Active
+            && matches!(n.kind, memb_core::Kind::Knowledge | memb_core::Kind::Claim)
+    }) {
+        let fingerprint = memb_embed::document_fingerprint(&note.title, &note.desc);
+        if let Some((_, v)) = cached
+            .get(&note.id)
+            .filter(|(f, v)| *f == fingerprint && v.data.len() == probe.data.len())
+        {
+            out.push((note.id, v.clone()));
+            continue;
+        }
+        match embed_text(&format!("{}\n{}", note.title, note.desc), false) {
+            Ok(Some((t, v))) if t == tag && v.data.len() == probe.data.len() => {
+                fresh.push((note.id, fingerprint, v.clone()));
+                out.push((note.id, v));
+            }
+            _ => continue,
+        }
+    }
+    if !fresh.is_empty() {
+        let _ = store.with_db(|db| memb_embed::write_document_cache(db, &tag, &fresh));
+    }
+    Ok(Some((tag, out)))
+}
+
 fn search_with_gemma(
     store: &Store,
     query: &str,

@@ -79,7 +79,7 @@ impl Dir {
         for i in 0..10 {
             let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
             let made = store
-                .with_db(|db| memb_scroll::append_message_with(db, "sess1", "cc", role, format!("synthetic message {i} about releases"), true, &limits))
+                .with_db(|db| memb_scroll::append_message_with(db, "sess1", "cc", role, if i == 0 { "From now on, always run the gate before tagging".to_string() } else { format!("synthetic message {i} about releases") }, true, &limits))
                 .unwrap();
             chunks += usize::from(made.is_some());
         }
@@ -119,6 +119,7 @@ fn curation_end_to_end_makes_pending_proposals_and_applies_only_on_confirmation(
     assert!(out.status.success(), "{}", text(&out.stderr));
     let summary = json_line(&out.stdout);
     assert_eq!((summary["dry_run"].clone(), summary["chunks_sent"].clone(), summary["proposals"].clone()), (json!(true), json!(1), json!([])));
+    assert_eq!(summary["packets"], 1, "the chunk holds a standing directive, so it forms a packet on its own");
     assert!(summary["prompt_bytes"].as_u64().unwrap() > 100);
     assert!(!text(&out.stderr).contains("sending"), "a dry run must not send anything");
     assert_eq!(summary["summarized"], 1, "a dry run reports how many summaries it would ask for");
@@ -260,7 +261,7 @@ fn curation_refuses_to_run_inside_a_curation_session_and_rejects_bad_arguments()
     let store = dir.store();
     let limits = ScrollLimits { max_messages: 10, retain_tail: 2, ..ScrollLimits::default() };
     for i in 0..10 {
-        store.with_db(|db| memb_scroll::append_message_with(db, "sess2", "cc", Role::User, format!("another synthetic message {i}"), true, &limits)).unwrap();
+        store.with_db(|db| memb_scroll::append_message_with(db, "sess2", "cc", Role::User, if i == 0 { "Remember that the gate must pass".to_string() } else { format!("another synthetic message {i}") }, true, &limits)).unwrap();
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     for _ in 0..memb_curator::ledger::MAX_PENDING - 1 {
@@ -340,8 +341,84 @@ fn summaries_get_an_embedding_tagged_with_the_model_identity() {
     let sent = bodies.lock().unwrap().join("\n");
     assert!(sent.contains("A synthetic summary bullet"), "{sent}");
     assert!(!sent.contains("synthetic message"), "chunk text must not reach the embedding service: {sent}");
-    // Nothing is left to embed, so a second run adds no vector and sends no embedding request.
+    // Nothing is left to embed: a second run asks the service only for the tiny probe that
+    // names the model identity, never for the summary or the conversation again.
     let before = bodies.lock().unwrap().len();
     dir.run(&["curate"], "");
-    assert_eq!(bodies.lock().unwrap().len(), before);
+    let later = bodies.lock().unwrap()[before..].join("\n");
+    assert!(!later.contains("A synthetic summary bullet") && !later.contains("synthetic message"), "{later}");
+}
+
+/// Layer 2 end to end with no model for the linking: two sessions' chunks get the same
+/// vector, so they link to each other and to an existing knowledge note, one packet with
+/// two sessions is built and sent once, and an unchanged packet is never sent again.
+#[test]
+fn linked_chunks_form_one_packet_that_is_judged_only_once() {
+    use std::io::{Read, Write as _};
+    use std::net::{Ipv4Addr, TcpListener};
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request).into_owned();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length = text[..split]
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            // Every text gets the same direction, so everything is close to everything.
+            let body = r#"{"embedding":[0.5,-0.25,0.125,1.0]}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    let dir = Dir::new("link", &format!("\n[embeddings]\nport = {port}\nmodel_id = \"synthetic-v1\"\n"));
+    let topic = dir.seed();
+    // An existing knowledge note, and a second session's chunk (no directive in it).
+    let store = dir.store();
+    store
+        .remember(Draft { title: "Release gate".into(), desc: "The gate runs before tagging".into(), kind: Kind::Knowledge, parents: vec![topic], properties: Default::default() })
+        .unwrap();
+    let limits = ScrollLimits { max_messages: 10, retain_tail: 2, ..ScrollLimits::default() };
+    for i in 0..10 {
+        store.with_db(|db| memb_scroll::append_message_with(db, "sess2", "cc", Role::User, format!("plain chatter {i}"), true, &limits)).unwrap();
+    }
+    drop(store);
+    // The model defers: no proposals (the reply also answers the summary requests).
+    dir.reply(&json!([]));
+
+    let first = dir.run(&["curate"], "");
+    assert!(first.status.success(), "{}", text(&first.stderr));
+    let summary = json_line(&first.stdout);
+    assert_eq!((summary["summarized"].clone(), summary["embedded"].clone()), (json!(2), json!(2)));
+    assert_eq!((summary["chunk_links"].clone(), summary["note_links"].clone()), (json!(1), json!(2)), "one chunk-chunk link, each chunk linked to the knowledge note");
+    assert_eq!((summary["packets"].clone(), summary["chunks_sent"].clone()), (json!(1), json!(2)), "both sessions in one packet");
+    assert!(text(&first.stderr).contains("sending 1 evidence packet(s) with 2 chunk(s)"), "{}", text(&first.stderr));
+    assert_eq!(summary["proposals"], json!([]));
+    // Deferred, not curated: both chunks stay staged until the staging limit.
+    let staged = || dir.store().with_db(|db| memb_scroll::list_staged_chunks(db, 10)).unwrap().len();
+    assert_eq!(staged(), 2);
+
+    // The same packet is not sent again: no model call, nothing new.
+    let second = dir.run(&["curate"], "");
+    assert!(second.status.success(), "{}", text(&second.stderr));
+    let again = json_line(&second.stdout);
+    assert_eq!((again["packets"].clone(), again["packets_already_judged"].clone(), again["chunks_sent"].clone()), (json!(0), json!(1), json!(0)));
+    assert!(!text(&second.stderr).contains("sending"), "{}", text(&second.stderr));
+    assert_eq!(staged(), 2, "deferred chunks stay staged");
 }

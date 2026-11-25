@@ -375,19 +375,26 @@ fn daemon_once(store: &Store, cfg: &config::Config, now: u64, mirror_root: Optio
         // at the keyboard. A failing or unavailable model never fails the routine (the
         // sweep, staging and mirror succeeded, and the chunks stay staged for the next
         // run); it only produces pending proposals that wait for the user.
-        if cfg.curator.daemon_enabled {
-            let curated = curate::backend_for(cfg, store.root())
-                .and_then(|b| curate::run_curate(store, cfg, &b, now, false, &mut io::stderr()));
-            match curated {
-                Ok(summary) => eprintln!("memb: curation done; {} proposal(s) now await review", summary.proposals.len()),
-                Err(reason) => eprintln!("memb: curation skipped: {reason}"),
-            }
-        }
+        daemon_curate(store, cfg, now);
         Ok((swept, staged))
     })();
     let done = now.saturating_add(started.elapsed().as_millis() as u64);
     store.with_db(|db| memb_ops::finish_daily_routine(db, claim, done, outcome.is_ok()))?;
     outcome.map(Some)
+}
+
+/// The daemon's curation step: only with `curator.daemon_enabled`. A failing or missing
+/// model never fails the routine; it is reported and the chunks stay staged.
+fn daemon_curate(store: &Store, cfg: &config::Config, now: u64) {
+    if !cfg.curator.daemon_enabled {
+        return;
+    }
+    let curated = curate::backend_for(cfg, store.root())
+        .and_then(|b| curate::run_curate(store, cfg, &b, now, false, &mut io::stderr()));
+    match curated {
+        Ok(summary) => eprintln!("memb: curation done; {} proposal(s) now await review", summary.proposals.len()),
+        Err(reason) => eprintln!("memb: curation skipped: {reason}"),
+    }
 }
 
 fn daemon(cli_mirror_root: Option<&Path>) -> Result<(), String> {
@@ -412,6 +419,16 @@ fn daemon(cli_mirror_root: Option<&Path>) -> Result<(), String> {
                 // fault (for example a bad mirror directory) would retry, and litter, every minute.
                 eprintln!("memb: routine failed; retrying in 15 minutes");
                 std::thread::sleep(std::time::Duration::from_secs(14 * 60));
+            }
+        }
+        // Between the daily routines: three or more uncurated chunks make curation due
+        // (at most once an hour), still only with `curator.daemon_enabled`.
+        if cfg.curator.daemon_enabled {
+            if let Ok(now) = now_ms() {
+                if curate::threshold_due(&store, now).unwrap_or(false) {
+                    // run_curate stages new chunks itself.
+                    daemon_curate(&store, &cfg, now);
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -1373,7 +1390,7 @@ cooldown_hours = 1
         if reply.to_str().is_none_or(|p| p.contains(char::is_whitespace)) {
             return; // the command line is split on spaces; a spaced temp path cannot be used
         }
-        std::fs::write(&reply, r#"[{"action":"KNOWLEDGE_UPSERT","title":"From the daemon","desc":"Needs review","parents":[1],"source_chunks":["chk_s1_0000"]}]"#).unwrap();
+        std::fs::write(&reply, r#"{"summary":["A synthetic summary bullet"],"explicit_signal":true,"proposals":[{"action":"KNOWLEDGE_UPSERT","title":"From the daemon","desc":"Needs review","parents":[1],"source_chunks":["chk_s1_0000"]}]}"#).unwrap();
         let day = 24 * 3600 * 1000u64;
         let seeded = |name: &str| {
             let root = dir.join(name);
@@ -1383,7 +1400,9 @@ cooldown_hours = 1
             store.remember(memb_core::Draft { title: "Topic".into(), desc: "A topic".into(), kind: memb_core::Kind::Topic, parents: vec![], properties: Default::default() }).unwrap();
             store.with_db(|db| {
                 for i in 0..45 {
-                    memb_scroll::append_message(db, "s1", "test", memb_scroll::Role::User, format!("message {i}"), true)?;
+                    // The first message is a standing directive: that alone puts the chunk in a packet.
+                    let text = if i == 0 { "Remember that releases need the gate".to_string() } else { format!("message {i}") };
+                    memb_scroll::append_message(db, "s1", "test", memb_scroll::Role::User, text, true)?;
                 }
                 Ok(())
             }).unwrap();

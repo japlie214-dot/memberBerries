@@ -5,7 +5,8 @@
 //! command, turns the answer into pending proposals and changes no note. A proposal
 //! only changes a note when the user types its confirmation in `proposals apply`.
 use crate::config::Config;
-use memb_curator::backend::{self, Backend, PromptChunk, PromptNote};
+use memb_curator::backend::{self, Backend, PromptNote};
+use memb_curator::{links, packets};
 use memb_curator::ledger::{self, Status, StoredProposal};
 use memb_curator::{CuratorAction, Proposal};
 use memb_store::Store;
@@ -69,8 +70,15 @@ pub struct Summary {
     pub staged_now: usize,
     pub expired_chunks: usize,
     pub expired_proposals: usize,
+    /// Chunks in the evidence packets sent (or that a dry run would send).
     pub chunks_sent: usize,
     pub prompt_bytes: usize,
+    /// Evidence packets sent (or that a dry run would send).
+    pub packets: usize,
+    /// Packets left out because the model already judged identical content.
+    pub packets_already_judged: usize,
+    /// Links stored this run: (chunk to chunk, chunk to note).
+    pub links: (usize, usize),
     /// Chunks that got a summary this run (a dry run reports how many would).
     pub summarized: usize,
     /// Chunks that got a summary vector this run.
@@ -85,6 +93,8 @@ impl Summary {
         json!({"dry_run": self.dry_run, "staged_now": self.staged_now,
                "expired_chunks": self.expired_chunks, "expired_proposals": self.expired_proposals,
                "chunks_sent": self.chunks_sent, "prompt_bytes": self.prompt_bytes,
+               "packets": self.packets, "packets_already_judged": self.packets_already_judged,
+               "chunk_links": self.links.0, "note_links": self.links.1,
                "summarized": self.summarized, "embedded": self.embedded,
                "proposals": self.proposals, "skipped": self.skipped})
     }
@@ -92,6 +102,11 @@ impl Summary {
 
 /// One curation run. With `dry_run` nothing is sent and nothing but staging and
 /// expiry is recorded, so the user can see how much text would leave memb.
+///
+/// Order: expire, stage, Layer 1 (summaries and summary vectors), links between staged
+/// chunks and between chunks and notes, evidence packets, then one model call for the
+/// packets it has not already judged. Chunks that meet none of the three Phase 3 rules
+/// are in no packet and stay staged until the staging limit.
 pub fn run_curate(
     store: &Store,
     cfg: &Config,
@@ -126,19 +141,29 @@ pub fn run_curate(
         (summarized, embedded) = summarize_staged(store, backend, &staged, notice)?;
         staged = store.with_db(|db| memb_scroll::list_staged_chunks(db, MAX_CHUNKS_PER_RUN))?;
     }
-    let chunks: Vec<PromptChunk> = staged
-        .iter()
-        .map(|c| PromptChunk {
-            session_id: c.session_id.clone(),
-            chunk_id: c.chunk_id.clone(),
-            text: match &c.summary {
-                Some(summary) => format!("summary:\n{summary}\nconversation:\n{}", flatten(&c.messages)),
-                None => flatten(&c.messages),
-            },
-        })
-        .collect();
-    let notes: Vec<PromptNote> = store
-        .load_all_notes()?
+    let all_notes = store.load_all_notes()?;
+    // Layer 2 links: no model call. A dry run only reads the links stored earlier.
+    let mut links_made = (0, 0);
+    if !dry_run && !staged.is_empty() {
+        // Best effort: with no embedding backend there are no vectors to link.
+        if let Ok(Some((tag, nodes))) = memb_rag::note_vectors(store) {
+            links_made = store.with_db(|db| links::refresh_links(db, &staged, &nodes, &tag))?;
+        }
+    }
+    let ids: Vec<String> = staged.iter().map(|c| c.chunk_id.clone()).collect();
+    let link_set = store.with_db(|db| links::read_links(db, &ids))?;
+    let all_packets = packets::build_linked_packets(&staged, &link_set, &all_notes);
+    let ttl = ttl_ms(cfg);
+    let mut fresh = Vec::new();
+    let mut already_judged = 0;
+    for packet in all_packets {
+        if store.with_db(|db| links::hash_seen(db, &packet.hash, now, ttl))? {
+            already_judged += 1;
+        } else {
+            fresh.push(packet);
+        }
+    }
+    let catalog: Vec<PromptNote> = all_notes
         .values()
         .filter(|n| n.status == memb_core::NoteStatus::Active)
         .map(|n| PromptNote {
@@ -147,39 +172,50 @@ pub fn run_curate(
             title: n.title.clone(),
         })
         .collect();
-    let (prompt, included) = backend::build_prompt(&chunks, &notes);
+    let (prompt, included) = backend::build_packet_prompt(&fresh, &catalog);
+    let sent: Vec<&packets::LinkedPacket> = included.iter().map(|&i| &fresh[i]).collect();
     let mut summary = Summary {
         staged_now,
         expired_chunks,
         expired_proposals,
-        chunks_sent: included.len(),
+        chunks_sent: sent.iter().map(|p| p.chunks.len()).sum(),
         prompt_bytes: prompt.len(),
+        packets: sent.len(),
+        packets_already_judged: already_judged,
+        links: links_made,
         summarized,
         embedded,
         proposals: Vec::new(),
         skipped: 0,
         dry_run,
     };
-    if included.is_empty() || dry_run {
+    if !dry_run {
+        // Recorded whether or not anything is sent, so the "enough chunks" trigger does not
+        // fire again every minute for chunks the model already judged, and a failing model
+        // is not retried at once.
+        store.with_db(|db| links::set_last_curation_ms(db, now))?;
+    }
+    if sent.is_empty() || dry_run {
         return Ok(summary);
     }
     // Defense in depth: capture already refuses credentials; never send one onward.
     memb_core::reject_secrets(&prompt).map_err(|_| "sensitive text found; nothing was sent")?;
     writeln!(
         notice,
-        "memb: sending {} chunk(s) ({} bytes) of private conversation text to `{}`",
-        included.len(),
+        "memb: sending {} evidence packet(s) with {} chunk(s) ({} bytes) of private conversation text to `{}`",
+        sent.len(),
+        summary.chunks_sent,
         prompt.len(),
         backend.program()
     )
     .map_err(|_| "output failed")?;
     let reply = backend.run(&prompt)?;
-    let allowed: BTreeMap<String, String> = staged
+    let allowed: BTreeMap<String, String> = sent
         .iter()
-        .filter(|c| included.contains(&c.chunk_id))
-        .map(|c| (c.chunk_id.clone(), c.session_id.clone()))
+        .flat_map(|p| p.chunks.iter().map(|c| (c.chunk_id.clone(), c.session_id.clone())))
         .collect();
     let (proposals, mut skipped) = backend::parse_response(&reply, &allowed)?;
+    let mut cited: Vec<String> = Vec::new();
     for p in proposals {
         // The proposal is validated now and again when applied.
         if memb_core::reject_secrets(&p.action_json.to_string()).is_err()
@@ -190,11 +226,37 @@ pub fn run_curate(
         }
         let id = store.with_db(|db| ledger::add(db, now, p.action_json.clone(), p.sources.clone()))?;
         summary.proposals.push(id);
+        cited.extend(p.sources.iter().map(|(_, chunk)| chunk.clone()));
     }
     summary.skipped = skipped;
-    // The model has seen these chunks; they leave staging whatever it proposed.
-    store.with_db(|db| memb_scroll::mark_chunks_curated(db, &included))?;
+    // The model judged these packets: an identical packet is not sent again until it
+    // changes or the entry expires. Only chunks that a saved proposal cites leave staging;
+    // the rest were deferred and stay staged until the staging limit.
+    let hashes: Vec<String> = sent.iter().map(|p| p.hash.clone()).collect();
+    store.with_db(|db| links::record_hashes(db, &hashes, now, ttl))?;
+    cited.sort();
+    cited.dedup();
+    store.with_db(|db| memb_scroll::mark_chunks_curated(db, &cited))?;
     Ok(summary)
+}
+
+/// Uncurated chunks (staged or not) that make a curation run due between the daily
+/// routines.
+pub const THRESHOLD_CHUNKS: usize = 3;
+/// Least time between two curation runs started by that trigger.
+pub const THRESHOLD_COOLDOWN_MS: u64 = 60 * 60 * 1000;
+
+/// Phase 3: curation also runs "whenever >= 3 uncurated chunks accumulate", not only
+/// after the daily sweep. True when there are at least [`THRESHOLD_CHUNKS`] such chunks
+/// and the last run (of any kind) was at least an hour ago.
+pub fn threshold_due(store: &Store, now: u64) -> Result<bool, String> {
+    let unstaged = store.with_db(|db| memb_scroll::list_uncurated_chunks(db, THRESHOLD_CHUNKS))?.len();
+    let staged = store.with_db(|db| memb_scroll::list_staged_chunks(db, THRESHOLD_CHUNKS))?.len();
+    if unstaged + staged < THRESHOLD_CHUNKS {
+        return Ok(false);
+    }
+    let last = store.with_db(links::last_curation_ms)?;
+    Ok(now.saturating_sub(last) >= THRESHOLD_COOLDOWN_MS)
 }
 
 /// Layer 1: one model call per staged chunk that has no summary yet (at most
@@ -448,6 +510,38 @@ mod tests {
         // A configured shorter limit is honored.
         cfg.curator.staging_ttl_days = 1;
         assert_eq!(ttl_ms(&cfg), DAY_MS);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn three_uncurated_chunks_make_curation_due_at_most_once_an_hour() {
+        let (store, root) = temp_store("threshold");
+        let limits = memb_scroll::ScrollLimits { max_messages: 10, retain_tail: 2, ..Default::default() };
+        let add_chunk = |session: &str| {
+            for i in 0..10 {
+                store.with_db(|db| memb_scroll::append_message_with(db, session, "cc", memb_scroll::Role::User, format!("m{i}"), true, &limits)).unwrap();
+            }
+        };
+        let now = 10 * DAY_MS;
+        add_chunk("a");
+        add_chunk("b");
+        assert!(!threshold_due(&store, now).unwrap(), "two chunks are not enough");
+        add_chunk("c");
+        assert!(threshold_due(&store, now).unwrap(), "three uncurated chunks, never curated");
+        // Staged chunks still count (they are uncurated).
+        for c in store.with_db(|db| memb_scroll::list_uncurated_chunks(db, 10)).unwrap() {
+            store.with_db(|db| memb_scroll::stage_chunk_evidence(db, &c.chunk_id)).unwrap();
+        }
+        assert!(threshold_due(&store, now).unwrap());
+        // A run just happened: not due again until an hour has passed.
+        store.with_db(|db| links::set_last_curation_ms(db, now)).unwrap();
+        assert!(!threshold_due(&store, now + THRESHOLD_COOLDOWN_MS - 1).unwrap());
+        assert!(threshold_due(&store, now + THRESHOLD_COOLDOWN_MS).unwrap());
+        // Curated chunks no longer count.
+        let ids: Vec<String> = store.with_db(|db| memb_scroll::list_staged_chunks(db, 10)).unwrap().into_iter().map(|c| c.chunk_id).collect();
+        store.with_db(|db| memb_scroll::mark_chunks_curated(db, &ids[..2])).unwrap();
+        assert!(!threshold_due(&store, now + 2 * THRESHOLD_COOLDOWN_MS).unwrap());
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

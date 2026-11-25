@@ -2,6 +2,8 @@
 //! store. [`backend`] runs the user's configured command-line model (and nothing else
 //! starts a model); [`ledger`] keeps proposals durably until the user decides.
 pub mod backend;
+pub mod links;
+pub mod packets;
 pub mod ledger;
 
 use memb_core::{Draft, Kind, NotePatch};
