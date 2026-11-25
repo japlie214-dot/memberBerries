@@ -24,6 +24,8 @@ pub enum Status {
     /// never applied a second time.
     Applying,
     Applied,
+    /// Applied, then every note edit it made was reversed.
+    RolledBack,
     Rejected,
     Expired,
 }
@@ -40,6 +42,12 @@ pub struct StoredProposal {
     pub sources: Vec<(String, String)>,
     /// The note the applied action created or changed.
     pub note_id: Option<u64>,
+    /// Revision ids the applied action wrote, so it can be rolled back as one edit.
+    #[serde(default)]
+    pub revisions: Vec<u64>,
+    /// True when memb applied it without a typed confirmation (auto-apply).
+    #[serde(default)]
+    pub auto: bool,
 }
 
 fn load(raw: &[u8]) -> Result<StoredProposal, String> {
@@ -90,6 +98,8 @@ pub fn add(
                 action,
                 sources,
                 note_id: None,
+                revisions: Vec::new(),
+                auto: false,
             },
         )?;
         id
@@ -142,6 +152,7 @@ fn transition(
     from: &[Status],
     to: Status,
     note_id: Option<u64>,
+    revisions: Option<(Vec<u64>, bool)>,
 ) -> Result<StoredProposal, String> {
     let w = db.begin_write().map_err(|e| e.to_string())?;
     let updated = {
@@ -158,6 +169,8 @@ fn transition(
             status: to,
             decided_ms: Some(now_ms),
             note_id: note_id.or(current.note_id),
+            revisions: revisions.as_ref().map_or(current.revisions.clone(), |r| r.0.clone()),
+            auto: revisions.as_ref().map_or(current.auto, |r| r.1),
             ..current
         };
         put(&mut table, &updated)?;
@@ -170,12 +183,30 @@ fn transition(
 /// Pending to applying. Fails if the proposal is not pending (already used, rejected
 /// or expired), which is what makes approval single-use across processes.
 pub fn claim(db: &Database, id: u64, now_ms: u64) -> Result<StoredProposal, String> {
-    transition(db, id, now_ms, &[Status::Pending], Status::Applying, None)
+    transition(db, id, now_ms, &[Status::Pending], Status::Applying, None, None)
 }
 
 /// Applying to applied, recording the note that was created or changed.
 pub fn finish(db: &Database, id: u64, now_ms: u64, note_id: Option<u64>) -> Result<(), String> {
-    transition(db, id, now_ms, &[Status::Applying], Status::Applied, note_id).map(|_| ())
+    finish_recorded(db, id, now_ms, note_id, Vec::new(), false)
+}
+
+/// Like `finish`, also recording the revisions the action wrote and whether memb applied
+/// it by itself (`auto`).
+pub fn finish_recorded(
+    db: &Database,
+    id: u64,
+    now_ms: u64,
+    note_id: Option<u64>,
+    revisions: Vec<u64>,
+    auto: bool,
+) -> Result<(), String> {
+    transition(db, id, now_ms, &[Status::Applying], Status::Applied, note_id, Some((revisions, auto))).map(|_| ())
+}
+
+/// Applied to rolled back, after the store reversed the recorded revisions.
+pub fn mark_rolled_back(db: &Database, id: u64, now_ms: u64) -> Result<(), String> {
+    transition(db, id, now_ms, &[Status::Applied], Status::RolledBack, None, None).map(|_| ())
 }
 
 /// Pending (or a stuck applying) to rejected.
@@ -186,6 +217,7 @@ pub fn reject(db: &Database, id: u64, now_ms: u64) -> Result<(), String> {
         now_ms,
         &[Status::Pending, Status::Applying],
         Status::Rejected,
+        None,
         None,
     )
     .map(|_| ())

@@ -422,3 +422,97 @@ fn linked_chunks_form_one_packet_that_is_judged_only_once() {
     assert!(!text(&second.stderr).contains("sending"), "{}", text(&second.stderr));
     assert_eq!(staged(), 2, "deferred chunks stay staged");
 }
+
+#[test]
+fn auto_apply_applies_within_limits_and_every_edit_can_be_rolled_back_by_proposal() {
+    let dir = Dir::new("auto", "auto_apply = true\nmax_auto_edits = 2\n");
+    let topic = dir.seed();
+    dir.reply(&json!([
+        {"action":"KNOWLEDGE_UPSERT","title":"Release checklist","desc":"Run the gate before tagging","parents":[topic],"source_chunks":[CHUNK]},
+        {"action":"UPDATE","id":topic,"patch":{"desc":"How releases are cut and verified"},"source_chunks":[CHUNK]},
+        {"action":"KNOWLEDGE_UPSERT","title":"Third edit","desc":"Over the per-run limit","parents":[topic],"source_chunks":[CHUNK]}
+    ]));
+    let out = dir.run(&["curate"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let summary = json_line(&out.stdout);
+    assert_eq!(summary["proposals"], json!([1, 2, 3]));
+    assert_eq!(summary["auto_applied"], json!([1, 2]));
+    assert_eq!(summary["held_for_review"], 1, "the third edit is over curator.max_auto_edits");
+    assert!(text(&out.stderr).contains("auto-applied 2"), "{}", text(&out.stderr));
+    let notes = dir.store().load_all_notes().unwrap();
+    assert_eq!(notes.len(), 2);
+    let created = notes.values().find(|n| n.title == "Release checklist").unwrap();
+    assert_eq!(created.properties["source_chunks"][0]["chunk_id"], CHUNK, "provenance is stamped on automatic edits too");
+    assert_eq!(notes[&topic].desc, "How releases are cut and verified");
+    let statuses: Vec<String> = text(&dir.run(&["proposals"], "").stdout)
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["status"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(statuses, ["pending", "applied", "applied"]);
+
+    // The audit list shows what memb did by itself, with the revisions written.
+    let audit: Vec<Value> = text(&dir.run(&["proposals", "audit"], "").stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(audit.iter().map(|r| r["id"].as_u64().unwrap()).collect::<Vec<_>>(), [2, 1]);
+    assert!(audit.iter().all(|r| !r["revisions"].as_array().unwrap().is_empty()));
+
+    // Rollback needs the typed confirmation, then reverses the edit.
+    let out = dir.run(&["proposals", "rollback", "1"], "yes\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(dir.store().load_all_notes().unwrap().len(), 2);
+    let out = dir.run(&["proposals", "rollback", "1"], "ROLLBACK 1\n");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let after = dir.store().load_all_notes().unwrap();
+    assert_eq!(after.values().find(|n| n.title == "Release checklist").unwrap().status, memb_core::NoteStatus::Retracted);
+    assert!(dir.run(&["proposals", "rollback", "1"], "ROLLBACK 1\n").status.code() == Some(1), "only once");
+    // Undoing the update restores the earlier text.
+    assert!(dir.run(&["proposals", "rollback", "2"], "ROLLBACK 2\n").status.success());
+    assert_eq!(dir.store().inspect(topic).unwrap().unwrap().desc, "How releases are cut");
+    let statuses: Vec<String> = text(&dir.run(&["proposals", "--status", "rolledback"], "").stdout)
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].to_string())
+        .collect();
+    assert_eq!(statuses, ["2", "1"]);
+    // The held proposal still follows the manual path.
+    assert!(dir.run(&["proposals", "apply", "3"], "APPLY 3\n").status.success());
+}
+
+#[test]
+fn the_kill_switch_and_cascade_rule_hold_back_automatic_edits() {
+    let dir = Dir::new("rails", "auto_apply = true\n");
+    let topic = dir.seed();
+    let store = dir.store();
+    let know = store.remember(Draft { title: "Gate".into(), desc: "The gate".into(), kind: Kind::Knowledge, parents: vec![topic], properties: Default::default() }).unwrap();
+    let claim = store.remember(Draft { title: "Gate is strict".into(), desc: "It fails on warnings".into(), kind: Kind::Claim, parents: vec![know.id], properties: Default::default() }).unwrap();
+    drop(store);
+    dir.reply(&json!([
+        {"action":"RETRACT","id":know.id,"source_chunks":[CHUNK]},
+        {"action":"RETRACT","id":claim.id,"source_chunks":[CHUNK]}
+    ]));
+    // Paused: nothing is applied, both stay pending.
+    assert!(dir.run(&["proposals", "pause"], "").status.success());
+    let summary = json_line(&dir.run(&["curate"], "").stdout);
+    assert_eq!((summary["auto_applied"].clone(), summary["held_for_review"].clone()), (json!([]), json!(2)));
+    assert_eq!(dir.store().load_all_notes().unwrap().values().filter(|n| n.status == memb_core::NoteStatus::Active).count(), 3);
+    assert!(dir.run(&["proposals", "resume"], "").status.success());
+    // The model cannot flip the switch from inside a curation session.
+    let inside = dir.command(&["proposals", "pause"]).env("MEMB_INTERNAL", "1").stdin(Stdio::null()).output().unwrap();
+    assert_eq!(inside.status.code(), Some(1));
+    // Resumed, a second run (new evidence) applies the claim retraction but holds the cascade.
+    let store = dir.store();
+    let limits = ScrollLimits { max_messages: 10, retain_tail: 2, ..ScrollLimits::default() };
+    for i in 0..10 {
+        let first = if i == 0 { "Remember that the gate must stay strict".to_string() } else { format!("another message {i}") };
+        store.with_db(|db| memb_scroll::append_message_with(db, "sess2", "cc", Role::User, first, true, &limits)).unwrap();
+    }
+    drop(store);
+    dir.reply(&json!([
+        {"action":"RETRACT","id":know.id,"source_chunks":["chk_sess2_0000"]},
+        {"action":"RETRACT","id":claim.id,"source_chunks":["chk_sess2_0000"]}
+    ]));
+    let summary = json_line(&dir.run(&["curate"], "").stdout);
+    assert_eq!(summary["held_for_review"], 1, "retracting a note that has active claims is a cascade: {summary}");
+    assert_eq!(summary["auto_applied"].as_array().unwrap().len(), 1);
+    let notes = dir.store().load_all_notes().unwrap();
+    assert_eq!(notes[&claim.id].status, memb_core::NoteStatus::Retracted);
+    assert_eq!(notes[&know.id].status, memb_core::NoteStatus::Active);
+}

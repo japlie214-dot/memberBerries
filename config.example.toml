@@ -38,7 +38,12 @@ chunk_to_chunk_threshold = 0.72   # fixed: any other value is rejected
 chunk_to_node_threshold = 0.70    # fixed: any other value is rejected
 staging_ttl_days = 30        # 1..=365: staged evidence and unanswered proposals expire after this
 daemon_enabled = false       # true: `memb daemon` runs curation once a day, i.e. sends staged conversation
-                             # text to cli_command with nobody at the keyboard. Proposals still wait for you.
+                             # text to cli_command with nobody at the keyboard. Proposals still wait for you
+                             # unless auto_apply is also true.
+auto_apply = false           # true: valid proposals are applied without a typed confirmation (full auto-apply, decided
+                             # 2026-11-25). Safety net: every edit is recorded and `memb proposals rollback <id>`
+                             # reverses it; `memb proposals pause` is the kill switch; `memb proposals audit` lists them.
+max_auto_edits = 5           # 1..=50: most proposals one run applies by itself; the rest wait for review
 
 [scheduler]                  # used by `memb daemon`
 routine_wib_hour = 15        # 0..=23, Western Indonesia Time (UTC+7)

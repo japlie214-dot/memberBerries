@@ -563,6 +563,97 @@ impl Store {
         Ok(restored)
     }
 
+    /// Highest revision id so far (0 when there is none).
+    pub fn latest_revision_id(&self) -> Result<u64, String> {
+        Ok(self.list_revisions(None, 1)?.first().map_or(0, |r| r.rev_id))
+    }
+
+    /// Reverse a group of revisions atomically, newest first, all or nothing.
+    ///
+    /// Supported: `update`, `remember`, `supersede_new`, `supersede_old` and `retract`.
+    /// A created note is not deleted: it becomes `Retracted`. A superseded or retracted
+    /// note becomes active again with its earlier content. Every step needs the note to
+    /// still equal that revision's after-image (no later edit), and the graph must stay
+    /// valid (for example a created topic cannot be undone while an active note still
+    /// hangs under it). Each step records its own `rollback_<op>:<id>` revision.
+    pub fn rollback_revisions(&self, ids: &[u64]) -> Result<Vec<Note>, String> {
+        if ids.is_empty() || ids.len() > 200 {
+            return Err("give between 1 and 200 revisions".into());
+        }
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let _lock = acquire_os_lock(&self.root)?;
+        let db = self.open_db()?;
+        let mut all = Self::load_all_notes_locked(&db)?;
+        let mut revisions = Vec::new();
+        {
+            let r = db.begin_read().map_err(|e| e.to_string())?;
+            let revs = r.open_table(REVISIONS_TABLE).map_err(|e| e.to_string())?;
+            for id in ids.iter().rev() {
+                let value = revs.get(*id).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("revision {id} not found"))?;
+                let rev: Revision = serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
+                if rev.rev_id != *id {
+                    return Err("revision key/id mismatch".into());
+                }
+                revisions.push(rev);
+            }
+        }
+        let ts = now_ms();
+        let mut steps: Vec<(u64, String, Note, Note)> = Vec::new(); // (note, op, from, to)
+        for rev in &revisions {
+            let after = rev.after.clone().ok_or("revision has no after-image")?;
+            if after.id != rev.note_id {
+                return Err("inconsistent revision".into());
+            }
+            if all.get(&rev.note_id) != Some(&after) {
+                return Err(format!("rollback conflict: note {} differs from revision {} after-image", rev.note_id, rev.rev_id));
+            }
+            let mut to = match rev.op.as_str() {
+                "remember" | "supersede_new" => {
+                    if rev.before.is_some() { return Err("inconsistent creation revision".into()); }
+                    let mut n = after.clone();
+                    n.status = NoteStatus::Retracted;
+                    n
+                }
+                "update" | "supersede_old" | "retract" => {
+                    let before = rev.before.clone().ok_or("revision has no before-image")?;
+                    if before.id != rev.note_id || before.kind != after.kind || before.created_at_ms != after.created_at_ms {
+                        return Err("inconsistent revision".into());
+                    }
+                    before
+                }
+                _ => return Err(format!("revision {} (`{}`) cannot be rolled back", rev.rev_id, rev.op)),
+            };
+            to.updated_at_ms = ts;
+            all.insert(to.id, to.clone());
+            steps.push((rev.rev_id, rev.op.clone(), after, to));
+        }
+        for note in all.values().filter(|n| n.status == NoteStatus::Active) {
+            validate_parents_shape(note.kind, &note.parents).map_err(|e| e.to_string())?;
+            Self::verify_parents_exist(&all, note.kind, &note.parents)?;
+        }
+        let w = db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut notes = w.open_table(NOTES_TABLE).map_err(|e| e.to_string())?;
+            let mut meta = w.open_table(META_TABLE).map_err(|e| e.to_string())?;
+            let mut revs = w.open_table(REVISIONS_TABLE).map_err(|e| e.to_string())?;
+            for (rev_id, op, from, to) in &steps {
+                let new_id = Self::next_counter(&mut meta, "next_rev")?;
+                if revs.get(new_id).map_err(|e| e.to_string())?.is_some() { return Err("revision counter collision".into()); }
+                let bytes = serde_json::to_vec(to).map_err(|e| e.to_string())?;
+                notes.insert(to.id, bytes.as_slice()).map_err(|e| e.to_string())?;
+                let record = Revision { rev_id: new_id, ts_ms: ts, op: format!("rollback_{op}:{rev_id}"),
+                    note_id: to.id, before: Some(from.clone()), after: Some(to.clone()) };
+                let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+                revs.insert(new_id, bytes.as_slice()).map_err(|e| e.to_string())?;
+            }
+        }
+        w.commit().map_err(|e| e.to_string())?;
+        Ok(steps.into_iter().map(|(_, _, _, to)| to).collect())
+    }
+
     pub fn supersede(&self, old_id: u64, draft: Draft) -> Result<Note, String> {
         let draft = draft.validate().map_err(|e| e.to_string())?;
         let _lock = acquire_os_lock(&self.root)?;
@@ -1005,6 +1096,49 @@ mod tests {
             assert_eq!(rev.op, "rollback_update:4");
             Ok(())
         }).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grouped_rollback_reverses_creations_supersessions_and_retractions() {
+        let dir = temp_dir("group_rollback");
+        let store = Store::open(&dir).unwrap();
+        let d = |title: &str, kind: Kind, parents: Vec<u64>| Draft { title: title.into(), desc: "text".into(), kind, parents, properties: BTreeMap::new() };
+        let t = store.remember(d("T", Kind::Topic, vec![])).unwrap();
+        let k = store.remember(d("K", Kind::Knowledge, vec![t.id])).unwrap();
+        let c = store.remember(d("C", Kind::Claim, vec![k.id])).unwrap();
+        let mark = store.latest_revision_id().unwrap();
+        // One "curation edit": supersede the claim.
+        let c2 = store.supersede(c.id, d("C2", Kind::Claim, vec![k.id])).unwrap();
+        let group: Vec<u64> = (mark + 1..=store.latest_revision_id().unwrap()).collect();
+        assert_eq!(group.len(), 2);
+        let back = store.rollback_revisions(&group).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(store.inspect(c.id).unwrap().unwrap().status, NoteStatus::Active);
+        assert_eq!(store.inspect(c2.id).unwrap().unwrap().status, NoteStatus::Retracted);
+        assert!(store.rollback_revisions(&group).unwrap_err().contains("conflict"), "a group cannot be undone twice");
+        // A retraction is undone.
+        let mark = store.latest_revision_id().unwrap();
+        store.retract(c.id, None, false).unwrap();
+        let group: Vec<u64> = (mark + 1..=store.latest_revision_id().unwrap()).collect();
+        store.rollback_revisions(&group).unwrap();
+        assert_eq!(store.inspect(c.id).unwrap().unwrap().status, NoteStatus::Active);
+        // A creation is undone, but not while something active hangs under it.
+        let mark = store.latest_revision_id().unwrap();
+        let k2 = store.remember(d("K2", Kind::Knowledge, vec![t.id])).unwrap();
+        let kid = (mark + 1..=store.latest_revision_id().unwrap()).collect::<Vec<_>>();
+        let child = store.remember(d("C3", Kind::Claim, vec![k2.id])).unwrap();
+        assert!(store.rollback_revisions(&kid).is_err());
+        assert_eq!(store.inspect(k2.id).unwrap().unwrap().status, NoteStatus::Active);
+        store.retract(child.id, None, false).unwrap();
+        // The claim was edited later (retracted), so the creation of K2 can go but a stale group cannot.
+        store.rollback_revisions(&kid).unwrap();
+        assert_eq!(store.inspect(k2.id).unwrap().unwrap().status, NoteStatus::Retracted);
+        // Rollback records are not themselves rollbackable, and unknown ids fail without changes.
+        let last = store.latest_revision_id().unwrap();
+        assert!(store.rollback_revisions(&[last]).unwrap_err().contains("cannot be rolled back"));
+        assert!(store.rollback_revisions(&[last + 5]).is_err());
+        assert!(store.rollback_revisions(&[]).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

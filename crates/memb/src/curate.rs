@@ -84,6 +84,10 @@ pub struct Summary {
     /// Chunks that got a summary vector this run.
     pub embedded: usize,
     pub proposals: Vec<u64>,
+    /// Proposals memb applied by itself this run (`curator.auto_apply`).
+    pub auto_applied: Vec<u64>,
+    /// Proposals left pending for review: over the per-run limit, a cascade, or paused.
+    pub held_for_review: usize,
     pub skipped: usize,
     pub dry_run: bool,
 }
@@ -96,7 +100,8 @@ impl Summary {
                "packets": self.packets, "packets_already_judged": self.packets_already_judged,
                "chunk_links": self.links.0, "note_links": self.links.1,
                "summarized": self.summarized, "embedded": self.embedded,
-               "proposals": self.proposals, "skipped": self.skipped})
+               "proposals": self.proposals, "auto_applied": self.auto_applied,
+               "held_for_review": self.held_for_review, "skipped": self.skipped})
     }
 }
 
@@ -186,6 +191,8 @@ pub fn run_curate(
         summarized,
         embedded,
         proposals: Vec::new(),
+        auto_applied: Vec::new(),
+        held_for_review: 0,
         skipped: 0,
         dry_run,
     };
@@ -237,7 +244,156 @@ pub fn run_curate(
     cited.sort();
     cited.dedup();
     store.with_db(|db| memb_scroll::mark_chunks_curated(db, &cited))?;
+    if cfg.curator.auto_apply && !summary.proposals.is_empty() {
+        let (applied, held) = auto_apply(store, cfg, &summary.proposals, now, notice)?;
+        summary.auto_applied = applied;
+        summary.held_for_review = held;
+    }
     Ok(summary)
+}
+
+/// The store revisions an action writes, so they can be recorded and reversed together.
+fn revision_ops(action: &CuratorAction) -> &'static [&'static str] {
+    match action {
+        CuratorAction::Defer {} => &[],
+        CuratorAction::KnowledgeUpsert { .. } | CuratorAction::ClaimAdd { .. } => &["remember"],
+        CuratorAction::ClaimSupersede { .. } => &["supersede_old", "supersede_new"],
+        CuratorAction::Update { .. } => &["update"],
+        CuratorAction::Retract { .. } => &["retract"],
+    }
+}
+
+/// Claims `id`, applies it and records the revisions it wrote. The caller has the user's
+/// typed confirmation or, with `auto`, the `curator.auto_apply` setting.
+fn apply_recorded(store: &Store, id: u64, prepared: Proposal, now: u64, auto: bool) -> Result<Option<u64>, String> {
+    // Claim first: another process (or a second confirmation) cannot apply it again.
+    store.with_db(|db| ledger::claim(db, id, now))?;
+    let ops = revision_ops(prepared.action());
+    let mark = store.latest_revision_id()?;
+    match prepared.apply_after_user_approval(store) {
+        Ok(note) => {
+            let revisions: Vec<u64> = store
+                .list_revisions(None, 200)?
+                .into_iter()
+                .filter(|r| r.rev_id > mark && ops.contains(&r.op.as_str()))
+                .map(|r| r.rev_id)
+                .rev()
+                .collect();
+            store.with_db(|db| ledger::finish_recorded(db, id, now, note, revisions, auto))?;
+            Ok(note)
+        }
+        Err(reason) => {
+            // It cannot be applied as proposed (for example the note changed); it is
+            // not retried silently.
+            let _ = store.with_db(|db| ledger::reject(db, id, now));
+            Err(reason)
+        }
+    }
+}
+
+/// True when the action would change more than one note or remove a whole subtree; those
+/// are never applied automatically.
+fn is_cascade(store: &Store, action: &CuratorAction) -> Result<bool, String> {
+    let CuratorAction::Retract { id, .. } = action else { return Ok(false) };
+    let all = store.load_all_notes()?;
+    let Some(target) = all.get(id) else { return Ok(false) };
+    Ok(match target.kind {
+        memb_core::Kind::Topic => true,
+        memb_core::Kind::Knowledge => all
+            .values()
+            .any(|n| n.status == memb_core::NoteStatus::Active && n.parents.contains(id)),
+        memb_core::Kind::Claim => false,
+    })
+}
+
+/// Applies the proposals of one run by itself, within the rails: not while paused, at most
+/// `curator.max_auto_edits` per run, never a cascading retraction, and a secret check on
+/// the exact action. Anything held stays pending for `proposals apply`. Returns the ids
+/// applied and the number held.
+fn auto_apply(
+    store: &Store,
+    cfg: &Config,
+    ids: &[u64],
+    now: u64,
+    notice: &mut impl Write,
+) -> Result<(Vec<u64>, usize), String> {
+    if store.with_db(links::auto_apply_paused)? {
+        writeln!(notice, "memb: auto-apply is paused; {} proposal(s) left pending", ids.len())
+            .map_err(|_| "output failed")?;
+        return Ok((Vec::new(), ids.len()));
+    }
+    let limit = cfg.curator.max_auto_edits as usize;
+    let (mut applied, mut held) = (Vec::new(), 0);
+    for &id in ids {
+        let Some(p) = store.with_db(|db| ledger::get(db, id))? else { continue };
+        let ready = (|| -> Result<Option<Proposal>, String> {
+            let action: CuratorAction = serde_json::from_value(p.action.clone()).map_err(|e| e.to_string())?;
+            if applied.len() >= limit || is_cascade(store, &action)? {
+                return Ok(None);
+            }
+            memb_core::reject_secrets(&p.action.to_string()).map_err(|_| "sensitive text".to_string())?;
+            Ok(Some(Proposal::prepare(action, &p.sources)?))
+        })();
+        match ready {
+            Ok(Some(prepared)) => match apply_recorded(store, id, prepared, now, true) {
+                Ok(_) => applied.push(id),
+                Err(reason) => {
+                    writeln!(notice, "memb: proposal {id} could not be applied and was rejected: {reason}")
+                        .map_err(|_| "output failed")?;
+                }
+            },
+            _ => held += 1,
+        }
+    }
+    writeln!(
+        notice,
+        "memb: auto-applied {} proposal(s), {held} left for review (undo with `memb proposals rollback <id>`)",
+        applied.len()
+    )
+    .map_err(|_| "output failed")?;
+    Ok((applied, held))
+}
+
+/// Reverses every note edit a proposal made, after a typed `ROLLBACK <id>`. Returns false
+/// when the user did not confirm.
+pub fn rollback_interactive(
+    store: &Store,
+    id: u64,
+    now: u64,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<bool, String> {
+    let p = store.with_db(|db| ledger::get(db, id))?.ok_or("proposal not found")?;
+    if p.status != Status::Applied {
+        return Err(format!("proposal is {:?}, not applied", p.status).to_lowercase());
+    }
+    if p.revisions.is_empty() {
+        return Err("this proposal recorded no note edits (applied before rollback records existed)".into());
+    }
+    let revisions: Vec<Value> = p
+        .revisions
+        .iter()
+        .filter_map(|r| store.revision(*r).ok().flatten())
+        .map(|r| {
+            json!({"revision": r.rev_id, "op": r.op, "note": r.note_id,
+                   "before": r.before.map(|n| json!({"title": n.title, "status": n.status})),
+                   "after": r.after.map(|n| json!({"title": n.title, "status": n.status}))})
+        })
+        .collect();
+    let display = serde_json::to_string(&json!({"proposal": brief(&p), "undoes": revisions}))
+        .map_err(|_| "preview failed")?;
+    writeln!(output, "{display}\nType ROLLBACK {id} to confirm, or anything else to cancel:")
+        .map_err(|_| "output failed")?;
+    output.flush().map_err(|_| "output failed")?;
+    let mut line = String::new();
+    input.read_line(&mut line).map_err(|_| "input failed")?;
+    if line.trim_end_matches(['\r', '\n']) != format!("ROLLBACK {id}") {
+        return Ok(false);
+    }
+    store.rollback_revisions(&p.revisions)?;
+    store.with_db(|db| ledger::mark_rolled_back(db, id, now))?;
+    writeln!(output, "Rolled back proposal {id}.").map_err(|_| "output failed")?;
+    Ok(true)
 }
 
 /// Uncurated chunks (staged or not) that make a curation run due between the daily
@@ -348,6 +504,21 @@ pub fn show(store: &Store, id: u64) -> Result<Value, String> {
               "notice": "Review the exact action. Applying needs the typed confirmation and can be done once."}))
 }
 
+/// Proposals memb applied by itself (newest first) with the revisions each wrote.
+pub fn audit(store: &Store, limit: usize) -> Result<Vec<Value>, String> {
+    let rows = store.with_db(|db| ledger::list(db, None, 200))?;
+    Ok(rows
+        .iter()
+        .filter(|p| p.auto && matches!(p.status, Status::Applied | Status::RolledBack))
+        .take(limit)
+        .map(|p| {
+            let mut row = brief(p);
+            row["revisions"] = json!(p.revisions);
+            row
+        })
+        .collect())
+}
+
 pub fn reject(store: &Store, id: u64, now: u64) -> Result<(), String> {
     store.with_db(|db| ledger::reject(db, id, now))
 }
@@ -382,21 +553,13 @@ pub fn apply_interactive(
     if line.trim_end_matches(['\r', '\n']) != format!("APPLY {id}") {
         return Ok(false);
     }
-    // Claim first: another process (or a second confirmation) cannot apply it again.
-    store.with_db(|db| ledger::claim(db, id, now))?;
-    match prepared.apply_after_user_approval(store) {
+    match apply_recorded(store, id, prepared, now, false) {
         Ok(note) => {
-            store.with_db(|db| ledger::finish(db, id, now, note))?;
             writeln!(output, "Applied; note {}.", note.map_or_else(|| "unchanged".into(), |n| n.to_string()))
                 .map_err(|_| "output failed after apply")?;
             Ok(true)
         }
-        Err(reason) => {
-            // It cannot be applied as proposed (for example the note changed); it is
-            // not retried silently.
-            let _ = store.with_db(|db| ledger::reject(db, id, now));
-            Err(format!("could not be applied and was rejected: {reason}"))
-        }
+        Err(reason) => Err(format!("could not be applied and was rejected: {reason}")),
     }
 }
 
@@ -405,6 +568,7 @@ fn parse_status(name: &str) -> Option<Status> {
         "pending" => Some(Status::Pending),
         "applying" => Some(Status::Applying),
         "applied" => Some(Status::Applied),
+        "rolledback" | "rolled-back" => Some(Status::RolledBack),
         "rejected" => Some(Status::Rejected),
         "expired" => Some(Status::Expired),
         _ => None,
@@ -412,7 +576,7 @@ fn parse_status(name: &str) -> Option<Status> {
 }
 
 pub const CURATE_USAGE: &str = "Usage: memb curate [--dry-run]";
-pub const PROPOSALS_USAGE: &str = "Usage: memb proposals [--status pending|applying|applied|rejected|expired] [--limit <1-200>] | memb proposals show <id> | memb proposals apply <id> | memb proposals reject <id>";
+pub const PROPOSALS_USAGE: &str = "Usage: memb proposals [--status pending|applying|applied|rejected|expired] [--limit <1-200>] | memb proposals show <id> | memb proposals apply <id> | memb proposals reject <id> | memb proposals rollback <id> | memb proposals audit [<limit>] | memb proposals pause | memb proposals resume";
 
 /// What a `proposals` command line asks for.
 #[derive(Debug, PartialEq)]
@@ -421,6 +585,13 @@ pub enum ProposalsCommand {
     Show(u64),
     Apply(u64),
     Reject(u64),
+    /// Undo every note edit of an applied proposal (typed confirmation).
+    Rollback(u64),
+    /// What memb applied by itself, newest first.
+    Audit(usize),
+    /// Kill switch for auto-apply, and its release.
+    Pause,
+    Resume,
 }
 
 pub fn parse_proposals(args: &[String]) -> Option<ProposalsCommand> {
@@ -431,6 +602,11 @@ pub fn parse_proposals(args: &[String]) -> Option<ProposalsCommand> {
         [c, i] if c == "show" => id(i).map(ProposalsCommand::Show),
         [c, i] if c == "apply" => id(i).map(ProposalsCommand::Apply),
         [c, i] if c == "reject" => id(i).map(ProposalsCommand::Reject),
+        [c, i] if c == "rollback" => id(i).map(ProposalsCommand::Rollback),
+        [c] if c == "audit" => Some(ProposalsCommand::Audit(20)),
+        [c, n] if c == "audit" => limit(n).map(ProposalsCommand::Audit),
+        [c] if c == "pause" => Some(ProposalsCommand::Pause),
+        [c] if c == "resume" => Some(ProposalsCommand::Resume),
         [f, s] if f == "--status" => parse_status(s).map(|s| ProposalsCommand::List(Some(s), 20)),
         [f, n] if f == "--limit" => limit(n).map(|n| ProposalsCommand::List(None, n)),
         [f1, s, f2, n] if f1 == "--status" && f2 == "--limit" => {

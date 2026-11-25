@@ -201,6 +201,29 @@ pub fn set_last_curation_ms(db: &Database, now_ms: u64) -> Result<(), String> {
     w.commit().map_err(|e| e.to_string())
 }
 
+/// The kill switch: while set, nothing is applied automatically (proposals stay pending).
+pub fn auto_apply_paused(db: &Database) -> Result<bool, String> {
+    let r = db.begin_read().map_err(|e| e.to_string())?;
+    let table = match r.open_table(STATE_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.to_string()),
+    };
+    let found = table.get("auto_apply_paused").map_err(|e| e.to_string())?;
+    Ok(found.is_some_and(|v| v.value() == b"1"))
+}
+
+pub fn set_auto_apply_paused(db: &Database, paused: bool) -> Result<(), String> {
+    let w = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut table = w.open_table(STATE_TABLE).map_err(|e| e.to_string())?;
+        table
+            .insert("auto_apply_paused", if paused { b"1".as_slice() } else { b"0".as_slice() })
+            .map_err(|e| e.to_string())?;
+    }
+    w.commit().map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

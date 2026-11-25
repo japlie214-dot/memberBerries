@@ -125,7 +125,14 @@ fn main() {
         };
         // Deciding on a proposal is for the user. The model command `memb curate` starts
         // has MEMB_INTERNAL=1; refuse there so it cannot approve its own proposals.
-        if matches!(command, curate::ProposalsCommand::Apply(_) | curate::ProposalsCommand::Reject(_))
+        if matches!(
+            command,
+            curate::ProposalsCommand::Apply(_)
+                | curate::ProposalsCommand::Reject(_)
+                | curate::ProposalsCommand::Rollback(_)
+                | curate::ProposalsCommand::Pause
+                | curate::ProposalsCommand::Resume
+        )
             && env::var("MEMB_INTERNAL").ok().as_deref() == Some("1")
         {
             eprintln!("memb: proposals failed: refusing to decide a proposal from inside a curation session");
@@ -152,6 +159,21 @@ fn main() {
                 }
                 curate::ProposalsCommand::Apply(id) => {
                     curate::apply_interactive(&store, &cfg, id, now, &mut io::stdin().lock(), &mut io::stdout().lock())
+                }
+                curate::ProposalsCommand::Rollback(id) => {
+                    curate::rollback_interactive(&store, id, now, &mut io::stdin().lock(), &mut io::stdout().lock())
+                }
+                curate::ProposalsCommand::Audit(limit) => {
+                    for row in curate::audit(&store, limit)? {
+                        println!("{row}");
+                    }
+                    Ok(true)
+                }
+                curate::ProposalsCommand::Pause | curate::ProposalsCommand::Resume => {
+                    let pause = matches!(command, curate::ProposalsCommand::Pause);
+                    store.with_db(|db| memb_curator::links::set_auto_apply_paused(db, pause))?;
+                    println!("Auto-apply is {}.", if pause { "paused" } else { "resumed" });
+                    Ok(true)
                 }
             }
         });

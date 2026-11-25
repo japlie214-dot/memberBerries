@@ -62,6 +62,11 @@ pub struct Curator {
     pub staging_ttl_days: u32,
     /// Opt-in: let `memb daemon` run curation (sends conversation text to `cli_command`).
     pub daemon_enabled: bool,
+    /// Apply valid proposals without a typed confirmation, with rollback as the safety net.
+    /// Off by default; `memb proposals pause` is the kill switch.
+    pub auto_apply: bool,
+    /// Most proposals one run may apply automatically; the rest wait for review.
+    pub max_auto_edits: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -116,6 +121,8 @@ impl Default for Curator {
             chunk_to_node_threshold: 0.70,
             staging_ttl_days: 30,
             daemon_enabled: false,
+            auto_apply: false,
+            max_auto_edits: 5,
         }
     }
 }
@@ -268,6 +275,7 @@ impl Config {
             return Err("curator thresholds are fixed at 0.72 and 0.70; remove those settings".into());
         }
         within("curator.staging_ttl_days", c.staging_ttl_days, 1, 365)?;
+        within("curator.max_auto_edits", c.max_auto_edits, 1, 50)?;
         let d = &self.scheduler;
         within("scheduler.routine_wib_hour", d.routine_wib_hour, 0, 23)?;
         within("scheduler.routine_wib_minute", d.routine_wib_minute, 0, 59)?;
@@ -469,6 +477,13 @@ mod tests {
         let c = Config::parse("[curator]\ncli_command = \"codex exec\"\nstaging_ttl_days = 7\n").unwrap();
         assert_eq!((c.curator.cli_command.as_str(), c.curator.staging_ttl_days), ("codex exec", 7));
         assert!(Config::parse("[curator]\nstaging_ttl_days = 365\n").is_ok());
+        let auto = Config::parse("[curator]\nauto_apply = true\nmax_auto_edits = 50\n").unwrap();
+        assert!(auto.curator.auto_apply && auto.curator.max_auto_edits == 50);
+        assert!(!Config::default().curator.auto_apply, "auto-apply is off by default");
+        for bad in [0, 51] {
+            let e = Config::parse(&format!("[curator]\nmax_auto_edits = {bad}\n")).unwrap_err();
+            assert!(e.contains("curator.max_auto_edits"), "{e}");
+        }
         for bad in ["0", "366", "99999"] {
             let e = Config::parse(&format!("[curator]\nstaging_ttl_days = {bad}\n")).unwrap_err();
             assert!(e.contains("curator.staging_ttl_days"), "{e}");
