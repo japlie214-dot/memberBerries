@@ -33,7 +33,10 @@ enabled = true               # false forces lexical-only search
 
 [curator]                    # used by `memb curate` (you run it; see wiki/Operations.md)
 backend = "cli"              # the only supported backend
-cli_command = "claude -p"    # run WITHOUT a shell, split on whitespace; it receives conversation text on stdin
+cli_command = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral"
+                             # run WITHOUT a shell, split on whitespace; it receives conversation text on stdin.
+                             # Verified: Codex, gpt-6-luna at medium reasoning (the default above).
+                             # Planned preset (own ticket, not verified yet): agy -p with gemini-4-hydrogen-medium.
 chunk_to_chunk_threshold = 0.72   # fixed: any other value is rejected
 chunk_to_node_threshold = 0.70    # fixed: any other value is rejected
 staging_ttl_days = 30        # 1..=365: staged evidence and unanswered proposals expire after this

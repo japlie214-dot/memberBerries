@@ -116,7 +116,7 @@ impl Default for Curator {
     fn default() -> Self {
         Self {
             backend: "cli".into(),
-            cli_command: "claude -p".into(),
+            cli_command: "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral".into(),
             chunk_to_chunk_threshold: 0.72,
             chunk_to_node_threshold: 0.70,
             staging_ttl_days: 30,
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn defaults_match_the_kit_example() {
         let kit = Config::parse(
-            "[storage]\nmax_notes = 50000\n[scroll]\nmax_messages = 90\nretain_tail = 10\nmin_prompt_chars = 100\ndedup_reset_every_n_chunks = 7\nignore_dirs = [\"*/tmp/*\", \"*/playground/*\"]\n[curator]\nbackend = \"cli\"\ncli_command = \"claude -p\"\nchunk_to_chunk_threshold = 0.72\nchunk_to_node_threshold = 0.70\nstaging_ttl_days = 30\n[scheduler]\nroutine_wib_hour = 15\nroutine_wib_minute = 45\ncooldown_hours = 20\nidle_sweep_hours = 24\nidle_sweep_min_messages = 45\n",
+            "[storage]\nmax_notes = 50000\n[scroll]\nmax_messages = 90\nretain_tail = 10\nmin_prompt_chars = 100\ndedup_reset_every_n_chunks = 7\nignore_dirs = [\"*/tmp/*\", \"*/playground/*\"]\n[curator]\nbackend = \"cli\"\ncli_command = \"codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral\"\nchunk_to_chunk_threshold = 0.72\nchunk_to_node_threshold = 0.70\nstaging_ttl_days = 30\n[scheduler]\nroutine_wib_hour = 15\nroutine_wib_minute = 45\ncooldown_hours = 20\nidle_sweep_hours = 24\nidle_sweep_min_messages = 45\n",
         )
         .unwrap();
         assert_eq!(kit.scroll.ignore_dirs.len(), 2);
@@ -480,6 +480,11 @@ mod tests {
         let auto = Config::parse("[curator]\nauto_apply = true\nmax_auto_edits = 50\n").unwrap();
         assert!(auto.curator.auto_apply && auto.curator.max_auto_edits == 50);
         assert!(!Config::default().curator.auto_apply, "auto-apply is off by default");
+        let default = Config::default().curator.cli_command;
+        assert!(default.starts_with("codex exec -m gpt-6-luna "), "{default}");
+        assert!(Config::parse(&format!("[curator]
+cli_command = \"{default}\"
+")).is_ok(), "the default command must itself be valid");
         for bad in [0, 51] {
             let e = Config::parse(&format!("[curator]\nmax_auto_edits = {bad}\n")).unwrap_err();
             assert!(e.contains("curator.max_auto_edits"), "{e}");

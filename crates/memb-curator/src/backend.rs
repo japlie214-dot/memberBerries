@@ -1,4 +1,4 @@
-//! Runs the user's configured command-line model (for example `claude -p`) once, with
+//! Runs the user's configured command-line model (for example `codex exec`) once, with
 //! the evidence on stdin, and parses its answer strictly. memb never picks a model or
 //! endpoint itself: it runs exactly the command the user configured, without a shell.
 //!

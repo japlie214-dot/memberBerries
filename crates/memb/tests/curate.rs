@@ -1,5 +1,5 @@
 //! `memb curate` and `memb proposals` through the real binary, with a fake command-line
-//! model (`cmd /C type reply.json`) standing in for `claude -p`. Windows only, like memb.
+//! model (`cmd /C type reply.json`) standing in for `codex exec`. Windows only, like memb.
 #![cfg(windows)]
 use std::io::Write;
 use std::path::PathBuf;
@@ -515,4 +515,35 @@ fn the_kill_switch_and_cascade_rule_hold_back_automatic_edits() {
     let notes = dir.store().load_all_notes().unwrap();
     assert_eq!(notes[&claim.id].status, memb_core::NoteStatus::Retracted);
     assert_eq!(notes[&know.id].status, memb_core::NoteStatus::Active);
+}
+
+/// Real `codex exec` on synthetic chunks (no project data). Opt-in: it uses the logged-in
+/// Codex and costs tokens. Run with:
+/// `cargo test -p memb --test curate real_codex -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn real_codex_summarizes_and_proposes_through_memb_curate() {
+    let dir = Dir::new("realcodex", "");
+    let topic = dir.seed();
+    let command = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral";
+    std::fs::write(
+        dir.0.join("config.toml"),
+        format!("[scroll]\nmax_messages = 10\nretain_tail = 2\n[curator]\ncli_command = \"{command}\"\n"),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let out = dir.run(&["curate"], "");
+    println!("elapsed: {:?}\nstderr: {}\nstdout: {}", started.elapsed(), text(&out.stderr), text(&out.stdout));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let summary = json_line(&out.stdout);
+    assert_eq!(summary["summarized"], 1, "the summary reply parsed: {summary}");
+    assert_eq!(summary["packets"], 1);
+    let chunk = dir.store().with_db(|db| memb_scroll::list_unembedded_chunks(db, 10)).unwrap();
+    println!("summary: {:?} explicit_signal: {:?}", chunk[0].summary, chunk[0].explicit_signal);
+    assert_eq!(chunk[0].explicit_signal, Some(true), "the chunk starts with 'From now on, always ...'");
+    for row in text(&dir.run(&["proposals"], "").stdout).lines() {
+        println!("proposal: {row}");
+    }
+    assert_eq!(dir.store().load_all_notes().unwrap().len(), 1, "curation changed no note");
+    let _ = topic;
 }
