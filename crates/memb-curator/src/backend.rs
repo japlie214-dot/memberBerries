@@ -83,6 +83,11 @@ impl Backend {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| "could not start the curation command".to_string())?;
+        // Everything the command starts joins a kill-on-close job, so a program it leaves
+        // running after it exits (`start /B`) is stopped too. Best effort: without a job
+        // the process-tree stop below still applies.
+        #[cfg(windows)]
+        let mut job = memb_win::KillOnCloseJob::new().ok().filter(|j| j.assign(&child).is_ok());
         let mut stdin = child.stdin.take().ok_or("curation command has no stdin")?;
         let mut stdout = child
             .stdout
@@ -126,6 +131,10 @@ impl Backend {
             if timed_out || overflow() {
                 // Out of time, or too much output: stop the command and everything it
                 // started (a wrapper such as `cmd /C` runs the real program as a child).
+                #[cfg(windows)]
+                if let Some(j) = &job {
+                    j.terminate();
+                }
                 stop_tree(&mut child);
                 break None;
             }
@@ -135,6 +144,10 @@ impl Backend {
         // the deadline: a program it started may still hold the output pipe open.
         // The writer is never joined (it ends when the pipe closes).
         drop(writer);
+        // The command has exited: close the job now so anything it left running dies and
+        // releases the output pipe.
+        #[cfg(windows)]
+        drop(job.take());
         if status.is_some() {
             while !reader.is_finished() && !overflow() {
                 if Instant::now() >= deadline {
@@ -548,6 +561,19 @@ mod tests {
             .unwrap()
             .with_timeout(Duration::from_millis(300));
         assert!(flood_wrapped.run("").is_err());
+        // A program the command leaves running after it exits is stopped with the job.
+        let left = Backend::from_command("cmd /C start /B ping -n 37 127.0.0.1 >nul")
+            .unwrap()
+            .with_timeout(Duration::from_secs(20));
+        let started = Instant::now();
+        left.run("").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        std::thread::sleep(Duration::from_millis(800));
+        let alive = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'PING.EXE' -and $_.CommandLine -like '*-n 37 *' }).Count"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&alive.stdout).trim().is_empty() || String::from_utf8_lossy(&alive.stdout).trim() == "0", "left-over ping: {}", String::from_utf8_lossy(&alive.stdout));
         let flood = Backend::from_command("cmd /C for /L %i in (1,1,20000) do @echo 0123456789012345678901234567890123456789")
             .unwrap();
         assert!(flood.run("").unwrap_err().contains("too much output"));

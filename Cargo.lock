@@ -481,6 +481,7 @@ dependencies = [
  "memb-embed",
  "memb-scroll",
  "memb-store",
+ "memb-win",
  "redb",
  "serde",
  "serde_json",

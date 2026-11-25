@@ -79,6 +79,69 @@ pub fn attach_job_object_2gb_cap() -> Result<JobGuard, String> {
     Err("Windows job objects are unavailable on this platform".into())
 }
 
+/// A Job Object that kills every process in it when the last handle closes (or on
+/// `terminate`). Used for the model command: anything it starts, even a program that
+/// outlives it (`start /B`), dies with the job.
+#[cfg(windows)]
+pub struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+
+// The handle is only used through `&self` calls that the OS serializes.
+#[cfg(windows)]
+unsafe impl Send for KillOnCloseJob {}
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    pub fn new() -> Result<Self, String> {
+        use std::mem::size_of;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        unsafe {
+            let job = CreateJobObjectW(null_mut(), null_mut());
+            if job.is_null() {
+                return Err("CreateJobObjectW failed".into());
+            }
+            let guard = Self(job);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                return Err("SetInformationJobObject failed".into());
+            }
+            Ok(guard)
+        }
+    }
+
+    /// Puts a freshly started child (and so the processes it starts later) in the job.
+    pub fn assign(&self, child: &std::process::Child) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        if unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as _) } == 0 {
+            return Err(format!("AssignProcessToJobObject failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Kills every process in the job now.
+    pub fn terminate(&self) {
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1); }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0); }
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

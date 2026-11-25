@@ -9,6 +9,7 @@ memb-core = { path = "../memb-core" }
 memb-store = { path = "../memb-store" }
 memb-embed = { path = "../memb-embed" }
 memb-scroll = { path = "../memb-scroll" }
+memb-win = { path = "../memb-win" }
 redb.workspace = true
 sha2 = "0.10"
 serde.workspace = true
