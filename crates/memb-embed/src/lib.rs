@@ -219,7 +219,42 @@ pub fn local_embedding(port: u16, text: &str) -> Result<QuantizedVec, String> {
                 .ok_or("invalid embedding value".to_string())
         })
         .collect::<Result<_, _>>()?;
-    Ok(QuantizedVec::from_f32(&values))
+    Ok(QuantizedVec::from_f32(&apply_mrl(values, mrl_dim_from_env()?)?))
+}
+
+/// Matryoshka sizes EmbeddingGemma supports; anything else is rejected rather than guessed.
+pub const MRL_DIMS: [usize; 4] = [128, 256, 512, 768];
+
+/// Optional Matryoshka truncation from `MEMB_EMBED_MRL_DIM` (until config.toml exists).
+/// Unset or empty means full dimension; an unsupported value is an error.
+pub fn mrl_dim_from_env() -> Result<Option<usize>, String> {
+    match std::env::var("MEMB_EMBED_MRL_DIM") {
+        Ok(v) if v.trim().is_empty() => Ok(None),
+        Ok(v) => parse_mrl_dim(v.trim()).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err("MEMB_EMBED_MRL_DIM is not valid text".into()),
+    }
+}
+
+pub fn parse_mrl_dim(text: &str) -> Result<usize, String> {
+    let dim: usize = text.parse().map_err(|_| "MRL dimension must be an integer")?;
+    if MRL_DIMS.contains(&dim) { Ok(dim) } else { Err(format!("MRL dimension must be one of {MRL_DIMS:?}")) }
+}
+
+/// Keep the first `dim` components and L2-renormalize (Matryoshka truncation).
+/// `None` returns the vector unchanged. Fails closed on short, non-finite or zero vectors.
+pub fn apply_mrl(mut v: Vec<f32>, dim: Option<usize>) -> Result<Vec<f32>, String> {
+    let Some(dim) = dim else { return Ok(v) };
+    if v.len() < dim { return Err(format!("embedding has {} values, fewer than MRL dimension {dim}", v.len())); }
+    v.truncate(dim);
+    let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    if !norm.is_finite() || norm < 1e-8 { return Err("embedding cannot be renormalized".into()); }
+    Ok(v.into_iter().map(|x| (x as f64 / norm) as f32).collect())
+}
+
+/// Cache identity that changes whenever the truncation size does, so stale vectors are never mixed.
+pub fn mrl_tag(tag: &str, dim: Option<usize>) -> String {
+    match dim { Some(d) => format!("{tag}+mrl{d}"), None => tag.to_owned() }
 }
 
 pub fn reciprocal_rank_fusion(lexical_ids: &[u64], vector_ids: &[u64], top_k: usize) -> Vec<u64> {
@@ -239,6 +274,35 @@ pub fn reciprocal_rank_fusion(lexical_ids: &[u64], vector_ids: &[u64], top_k: us
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mrl_truncates_to_prefix_and_renormalizes() {
+        let v = apply_mrl(vec![3.0, 4.0, 100.0, -100.0], Some(2)).unwrap();
+        assert_eq!(v.len(), 2);
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        assert_eq!(apply_mrl(vec![1.0, 2.0], None).unwrap(), vec![1.0, 2.0]);
+    }
+    #[test]
+    fn mrl_fails_closed() {
+        assert!(apply_mrl(vec![1.0; 4], Some(8)).is_err()); // shorter than requested
+        assert!(apply_mrl(vec![0.0; 8], Some(4)).is_err()); // zero after truncation
+        assert!(apply_mrl(vec![f32::NAN, 1.0], Some(2)).is_err());
+        assert!(apply_mrl(vec![1e30, 1e30], Some(2)).is_ok()); // f64 norm does not overflow
+    }
+    #[test]
+    fn mrl_dimension_must_be_supported() {
+        for ok in ["128", "256", "512", "768"] {
+            assert!(parse_mrl_dim(ok).is_ok());
+        }
+        for bad in ["0", "64", "1024", "-256", "256.0", "abc", ""] {
+            assert!(parse_mrl_dim(bad).is_err(), "{bad}");
+        }
+    }
+    #[test]
+    fn mrl_changes_cache_identity() {
+        assert_eq!(mrl_tag("m", None), "m");
+        assert_ne!(mrl_tag("m", Some(256)), mrl_tag("m", Some(128)));
+        assert_ne!(mrl_tag("m", Some(256)), "m");
+    }
     #[test]
     fn quantization_and_fusion_are_deterministic() {
         let a = QuantizedVec::from_f32(&[1.0, 0.0]);

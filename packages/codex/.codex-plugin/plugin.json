@@ -1,1 +1,1 @@
-{"name":"memb","version":"0.1.0","description":"Project-scoped local memory","mcpServers":"./.mcp.json"}
+{"name":"memb","version":"0.4.0","description":"Unified local memory graph with a read-only web inspector. Requires access to the Windows runtime.","mcpServers":"./.mcp.json"}

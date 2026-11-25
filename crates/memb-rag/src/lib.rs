@@ -41,7 +41,13 @@ fn search_with_gemma(
             .clone(),
         Err(_) => return hybrid_search(store, query, None, &[]),
     };
-    let (tag, q) = match model.embed_tagged(query, true) {
+    // An unsupported MEMB_EMBED_MRL_DIM or a failed embedding degrades to lexical search.
+    let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
+        return hybrid_search(store, query, None, &[]);
+    };
+    let (tag, q) = match model.embed_tagged(query, true).and_then(|(tag, v)| {
+        Ok((memb_embed::mrl_tag(&tag, mrl), memb_embed::apply_mrl(v, mrl)?))
+    }) {
         Ok((tag, v)) => (tag, QuantizedVec::from_f32(&v)),
         Err(_) => return hybrid_search(store, query, None, &[]),
     };
@@ -61,7 +67,11 @@ fn search_with_gemma(
             .filter(|(f, v)| *f == fingerprint && v.data.len() == q.data.len())
         {
             Some((_, v)) => v.clone(),
-            None => match model.embed_tagged(&format!("{}\n{}", note.title, note.desc), false) {
+            None => match model
+                .embed_tagged(&format!("{}\n{}", note.title, note.desc), false)
+                .and_then(|(t, v)| {
+                    Ok((memb_embed::mrl_tag(&t, mrl), memb_embed::apply_mrl(v, mrl)?))
+                }) {
                 Ok((doc_tag, v)) if doc_tag == tag && v.len() == q.data.len() => {
                     let v = QuantizedVec::from_f32(&v);
                     fresh.push((note.id, fingerprint, v.clone()));
@@ -87,6 +97,12 @@ fn search_with_server(
     use std::sync::{Mutex, OnceLock};
     static QUERIES: OnceLock<Mutex<memb_embed::QueryLru>> = OnceLock::new();
     store.search_lexical_ids(query, 1)?;
+    let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
+        return hybrid_search(store, query, None, &[]);
+    };
+    // The truncation size is part of the identity of every cached vector.
+    let model = model.map(|m| memb_embed::mrl_tag(m, mrl));
+    let model = model.as_deref();
     let cache =
         QUERIES.get_or_init(|| Mutex::new(memb_embed::QueryLru::new(memb_embed::QUERY_LRU_CAP)));
     let key = model.map(|m| format!("{port}:{m}:{}:{query}", query.len()));
@@ -205,6 +221,18 @@ mod tests {
             search_with_gemma(&store, "apples", root.join("missing-model")).unwrap()[0].id,
             note.id
         );
+        // The cached document vector must have the configured Matryoshka width
+        // (MEMB_EMBED_MRL_DIM, default full 768) and live under a size-specific identity.
+        let mrl = memb_embed::mrl_dim_from_env().unwrap();
+        let (tag, _) = memb_embed::gemma::GemmaEmbedder::new(
+            std::path::PathBuf::from(std::env::var_os("MEMB_TEST_GEMMA_DIR").unwrap()),
+        )
+        .embed_tagged("x", true)
+        .unwrap();
+        let cached = store
+            .with_db(|db| memb_embed::read_document_cache(db, &memb_embed::mrl_tag(&tag, mrl)))
+            .unwrap();
+        assert_eq!(cached[&note.id].1.data.len(), mrl.unwrap_or(768));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

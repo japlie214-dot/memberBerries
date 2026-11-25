@@ -1,12 +1,12 @@
 # memberBerries (`memb`)
 
-A Windows-first, local project memory tool shared across assistants. Save a reviewed note in one client and recall it from another running under the same Windows account and project. No background capture, network listener, model download, or API key is required.
+A Windows-first, local memory graph shared across assistants. Save a reviewed note in one client and recall it from another running under the same Windows account and data directory. Chat capture, embeddings and the daemon are opt-in; no network listener, model download, or API key is required for the default setup.
 
 ## Get started
 
-Use `memb.plugin` for Claude Cowork; no `.mcpb` is needed. Separate AGY and Codex archives remain available for those clients. Run `memb.exe web` for the local read-only [Memory Inspector](wiki/Inspector.md), or open it in a compatible MCP Apps host. See [installation and smoke tests](wiki/Install.md) for manual stdio setup and the verification status of each host. Native import is not implied by a working MCP runtime.
+Use `memb.plugin` for Claude Cowork; no `.mcpb` is needed. Separate AGY and Codex archives remain available for those clients. Run `memb.exe web` for the local read-only [Memory Inspector](wiki/Inspector.md); the MCP App panel was dropped. See [installation and smoke tests](wiki/Install.md) for manual stdio setup and the verification status of each host. Native import is not implied by a working MCP runtime.
 
-Start with a user-approved topic note, then add knowledge linked to a topic and claims linked to knowledge. Search, inspect, or explicitly forget a note under the same project slug. See the [tool guide](wiki/Memory.md) for examples and privacy limits.
+Start with a user-approved topic note, then add knowledge linked to a topic and claims linked to knowledge. Search, inspect, update, supersede or retract notes in the one unified graph. See the [tool guide](wiki/Memory.md) for examples and privacy limits.
 
 ## Build on Windows
 

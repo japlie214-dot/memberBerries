@@ -1,6 +1,7 @@
 """Build Windows ZIP-based host packages from the locked Rust release binary."""
 import hashlib
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -12,7 +13,19 @@ LAYOUTS = {
 }
 
 
+def check_versions():
+    """Every host manifest must carry the workspace version."""
+    match = re.search(r'^version = "([^"]+)"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"), re.M)
+    version = match.group(1)
+    for host, manifest in (("cowork", ".claude-plugin/plugin.json"), ("agy", "plugin.json"), ("codex", ".codex-plugin/plugin.json"), ("desktop", "manifest.json")):
+        found = json.loads((ROOT / "packages" / host / manifest).read_text(encoding="utf-8"))["version"]
+        if found != version:
+            raise ValueError(f"{host} manifest version {found} != workspace {version}")
+    return version
+
+
 def main():
+    check_versions()
     exe = (ROOT / "target/release/memb.exe").read_bytes()
     if not exe.startswith(b"MZ"):
         raise ValueError("expected a Windows executable")
