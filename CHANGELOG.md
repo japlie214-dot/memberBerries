@@ -5,6 +5,13 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.12.0 (2026-11-26)
+
+- **Snowflake AI_EMBED backend:** `[embeddings.snowflake]` (account, user, warehouse, key file, optional role and model). memb signs in with an unencrypted PKCS#8 key (RS256 JWT, the key never leaves the file), calls the SQL API through Windows' curl.exe, embeds notes 16 per statement, handles partitioned results and tags vectors with the model and prompt policy. The default model `snowflake-arctic-embed-m-v1.5` gets the retrieval prefix on queries; `snowflake-arctic-embed-l-v2.0` gets none (measured). Used only when configured and when no local model is chosen or installed. `memb doctor` reports it and checks the key file without any request.
+- `embed_note` gives every backend its own document format (used when linking chunks to notes).
+- Live measurements on this project's synthetic corpus: `evidence/t031-snowflake-ai-embed.md`.
+- Departure ledger: rows 18 (shared embedding service, T042, approved) and 19 (Snowflake) added.
+
 ## 0.11.0 (2026-11-26)
 
 - `memb models disable` and `memb models enable`: stop or resume automatic use of an installed model without deleting it. `memb models install` re-enables; `remove` deletes. Status and doctor say when it is disabled.

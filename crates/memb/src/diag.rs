@@ -184,7 +184,7 @@ fn memb_embed_hint() -> String {
     }
 }
 
-fn embedding_check(root: &Path) -> Check {
+fn embedding_check(root: &Path, snowflake: Option<&crate::config::Snowflake>) -> Check {
     if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1") {
         return Check::new("embeddings", Status::Info, "disabled: lexical-only search");
     }
@@ -212,12 +212,24 @@ fn embedding_check(root: &Path) -> Check {
     }
     if port.is_none() {
         if let Some((variant, dir)) = crate::models::installed_variant(root, &memb_win::probe_hardware()) {
+            let spare = if snowflake.is_some() { "; Snowflake is configured but stays unused while the local model is" } else { "" };
             return Check::new(
                 "embeddings",
                 Status::Ok,
-                format!("EmbeddingGemma 2 {} build installed in {}; memb uses it automatically with {}-wide vectors", variant.name(), dir.display(), variant.mrl_dim()),
+                format!("EmbeddingGemma 2 {} build installed in {}; memb uses it automatically with {}-wide vectors{spare}", variant.name(), dir.display(), variant.mrl_dim()),
             );
         }
+    }
+    if let (None, Some(sf)) = (port, snowflake) {
+        let model = sf.model.clone().unwrap_or_else(|| memb_embed::snowflake::DEFAULT_MODEL.to_string());
+        return match crate::config::expand_path(&sf.key_file, "embeddings.snowflake.key_file").and_then(|p| memb_embed::snowflake::load_key(&p).map(|_| p)) {
+            Ok(_) => Check::new(
+                "embeddings",
+                Status::Ok,
+                format!("Snowflake AI_EMBED ({model}, account {}) is the embedding backend: note titles, descriptions and search queries are sent to Snowflake; the key file is readable (no request was made)", sf.account),
+            ),
+            Err(reason) => Check::new("embeddings", Status::Warn, format!("Snowflake is configured but unusable ({reason}); search falls back to lexical")),
+        };
     }
     match port {
         Some(port) => {
@@ -287,7 +299,7 @@ pub fn doctor(root: &Path, config: &Result<Config, String>, store: Option<&Store
     match config {
         Ok(cfg) => {
             checks.push(Check::new("config", Status::Ok, "config.toml is valid (or absent: defaults)"));
-            checks.push(embedding_check(root));
+            checks.push(embedding_check(root, cfg.embeddings.snowflake.as_ref()));
             checks.push(command_check("curation model", &cfg.curator.cli_command, "main model"));
             if let Some(fallback) = cfg.curator.fallback() {
                 checks.push(command_check("curation fallback", fallback, "fallback model"));

@@ -38,6 +38,24 @@ pub struct Scroll {
     pub ignore_dirs: Vec<String>,
 }
 
+/// `[embeddings.snowflake]`: Snowflake AI_EMBED as a cloud embedding backend. Having this
+/// table is the opt-in: memb then sends note titles, descriptions and search queries to
+/// Snowflake whenever no local model is in use.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snowflake {
+    /// Account identifier, for example `ab14212.ap-southeast-1`.
+    pub account: String,
+    pub user: String,
+    pub role: Option<String>,
+    pub warehouse: String,
+    /// The AI_EMBED model; default `snowflake-arctic-embed-m-v1.5`.
+    pub model: Option<String>,
+    /// Path to an unencrypted PKCS#8 private key (`BEGIN PRIVATE KEY`); `%VAR%` is expanded.
+    /// The key stays in this file: it is never copied into config.toml or logged.
+    pub key_file: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Embeddings {
@@ -50,6 +68,7 @@ pub struct Embeddings {
     /// Hugging Face, checked against pinned SHA-256 values) when none is installed and no
     /// other backend is chosen. Off by default: `memb models install` does it on request.
     pub auto_download: bool,
+    pub snowflake: Option<Snowflake>,
     pub mrl_dim: Option<u32>,
     // Accepted only to give a clear error: memb does not launch an embedding server.
     pub binary: Option<String>,
@@ -113,6 +132,7 @@ impl Default for Embeddings {
             model_id: None,
             gemma_model_dir: None,
             auto_download: false,
+            snowflake: None,
             mrl_dim: None,
             binary: None,
             model_path: None,
@@ -283,6 +303,20 @@ impl Config {
         if let Some(dir) = &e.gemma_model_dir {
             expand_path(dir, "embeddings.gemma_model_dir")?;
         }
+        if let Some(sf) = &e.snowflake {
+            let key = expand_path(&sf.key_file, "embeddings.snowflake.key_file")?;
+            memb_embed::snowflake::SnowflakeConfig {
+                account: sf.account.clone(),
+                user: sf.user.clone(),
+                role: sf.role.clone(),
+                warehouse: sf.warehouse.clone(),
+                model: sf.model.clone().unwrap_or_else(|| memb_embed::snowflake::DEFAULT_MODEL.to_string()),
+                key_path: key,
+                base_url: None,
+            }
+            .validate()
+            .map_err(|e| format!("embeddings.snowflake: {e}"))?;
+        }
         if let Some(d) = e.mrl_dim {
             if !MRL_DIMS.contains(&d) {
                 return Err(format!("embeddings.mrl_dim must be one of {MRL_DIMS:?}"));
@@ -341,6 +375,15 @@ impl Config {
             let dir = expand_path(dir, "embeddings.gemma_model_dir")?;
             set("MEMB_GEMMA_MODEL_DIR", Some(dir.to_string_lossy().into_owned()));
         }
+        if let Some(sf) = &e.snowflake {
+            let key = expand_path(&sf.key_file, "embeddings.snowflake.key_file")?;
+            set("MEMB_SNOWFLAKE_ACCOUNT", Some(sf.account.clone()));
+            set("MEMB_SNOWFLAKE_USER", Some(sf.user.clone()));
+            set("MEMB_SNOWFLAKE_ROLE", sf.role.clone());
+            set("MEMB_SNOWFLAKE_WAREHOUSE", Some(sf.warehouse.clone()));
+            set("MEMB_SNOWFLAKE_MODEL", sf.model.clone());
+            set("MEMB_SNOWFLAKE_KEY", Some(key.to_string_lossy().into_owned()));
+        }
         Ok(())
     }
 
@@ -370,7 +413,13 @@ mod tests {
     use super::*;
 
     use super::ENV_LOCK as ENV;
-    const EMBED_VARS: [&str; 6] = [
+    const EMBED_VARS: [&str; 12] = [
+        "MEMB_SNOWFLAKE_ACCOUNT",
+        "MEMB_SNOWFLAKE_USER",
+        "MEMB_SNOWFLAKE_ROLE",
+        "MEMB_SNOWFLAKE_WAREHOUSE",
+        "MEMB_SNOWFLAKE_MODEL",
+        "MEMB_SNOWFLAKE_KEY",
         "MEMB_EMBED_PORT",
         "MEMB_EMBED_MODEL_ID",
         "MEMB_EMBED_MRL_DIM",
@@ -400,6 +449,70 @@ mod tests {
         for k in EMBED_VARS.iter().filter(|k| **k != "MEMB_CFG_TEST_ROOT") {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn the_snowflake_table_is_validated_exported_and_never_overrides_the_environment() {
+        with_clean_env(|| {
+            let toml = "[embeddings.snowflake]
+account = \"ab14212.ap-southeast-1\"
+user = \"SOMEONE\"
+warehouse = \"WH\"
+key_file = \"%MEMB_CFG_TEST_ROOT%/secrets/key.p8\"
+";
+            std::env::set_var("MEMB_CFG_TEST_ROOT", if cfg!(windows) { r"C:\data" } else { "/data" });
+            let cfg = Config::parse(toml).unwrap();
+            let sf = cfg.embeddings.snowflake.clone().unwrap();
+            assert_eq!((sf.role.as_deref(), sf.model.as_deref()), (None, None), "role and model are optional");
+            cfg.apply_embedding_env().unwrap();
+            assert_eq!(std::env::var("MEMB_SNOWFLAKE_ACCOUNT").unwrap(), "ab14212.ap-southeast-1");
+            assert_eq!(std::env::var("MEMB_SNOWFLAKE_USER").unwrap(), "SOMEONE");
+            assert_eq!(std::env::var("MEMB_SNOWFLAKE_WAREHOUSE").unwrap(), "WH");
+            let key = std::env::var("MEMB_SNOWFLAKE_KEY").unwrap();
+            assert!(key.ends_with("key.p8") && key.contains("secrets") && !key.contains('%'), "{key}");
+            assert!(std::env::var_os("MEMB_SNOWFLAKE_ROLE").is_none() && std::env::var_os("MEMB_SNOWFLAKE_MODEL").is_none());
+            // The environment wins over the file.
+            clear_embedding_vars();
+            std::env::set_var("MEMB_SNOWFLAKE_USER", "OTHER");
+            cfg.apply_embedding_env().unwrap();
+            assert_eq!(std::env::var("MEMB_SNOWFLAKE_USER").unwrap(), "OTHER");
+            // Disabled embeddings export nothing about Snowflake.
+            clear_embedding_vars();
+            Config::parse(&format!("[embeddings]
+enabled = false
+{toml}")).unwrap().apply_embedding_env().unwrap();
+            assert!(std::env::var_os("MEMB_SNOWFLAKE_ACCOUNT").is_none());
+            // Bad values and missing required keys are refused, and the key text is not a config value at all.
+            for bad in [
+                "[embeddings.snowflake]
+account = \"a b\"
+user = \"U\"
+warehouse = \"W\"
+key_file = \"k\"
+",
+                "[embeddings.snowflake]
+account = \"a\"
+user = \"U\"
+warehouse = \"W\"
+",
+                "[embeddings.snowflake]
+account = \"a\"
+user = \"U\"
+warehouse = \"W\"
+key_file = \"k\"
+private_key = \"x\"
+",
+                "[embeddings.snowflake]
+account = \"a\"
+user = \"U\"
+warehouse = \"W\"
+key_file = \"k\"
+model = \"m;DROP\"
+",
+            ] {
+                assert!(Config::parse(bad).is_err(), "{bad}");
+            }
+        });
     }
 
     #[test]

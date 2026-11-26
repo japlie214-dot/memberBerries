@@ -23,6 +23,10 @@ pub fn search(store: &Store, query: &str) -> Result<Vec<Note>, String> {
     if let Some(port) = port {
         return search_with_server(store, query, port, model.as_deref());
     }
+    // Cloud embeddings only when the user configured Snowflake and nothing local was chosen.
+    if let Ok(Some(client)) = snowflake_client() {
+        return search_with_snowflake(store, query, &client);
+    }
     // Supervision is deliberately disabled: reserving a port and then spawning
     // a child cannot establish that the responding listener belongs to it.
     // Never probe or send note content to an unauthenticated child endpoint.
@@ -121,8 +125,96 @@ pub fn embed_text(text: &str, is_query: bool) -> Result<Option<(String, Quantize
             let v = memb_embed::local_embedding(port, &sent)?;
             Ok(Some((server_tag(&model, mrl), v)))
         }
-        _ => Ok(None),
+        _ => match snowflake_client()? {
+            Some(client) => {
+                let mrl = memb_embed::mrl_dim_from_env()?;
+                let sent = if is_query { format!("{}{text}", memb_embed::snowflake::query_prefix(client.model())) } else { text.to_owned() };
+                let v = embed_snowflake(&client, &[sent], mrl)?.pop().ok_or("Snowflake returned no vector")?;
+                Ok(Some((memb_embed::mrl_tag(&memb_embed::snowflake::identity(client.model()), mrl), v)))
+            }
+            None => Ok(None),
+        },
     }
+}
+
+type SnowflakeSlot = std::sync::Mutex<Option<(String, std::sync::Arc<memb_embed::snowflake::Client>)>>;
+
+/// The Snowflake client for this process (the key is read once), or `None` when Snowflake is
+/// not configured. A broken configuration is an error.
+fn snowflake_client() -> Result<Option<std::sync::Arc<memb_embed::snowflake::Client>>, String> {
+    static CLIENT: std::sync::OnceLock<SnowflakeSlot> = std::sync::OnceLock::new();
+    let Some(cfg) = memb_embed::snowflake::config_from_env()? else { return Ok(None) };
+    let id = format!("{cfg:?}");
+    let mut guard = CLIENT.get_or_init(Default::default).lock().map_err(|_| "snowflake client lock poisoned".to_string())?;
+    if let Some((key, client)) = guard.as_ref() {
+        if *key == id {
+            return Ok(Some(client.clone()));
+        }
+    }
+    let client = std::sync::Arc::new(memb_embed::snowflake::Client::new(cfg)?);
+    *guard = Some((id, client.clone()));
+    Ok(Some(client))
+}
+
+fn embed_snowflake(
+    client: &memb_embed::snowflake::Client,
+    texts: &[String],
+    mrl: Option<usize>,
+) -> Result<Vec<QuantizedVec>, String> {
+    client
+        .embed_batch(texts)?
+        .into_iter()
+        .map(|v| Ok(QuantizedVec::from_f32(&memb_embed::apply_mrl(v, mrl)?)))
+        .collect()
+}
+
+fn search_with_snowflake(
+    store: &Store,
+    query: &str,
+    client: &memb_embed::snowflake::Client,
+) -> Result<Vec<Note>, String> {
+    let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
+        return hybrid_search(store, query, None, &[]);
+    };
+    let tag = memb_embed::mrl_tag(&memb_embed::snowflake::identity(client.model()), mrl);
+    let cache = query_cache();
+    let key = format!("sf:{tag}:{}:{query}", query.len());
+    let cached = cache.lock().ok().and_then(|mut c| c.get(&key).cloned());
+    let q = match cached {
+        Some(v) => v,
+        None => {
+            let sent = format!("{}{query}", memb_embed::snowflake::query_prefix(client.model()));
+            match embed_snowflake(client, &[sent], mrl).ok().and_then(|mut v| v.pop()) {
+                Some(v) => v,
+                None => return hybrid_search(store, query, None, &[]),
+            }
+        }
+    };
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, q.clone());
+    }
+    // Notes that are not cached yet go out in batches (one statement per 16), not one by one.
+    let hot = hot_set_batch(store, &tag, |notes| {
+        let texts: Vec<String> = notes.iter().map(|n| memb_embed::snowflake::document_text(&n.title, &n.desc)).collect();
+        embed_snowflake(client, &texts, mrl).ok().filter(|v| v.iter().all(|x| x.data.len() == q.data.len()))
+    })?;
+    match hot {
+        Some((index, _)) => fuse(store, query, Some(&q), &index, true),
+        None => hybrid_search(store, query, None, &[]),
+    }
+}
+
+/// What a note is embedded as by the active backend, with the tag of the vector.
+/// `Ok(None)` when no embedding backend is configured.
+pub fn embed_note(title: &str, desc: &str) -> Result<Option<(String, QuantizedVec)>, String> {
+    let local = std::env::var_os("MEMB_GEMMA_MODEL_DIR").is_some_and(|p| !p.is_empty())
+        || std::env::var("MEMB_EMBED_PORT").ok().and_then(|p| p.parse::<u16>().ok()).is_some_and(|p| p != 0);
+    if !local && std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() != Some("1") {
+        if snowflake_client()?.is_some() {
+            return embed_text(&memb_embed::snowflake::document_text(title, desc), false);
+        }
+    }
+    embed_text(&memb_embed::document_text(title, desc), false)
 }
 
 /// Vectors of every active knowledge and claim note, embedded with the configured
@@ -157,7 +249,7 @@ pub fn note_vectors(store: &Store) -> Result<Option<(String, Vec<(u64, Quantized
             out.push((note.id, v.clone()));
             continue;
         }
-        match embed_text(&memb_embed::document_text(&note.title, &note.desc), false) {
+        match embed_note(&note.title, &note.desc) {
             Ok(Some((t, v))) if t == tag && v.data.len() == probe.data.len() => {
                 fresh.push((*key, v.clone()));
                 out.push((note.id, v));
@@ -213,6 +305,17 @@ pub fn hot_set(
     tag: &str,
     mut embed_doc: impl FnMut(&Note) -> Option<QuantizedVec>,
 ) -> Result<Option<(HotVectors, HotSource)>, String> {
+    hot_set_batch(store, tag, |notes| notes.iter().map(|n| embed_doc(n)).collect::<Option<Vec<_>>>())
+}
+
+/// Like `hot_set`, but the notes that are not cached are handed over in one list, so a
+/// backend with a per-request cost (Snowflake) can embed them in batches. `embed_docs` must
+/// return one vector per note, in order, or `None`.
+pub fn hot_set_batch(
+    store: &Store,
+    tag: &str,
+    mut embed_docs: impl FnMut(&[&Note]) -> Option<Vec<QuantizedVec>>,
+) -> Result<Option<(HotVectors, HotSource)>, String> {
     let version = store.kb_version()?;
     if let Some(hit) = hot_cache_lookup(store.root(), tag, version) {
         return Ok(Some((hit, HotSource::Memory)));
@@ -236,18 +339,26 @@ pub fn hot_set(
     let cached = store
         .with_db(|db| memb_embed::get_document_vectors(db, &keys))
         .unwrap_or_default();
+    let missing: Vec<&Note> = active.iter().zip(&keys).filter(|(_, k)| !cached.contains_key(*k)).map(|(n, _)| *n).collect();
+    let mut made = if missing.is_empty() {
+        Vec::new()
+    } else {
+        match embed_docs(&missing) {
+            Some(v) if v.len() == missing.len() => v,
+            _ => return Ok(None),
+        }
+    }
+    .into_iter();
     let mut fresh = Vec::new();
     let mut entries: Vec<(u64, QuantizedVec)> = Vec::new();
     for (note, key) in active.iter().zip(&keys) {
         let vector = match cached.get(key) {
             Some(v) => v.clone(),
-            None => match embed_doc(note) {
-                Some(v) => {
-                    fresh.push((*key, v.clone()));
-                    v
-                }
-                None => return Ok(None),
-            },
+            None => {
+                let v = made.next().ok_or("batch embedding ran out of vectors")?;
+                fresh.push((*key, v.clone()));
+                v
+            }
         };
         if entries.first().is_some_and(|(_, f)| f.data.len() != vector.data.len()) {
             return Ok(None);
@@ -537,6 +648,143 @@ mod tests {
         assert!(listener.accept().is_ok(), "the control must reach the listener, or the check above proves nothing");
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A loopback stand-in for Snowflake's SQL API that "embeds" by hashing words into 64
+    /// buckets (so related texts get similar vectors) and records every request body.
+    fn mock_snowflake() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::io::{Read, Write};
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let (seen, failing) = (bodies.clone(), fail.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).into_owned();
+                let body: serde_json::Value = text.split("\r\n\r\n").nth(1).and_then(|b| serde_json::from_str(b).ok()).unwrap_or_default();
+                if failing.load(Ordering::SeqCst) {
+                    let _ = stream.write_all(b"HTTP/1.1 500 X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    continue;
+                }
+                let mut rows = Vec::new();
+                let count = body["bindings"].as_object().map_or(0, |b| b.len());
+                for i in 1..=count {
+                    let text = body["bindings"][i.to_string()]["value"].as_str().unwrap_or("");
+                    let text = text.strip_prefix("Represent this sentence for searching relevant passages: ").unwrap_or(text);
+                    let mut v = vec![0f32; 64];
+                    for word in text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+                        let bucket = word.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b))) % 64;
+                        v[bucket as usize] += 1.0;
+                    }
+                    rows.push(serde_json::json!([serde_json::to_string(&v).unwrap()]));
+                }
+                seen.lock().unwrap().push(body);
+                let reply = serde_json::json!({"data": rows}).to_string();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+            }
+        });
+        (port, bodies, fail)
+    }
+
+    #[test]
+    fn snowflake_search_embeds_notes_in_batches_once_and_falls_back_to_lexical_when_it_fails() {
+        use memb_core::{Draft, Kind, NotePatch};
+        use std::collections::BTreeMap;
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = ["MEMB_EMBED_DISABLE", "MEMB_GEMMA_MODEL_DIR", "MEMB_EMBED_PORT", "MEMB_EMBED_MODEL_ID", "MEMB_EMBED_MRL_DIM", "MEMB_SNOWFLAKE_ACCOUNT", "MEMB_SNOWFLAKE_USER", "MEMB_SNOWFLAKE_ROLE", "MEMB_SNOWFLAKE_WAREHOUSE", "MEMB_SNOWFLAKE_MODEL", "MEMB_SNOWFLAKE_KEY", "MEMB_SNOWFLAKE_BASE_URL"];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        let root = std::env::temp_dir().join(format!("memb-rag-snowflake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let key = root.join("key.p8");
+        std::fs::write(&key, include_str!("../../memb-embed/tests/fixtures/snowflake_test_key.p8")).unwrap();
+        let store = Store::open(&root.join("data")).unwrap();
+        let topics = ["scarlet apples", "database locks", "release gate", "windows tasks"];
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            let title = if i < 4 { topics[i].to_string() } else { format!("filler note {i}") };
+            let desc = if i < 4 { format!("all about {}", topics[i]) } else { format!("unrelated filler text number {i}") };
+            ids.push(store.remember(Draft { title, desc, kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() }).unwrap().id);
+        }
+        let (port, bodies, fail) = mock_snowflake();
+        std::env::set_var("MEMB_SNOWFLAKE_ACCOUNT", "ab14212.ap-southeast-1");
+        std::env::set_var("MEMB_SNOWFLAKE_USER", "SOMEONE");
+        std::env::set_var("MEMB_SNOWFLAKE_WAREHOUSE", "WH");
+        std::env::set_var("MEMB_SNOWFLAKE_KEY", &key);
+        std::env::set_var("MEMB_SNOWFLAKE_BASE_URL", format!("http://127.0.0.1:{port}"));
+
+        // First search: one statement for the query, two for the 20 notes (16 + 4).
+        let found = search(&store, "scarlet apples").unwrap();
+        assert_eq!(found.first().map(|n| n.id), Some(ids[0]), "the vector match comes first: {found:?}");
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3, "query + 2 note batches");
+        let query_text = sent[0]["bindings"]["1"]["value"].as_str().unwrap();
+        assert_eq!(query_text, "Represent this sentence for searching relevant passages: scarlet apples", "arctic-embed-m takes the retrieval prefix");
+        assert!(sent[0]["statement"].as_str().unwrap().contains("AI_EMBED('snowflake-arctic-embed-m-v1.5'"));
+        let doc_texts: Vec<&str> = sent[1..].iter().flat_map(|b| b["bindings"].as_object().unwrap().values().map(|v| v["value"].as_str().unwrap())).collect();
+        assert_eq!(doc_texts.len(), 20);
+        assert!(doc_texts.contains(&"scarlet apples: all about scarlet apples"), "documents go out as `title: desc`");
+        // A different query reuses the stored vectors: one statement.
+        let found = search(&store, "release gate").unwrap();
+        assert_eq!(found.first().map(|n| n.id), Some(ids[2]));
+        assert_eq!(bodies.lock().unwrap().len(), 4);
+        // The same query again is served from the query cache: no statement at all.
+        search(&store, "release gate").unwrap();
+        assert_eq!(bodies.lock().unwrap().len(), 4);
+        // One edited note: its vector alone is embedded again (query + a batch of one).
+        store.update(ids[3], NotePatch { desc: Some("tasks that run on windows".into()), ..Default::default() }).unwrap();
+        search(&store, "windows tasks").unwrap();
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 6);
+        assert_eq!(sent[5]["bindings"].as_object().unwrap().len(), 1);
+        // The tag names the model and prompt policy, so it never mixes with other vectors.
+        let (tag, _) = embed_text("anything", true).unwrap().unwrap();
+        assert_eq!(tag, "snowflake|snowflake-arctic-embed-m-v1.5|prompt:retrieval-prefix-v1");
+        assert!(embed_note("t", "d").unwrap().is_some());
+        // When Snowflake fails the answer is still the lexical one.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let found = search(&store, "database locks").unwrap();
+        assert_eq!(found.first().map(|n| n.id), Some(ids[1]), "lexical fallback");
+        // Disabling embeddings sends nothing to Snowflake.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let before = bodies.lock().unwrap().len();
+        std::env::set_var("MEMB_EMBED_DISABLE", "1");
+        search(&store, "windows tasks").unwrap();
+        std::env::remove_var("MEMB_EMBED_DISABLE");
+        assert_eq!(bodies.lock().unwrap().len(), before, "disabled means disabled");
+        // A partial setup is an error from the embedding functions, not a silent fallback.
+        std::env::remove_var("MEMB_SNOWFLAKE_USER");
+        assert!(embed_text("x", true).is_err());
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -7,3 +7,6 @@ edition.workspace = true
 memb-core = { path = "../memb-core" }
 memb-store = { path = "../memb-store" }
 memb-embed = { path = "../memb-embed" }
+
+[dev-dependencies]
+serde_json.workspace = true

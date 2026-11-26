@@ -295,3 +295,114 @@ fn embeddinggemma_q4_speed_memory_and_retrieval_quality_on_this_machine() {
         std::fs::write(out, report).unwrap();
     }
 }
+
+/// Live check of Snowflake AI_EMBED with the user's own account, using only the synthetic
+/// corpus above. Needs MEMB_SNOWFLAKE_ACCOUNT, MEMB_SNOWFLAKE_USER, MEMB_SNOWFLAKE_WAREHOUSE and
+/// MEMB_SNOWFLAKE_KEY (path to an unencrypted PKCS#8 .p8); optional MEMB_SNOWFLAKE_ROLE and
+/// MEMB_SNOWFLAKE_MODELS (comma list). Sends the 30 synthetic notes and questions above, nothing else.
+#[test]
+#[ignore = "needs Snowflake credentials in MEMB_SNOWFLAKE_*"]
+fn snowflake_ai_embed_live_speed_and_retrieval_quality() {
+    use memb_embed::snowflake::{Client, SnowflakeConfig};
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let models = var("MEMB_SNOWFLAKE_MODELS").unwrap_or_else(|| "snowflake-arctic-embed-m-v1.5,snowflake-arctic-embed-l-v2.0".into());
+    let mut report = String::new();
+    macro_rules! line {
+        ($($arg:tt)*) => {{ let l = format!($($arg)*); println!("{l}"); let _ = writeln!(report, "{l}"); }};
+    }
+    line!("# Snowflake AI_EMBED live check (synthetic corpus only)\n");
+    line!("| model | query prefix | width | first call ms | single-text p50 ms | batch of 16 ms | recall@1 | recall@3 | recall@5 | MRR@10 | 256-wide recall@1 | 256-wide recall@3 |");
+    line!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for model in models.split(',') {
+        let cfg = SnowflakeConfig {
+            account: var("MEMB_SNOWFLAKE_ACCOUNT").expect("MEMB_SNOWFLAKE_ACCOUNT"),
+            user: var("MEMB_SNOWFLAKE_USER").expect("MEMB_SNOWFLAKE_USER"),
+            role: var("MEMB_SNOWFLAKE_ROLE"),
+            warehouse: var("MEMB_SNOWFLAKE_WAREHOUSE").expect("MEMB_SNOWFLAKE_WAREHOUSE"),
+            model: model.trim().to_string(),
+            key_path: PathBuf::from(var("MEMB_SNOWFLAKE_KEY").expect("MEMB_SNOWFLAKE_KEY")),
+            base_url: None,
+        };
+        let client = Client::new(cfg).expect("client");
+        let t = Instant::now();
+        let first = match client.embed_batch(&["hello world".to_string()]) {
+            Ok(v) => v,
+            Err(e) => {
+                line!("| {model} | - | failed: {e} | | | | | | | | | |");
+                continue;
+            }
+        };
+        let first_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let width = first[0].len();
+        let mut singles = Vec::new();
+        for i in 0..5 {
+            let t = Instant::now();
+            client.embed_batch(&[format!("latency probe number {i}")]).unwrap();
+            singles.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let t = Instant::now();
+        client.embed_batch(&(0..16).map(|i| format!("batch probe {i}")).collect::<Vec<_>>()).unwrap();
+        let batch_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let docs: Vec<Vec<f32>> = client.embed_batch(&NOTES.iter().map(|(t, d)| format!("{t}: {d}")).collect::<Vec<_>>()).unwrap();
+        for prefix in ["", "Represent this sentence for searching relevant passages: "] {
+            let queries: Vec<Vec<f32>> = client.embed_batch(&QUERIES.iter().map(|q| format!("{prefix}{q}")).collect::<Vec<_>>()).unwrap();
+            let rank = |cut: Option<usize>| -> Vec<Vec<usize>> {
+                let prep = |v: &Vec<f32>| match cut {
+                    Some(w) => apply_mrl(v.clone(), Some(w)).unwrap(),
+                    None => v.clone(),
+                };
+                queries
+                    .iter()
+                    .map(|q| {
+                        let q = prep(q);
+                        let mut s: Vec<(f32, usize)> = docs.iter().enumerate().map(|(i, d)| (cosine_f32(&q, &prep(d)), i)).collect();
+                        s.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        s.into_iter().map(|x| x.1).collect()
+                    })
+                    .collect()
+            };
+            let (a, b, c, m) = score(&rank(None));
+            let (a2, b2, _, _) = score(&rank(Some(256)));
+            let label = if prefix.is_empty() { "none" } else { "retrieval prefix" };
+            line!("| {model} | {label} | {width} | {first_ms:.0} | {:.0} | {batch_ms:.0} | {a:.2} | {b:.2} | {c:.2} | {m:.2} | {a2:.2} | {b2:.2} |", pct(&mut singles.clone(), 0.5));
+        }
+    }
+    if let Some(out) = std::env::var_os("MEMB_BENCH_OUT") {
+        std::fs::write(out, report).unwrap();
+    }
+}
+
+/// The same synthetic corpus through memb's real search path with Snowflake as the backend
+/// (config from MEMB_SNOWFLAKE_*): first search (index build), warm searches, and hybrid recall.
+#[test]
+#[ignore = "needs Snowflake credentials in MEMB_SNOWFLAKE_*"]
+fn snowflake_through_memb_search_live() {
+    let root = std::env::temp_dir().join(format!("memb-bench-sf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let store = Store::open(&root).unwrap();
+    let ids: Vec<u64> = NOTES
+        .iter()
+        .map(|(t, d)| store.remember(Draft { title: (*t).into(), desc: (*d).into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() }).unwrap().id)
+        .collect();
+    let to_idx = |id: u64| ids.iter().position(|x| *x == id).unwrap();
+    std::env::remove_var("MEMB_GEMMA_MODEL_DIR");
+    std::env::remove_var("MEMB_EMBED_PORT");
+    std::env::remove_var("MEMB_EMBED_DISABLE");
+    let t = Instant::now();
+    memb_rag::search(&store, QUERIES[0]).unwrap();
+    println!("first search (30 notes embedded in 2 statements + query): {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    let mut warm = Vec::new();
+    let mut ranked = Vec::new();
+    for q in QUERIES.iter() {
+        let t = Instant::now();
+        let found = memb_rag::search(&store, q).unwrap();
+        warm.push(t.elapsed().as_secs_f64() * 1000.0);
+        ranked.push(found.into_iter().map(|n| to_idx(n.id)).collect::<Vec<_>>());
+    }
+    let (a, b, c, m) = score(&ranked);
+    println!("hybrid through memb (default model, 768-wide i8 + lexical): recall@1 {a:.2} @3 {b:.2} @5 {c:.2} MRR {m:.2}");
+    println!("warm search (one query statement): p50 {:.0} ms, p95 {:.0} ms", pct(&mut warm.clone(), 0.5), pct(&mut warm, 0.95));
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}

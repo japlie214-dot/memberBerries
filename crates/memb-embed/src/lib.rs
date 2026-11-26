@@ -1,5 +1,6 @@
 pub mod gemma;
 pub mod idle;
+pub mod snowflake;
 
 use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};

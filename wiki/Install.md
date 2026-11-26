@@ -28,7 +28,7 @@ To uninstall, remove only the `memb` extension/plugin or configuration entry and
 
 ### Verification matrix
 
-v0.11.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
+v0.12.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
 
 ### Cross-client smoke test
 
@@ -37,6 +37,28 @@ v0.11.0: `scripts/smoke-packages.py` runs the three packaged binaries as separat
 3. In the second host, search for `orchard`. Confirm that the exact same ID and description are returned, including after a host restart.
 4. Retract the note after checking its ID and confirming. In either host, inspect the ID again; its status should be `retracted`. Retraction is a soft delete, not physical erasure.
 5. If no tools appear, verify the path, `memb.exe --version`, startup environment and workspace trust; if results are empty, compare `MEMB_DATA_DIR` in both hosts. Do not enable unauthenticated HTTP to troubleshoot.
+
+## Cloud embeddings (Snowflake AI_EMBED)
+
+If you have a Snowflake account with Cortex access, memb can use its `AI_EMBED` function instead of a local model. **This sends note titles, descriptions and search queries (and, on the first search, every note you have) to Snowflake.** It is used only when you add the table below, and only when no local model is in use: an explicit `embeddings.gemma_model_dir` or port, or an installed local model (`memb models install`), always wins.
+
+```toml
+[embeddings.snowflake]
+account   = "ab14212.ap-southeast-1"
+user      = "YOUR_USER"
+warehouse = "YOUR_WAREHOUSE"
+# role    = "YOUR_ROLE"                       # optional: the role needs SNOWFLAKE.CORTEX_USER or CORTEX_EMBED_USER
+# model   = "snowflake-arctic-embed-m-v1.5"   # default
+key_file  = '%LOCALAPPDATA%\memberBerries\secrets\snowflake_private_key.p8'   # single quotes: a TOML literal string, backslashes stay as they are
+```
+
+The key is an unencrypted PKCS#8 private key (`-----BEGIN PRIVATE KEY-----`) registered on your Snowflake user (`ALTER USER ... SET RSA_PUBLIC_KEY=...`). It stays in that file: memb reads it, signs a short-lived token with it and never copies, prints or sends it. Keep it somewhere only your user can read, for example:
+
+```powershell
+icacls "%LOCALAPPDATA%\memberBerries\secrets" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"
+```
+
+Measured on a 30-note synthetic corpus ([evidence](../evidence/t031-snowflake-ai-embed.md)): the default `snowflake-arctic-embed-m-v1.5` with memb's retrieval prefix ranks best (recall@1 0.93) and is the fastest, about 0.8 s per request; `snowflake-arctic-embed-l-v2.0` is nearly as good and slower. Searches take about 1 s each (the first one after a change also embeds the new notes, 16 per request). `memb doctor` reports the backend and checks that the key file is readable without making a request.
 
 ## Semantic search (EmbeddingGemma 2)
 

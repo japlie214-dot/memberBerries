@@ -27,6 +27,15 @@ enabled = true               # false forces lexical-only search
 # model_id = "embeddinggemma-300m-q8"    # names the vector cache; required for a useful cache with a port
 # Off by default. In-process EmbeddingGemma 2 (ONNX); %VAR% is expanded, the path must be absolute.
 # gemma_model_dir = "%LOCALAPPDATA%\\memberBerries\\models\\embeddinggemma-2"   # not needed after `memb models install`
+# Cloud embeddings through Snowflake AI_EMBED. SENDS note titles, descriptions and queries to Snowflake;
+# used only when no local model is chosen or installed. key_file is the PATH of an unencrypted PKCS#8 .p8; never paste a key here.
+# [embeddings.snowflake]
+# account = "ab14212.ap-southeast-1"
+# user = "YOUR_USER"
+# warehouse = "YOUR_WAREHOUSE"
+# role = "YOUR_ROLE"                          # optional
+# model = "snowflake-arctic-embed-m-v1.5"     # default
+# key_file = "%LOCALAPPDATA%\\memberBerries\\secrets\\snowflake_private_key.p8"
 # auto_download = false      # true: the daily routine downloads the model (207 MB, verified) if none is installed
 # mrl_dim = 256              # one of 128, 256, 512, 768: shorter vectors (Matryoshka); omit for full width
 
