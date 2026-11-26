@@ -3,7 +3,7 @@
 One iteration is one version. Before a new package is built, the number goes up
 (`python scripts/bump-version.py minor|patch`, which refuses to run until this file has an
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
-adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014).
+adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
 ## 0.5.0 (2026-11-26)
 

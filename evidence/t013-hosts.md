@@ -33,8 +33,20 @@ Read back with `crates/memb/tests/hooks.rs::t013_read_scroll` (ignored helper te
 Codex's usage quota is used up until 2026-11-28 21:23 local (see T025 transcript). A prompt would still reach the
 `UserPromptSubmit` hook, but the `Stop` hook needs a finished model reply. Also needs `/hooks` trust.
 
-## Claude Desktop (Cowork and Code tab): not run yet
+## Claude Desktop (Code tab, installed plugin 0.5.0): VERIFIED live
 
-The installed memb plugin in Claude Desktop is the 2026-11-24 build without hooks. A live check needs either
-installing the rebuilt `memb.plugin` into Claude Desktop with `MEMB_SCROLL_CAPTURE=1` in its environment, or temporary hook
-settings in a project; both change the user's real configuration, so they wait for the user's approval.
+Method: the user installed `memb.plugin` (0.4.0 build with hooks, later reinstalled as 0.5.0) in Claude Desktop. This
+project's local settings got a temporary `env` block (`MEMB_SCROLL_CAPTURE=1`, `MEMB_DATA_DIR=C:	mp	013\cc\data`;
+the original file was backed up and restored afterwards, the temporary data directory was deleted). The hooks that ran
+are the plugin's own `hooks/hooks.json` (`${CLAUDE_PLUGIN_ROOT}/server/memb.exe` with `args`), so the
+plugin-root substitution and the direct (no shell) command are confirmed for Claude Desktop.
+
+| Run | Result read back from the data dir (session `cc_<session id>`) |
+|---|---|
+| capture on | 2 messages: Assistant (the previous reply, from `Stop`) and User (the next prompt, from `UserPromptSubmit`), text exact |
+| then `MEMB_NO_MEMORY=1` added to the same env block; one more reply and one more prompt | still 2 messages: nothing new stored |
+
+## Codex: NOT run (own ticket)
+
+Codex's usage quota is used up until 2026-11-28 21:23 local (see the T025 transcript), so a model-driven session is
+impossible now; a live Codex check also needs the user to trust the hooks in `/hooks`. Moved to its own ticket (T027).
