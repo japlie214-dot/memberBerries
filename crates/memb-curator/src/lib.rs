@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod links;
 pub mod packets;
+pub mod quota;
 pub mod ledger;
 
 use memb_core::{Draft, Kind, NotePatch};

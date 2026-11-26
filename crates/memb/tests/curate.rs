@@ -525,11 +525,12 @@ fn the_kill_switch_and_cascade_rule_hold_back_automatic_edits() {
 fn real_codex_summarizes_and_proposes_through_memb_curate() {
     let dir = Dir::new("realcodex", "");
     let topic = dir.seed();
-    // No cli_command: the shipped default command is what is being verified.
-    std::fs::write(dir.0.join("config.toml"), "[scroll]
-max_messages = 10
-retain_tail = 2
-").unwrap();
+    // The shipped Codex command (the default fallback), used alone.
+    std::fs::write(
+        dir.0.join("config.toml"),
+        "[scroll]\nmax_messages = 10\nretain_tail = 2\n[curator]\ncli_command = \"codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories\"\n",
+    )
+    .unwrap();
     let started = std::time::Instant::now();
     let out = dir.run(&["curate"], "");
     println!("elapsed: {:?}\nstderr: {}\nstdout: {}", started.elapsed(), text(&out.stderr), text(&out.stdout));
@@ -547,14 +548,14 @@ retain_tail = 2
     let _ = topic;
 }
 
-/// Same real run through Antigravity (`agy`, gemini-4-hydrogen-medium), which speaks the
-/// stream protocol and runs with an isolated home. `cargo test -p memb --test curate real_agy -- --ignored --nocapture`
+/// The real run with the shipped defaults: agy (gemini-4-hydrogen-medium) first, Codex as
+/// the fallback. `cargo test -p memb --test curate real_agy -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn real_agy_summarizes_and_proposes_through_memb_curate() {
     let dir = Dir::new("realagy", "");
     let topic = dir.seed();
-    std::fs::write(dir.0.join("config.toml"), "[scroll]\nmax_messages = 10\nretain_tail = 2\n[curator]\ncli_protocol = \"agy-stream\"\ncli_command = \"agy --model gemini-4-hydrogen-medium --disable-slash-commands --input-format stream-json --output-format stream-json --print-timeout 150s\"\n").unwrap();
+    std::fs::write(dir.0.join("config.toml"), "[scroll]\nmax_messages = 10\nretain_tail = 2\n").unwrap();
     let started = std::time::Instant::now();
     let out = dir.run(&["curate"], "");
     println!("elapsed: {:?}\nstderr: {}\nstdout: {}", started.elapsed(), text(&out.stderr), text(&out.stdout));

@@ -201,6 +201,39 @@ pub fn set_last_curation_ms(db: &Database, now_ms: u64) -> Result<(), String> {
     w.commit().map_err(|e| e.to_string())
 }
 
+/// The quota backoff of model number `slot` after it said its usage quota was used up:
+/// (wait until this UNIX time in ms, consecutive hits). (0, 0) when there is none.
+pub fn quota_backoff(db: &Database, slot: usize) -> Result<(u64, u32), String> {
+    let r = db.begin_read().map_err(|e| e.to_string())?;
+    let table = match r.open_table(STATE_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((0, 0)),
+        Err(e) => return Err(e.to_string()),
+    };
+    let found = table.get(format!("quota_backoff_{slot}").as_str()).map_err(|e| e.to_string())?;
+    Ok(found
+        .and_then(|v| {
+            let b = v.value();
+            let until = u64::from_le_bytes(<[u8; 8]>::try_from(b.get(..8)?).ok()?);
+            let strikes = u32::from_le_bytes(<[u8; 4]>::try_from(b.get(8..12)?).ok()?);
+            Some((until, strikes))
+        })
+        .unwrap_or((0, 0)))
+}
+
+pub fn set_quota_backoff(db: &Database, slot: usize, until_ms: u64, strikes: u32) -> Result<(), String> {
+    let w = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut table = w.open_table(STATE_TABLE).map_err(|e| e.to_string())?;
+        let mut v = until_ms.to_le_bytes().to_vec();
+        v.extend_from_slice(&strikes.to_le_bytes());
+        table
+            .insert(format!("quota_backoff_{slot}").as_str(), v.as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    w.commit().map_err(|e| e.to_string())
+}
+
 /// The kill switch: while set, nothing is applied automatically (proposals stay pending).
 pub fn auto_apply_paused(db: &Database) -> Result<bool, String> {
     let r = db.begin_read().map_err(|e| e.to_string())?;

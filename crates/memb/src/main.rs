@@ -94,17 +94,21 @@ fn main() {
         std::process::exit(2);
     }
     if args.first().is_some_and(|a| a == "curate") {
-        let dry_run = match args.as_slice() {
-            [_] => false,
-            [_, flag] if flag == "--dry-run" => true,
+        let (dry_run, retry_now) = match args.as_slice() {
+            [_] => (false, false),
+            [_, flag] if flag == "--dry-run" => (true, false),
+            [_, flag] if flag == "--retry-now" => (false, true),
             _ => {
                 eprintln!("{}", curate::CURATE_USAGE);
                 std::process::exit(2);
             }
         };
         let result = settings_with_config().and_then(|(store, cfg)| {
-            let backend = curate::backend_for(&cfg, store.root())?;
-            curate::run_curate(&store, &cfg, &backend, now_ms()?, dry_run, &mut io::stderr())
+            let models = curate::models_for(&cfg, store.root())?;
+            if retry_now {
+                models.clear_backoff(&store)?;
+            }
+            curate::run_curate(&store, &cfg, &models, now_ms()?, dry_run, &mut io::stderr())
         });
         match result {
             Ok(summary) => {
@@ -411,7 +415,7 @@ fn daemon_curate(store: &Store, cfg: &config::Config, now: u64) {
     if !cfg.curator.daemon_enabled {
         return;
     }
-    let curated = curate::backend_for(cfg, store.root())
+    let curated = curate::models_for(cfg, store.root())
         .and_then(|b| curate::run_curate(store, cfg, &b, now, false, &mut io::stderr()));
     match curated {
         Ok(summary) => eprintln!("memb: curation done; {} proposal(s) now await review", summary.proposals.len()),
@@ -447,7 +451,7 @@ fn daemon(cli_mirror_root: Option<&Path>) -> Result<(), String> {
         // (at most once an hour), still only with `curator.daemon_enabled`.
         if cfg.curator.daemon_enabled {
             if let Ok(now) = now_ms() {
-                if curate::threshold_due(&store, now).unwrap_or(false) {
+                if curate::threshold_due(&store, now).unwrap_or(false) && curate::model_ready(&store, &cfg, now) {
                     // run_curate stages new chunks itself.
                     daemon_curate(&store, &cfg, now);
                 }

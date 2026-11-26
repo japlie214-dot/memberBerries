@@ -168,6 +168,28 @@ impl Drop for KillOnCloseJob {
     }
 }
 
+/// Minutes the machine's local time is ahead of UTC right now (negative when behind), so
+/// a time printed in local time can be turned into UTC. 0 where this is unknown.
+pub fn local_utc_offset_minutes() -> i32 {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+        let mut tz: TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let id = GetTimeZoneInformation(&mut tz);
+        if id == 0xFFFF_FFFF {
+            return 0;
+        }
+        let extra = match id {
+            1 => tz.StandardBias,
+            2 => tz.DaylightBias,
+            _ => 0,
+        };
+        return -(tz.Bias + extra);
+    }
+    #[cfg(not(windows))]
+    0
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

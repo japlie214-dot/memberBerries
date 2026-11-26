@@ -57,8 +57,9 @@ pub struct Embeddings {
 pub struct Curator {
     pub backend: String,
     pub cli_command: String,
-    /// `text` (default; Codex) or `agy-stream` (Antigravity `agy`, isolated home directory).
-    pub cli_protocol: String,
+    /// Tried when `cli_command` fails or its quota is used up. Unset: Codex (gpt-6-luna)
+    /// when `cli_command` is the default agy command, otherwise none. Empty: none.
+    pub fallback_command: Option<String>,
     pub chunk_to_chunk_threshold: f64,
     pub chunk_to_node_threshold: f64,
     pub staging_ttl_days: u32,
@@ -114,12 +115,29 @@ impl Default for Embeddings {
     }
 }
 
+/// The default model: Antigravity `agy`, gemini-4-hydrogen-medium (stream protocol).
+pub const AGY_COMMAND: &str = "agy --model gemini-4-hydrogen-medium --disable-slash-commands --input-format stream-json --output-format stream-json --print-timeout 150s";
+/// The default fallback: Codex, gpt-6-luna at medium reasoning, isolated from the user's
+/// Codex plugins, skills, hooks, memories and AGENTS.md.
+pub const CODEX_COMMAND: &str = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories";
+
+impl Curator {
+    /// The fallback model command, if any (see `fallback_command`).
+    pub fn fallback(&self) -> Option<&str> {
+        match self.fallback_command.as_deref() {
+            Some(f) if f.trim().is_empty() => None,
+            Some(f) => Some(f),
+            None => (self.cli_command == AGY_COMMAND).then_some(CODEX_COMMAND),
+        }
+    }
+}
+
 impl Default for Curator {
     fn default() -> Self {
         Self {
             backend: "cli".into(),
-            cli_command: "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories".into(),
-            cli_protocol: "text".into(),
+            cli_command: AGY_COMMAND.into(),
+            fallback_command: None,
             chunk_to_chunk_threshold: 0.72,
             chunk_to_node_threshold: 0.70,
             staging_ttl_days: 30,
@@ -269,11 +287,12 @@ impl Config {
         if c.backend != "cli" {
             return Err("curator.backend must be \"cli\", the only supported backend".into());
         }
-        if c.cli_protocol != "text" && c.cli_protocol != "agy-stream" {
-            return Err("curator.cli_protocol must be \"text\" or \"agy-stream\"".into());
-        }
         memb_curator::backend::Backend::from_command(&c.cli_command)
             .map_err(|e| format!("curator.cli_command: {e}"))?;
+        if let Some(f) = c.fallback() {
+            memb_curator::backend::Backend::from_command(f)
+                .map_err(|e| format!("curator.fallback_command: {e}"))?;
+        }
         let fixed = Curator::default();
         if c.chunk_to_chunk_threshold != fixed.chunk_to_chunk_threshold
             || c.chunk_to_node_threshold != fixed.chunk_to_node_threshold
@@ -387,7 +406,7 @@ mod tests {
     #[test]
     fn defaults_match_the_kit_example() {
         let kit = Config::parse(
-            "[storage]\nmax_notes = 50000\n[scroll]\nmax_messages = 90\nretain_tail = 10\nmin_prompt_chars = 100\ndedup_reset_every_n_chunks = 7\nignore_dirs = [\"*/tmp/*\", \"*/playground/*\"]\n[curator]\nbackend = \"cli\"\ncli_command = \"codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories\"\nchunk_to_chunk_threshold = 0.72\nchunk_to_node_threshold = 0.70\nstaging_ttl_days = 30\n[scheduler]\nroutine_wib_hour = 15\nroutine_wib_minute = 45\ncooldown_hours = 20\nidle_sweep_hours = 24\nidle_sweep_min_messages = 45\n",
+            "[storage]\nmax_notes = 50000\n[scroll]\nmax_messages = 90\nretain_tail = 10\nmin_prompt_chars = 100\ndedup_reset_every_n_chunks = 7\nignore_dirs = [\"*/tmp/*\", \"*/playground/*\"]\n[curator]\nbackend = \"cli\"\ncli_command = \"agy --model gemini-4-hydrogen-medium --disable-slash-commands --input-format stream-json --output-format stream-json --print-timeout 150s\"\nchunk_to_chunk_threshold = 0.72\nchunk_to_node_threshold = 0.70\nstaging_ttl_days = 30\n[scheduler]\nroutine_wib_hour = 15\nroutine_wib_minute = 45\ncooldown_hours = 20\nidle_sweep_hours = 24\nidle_sweep_min_messages = 45\n",
         )
         .unwrap();
         assert_eq!(kit.scroll.ignore_dirs.len(), 2);
@@ -487,7 +506,18 @@ mod tests {
         assert!(auto.curator.auto_apply && auto.curator.max_auto_edits == 50);
         assert!(!Config::default().curator.auto_apply, "auto-apply is off by default");
         let default = Config::default().curator.cli_command;
-        assert!(default.starts_with("codex exec -m gpt-6-luna "), "{default}");
+        assert!(default.starts_with("agy --model gemini-4-hydrogen-medium "), "{default}");
+        let c = Config::default().curator;
+        assert_eq!(c.fallback(), Some(CODEX_COMMAND));
+        assert!(CODEX_COMMAND.starts_with("codex exec -m gpt-6-luna "));
+        // A command of your own gets no surprise fallback; an empty setting turns it off.
+        let own = Config::parse("[curator]\ncli_command = \"mymodel -p\"\n").unwrap().curator;
+        assert_eq!(own.fallback(), None);
+        let off = Config::parse("[curator]\nfallback_command = \"\"\n").unwrap().curator;
+        assert_eq!(off.fallback(), None);
+        let set = Config::parse("[curator]\nfallback_command = \"mymodel -p\"\n").unwrap().curator;
+        assert_eq!(set.fallback(), Some("mymodel -p"));
+        assert!(Config::parse("[curator]\nfallback_command = \"x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x\"\n").is_err());
         assert!(Config::parse(&format!("[curator]
 cli_command = \"{default}\"
 ")).is_ok(), "the default command must itself be valid");

@@ -4,7 +4,7 @@
 //!
 //! Everything the model returns is untrusted text. It is parsed into proposals that
 //! still need the user's explicit approval; parsing never changes a store.
-use crate::CuratorAction;
+use crate::{quota, CuratorAction};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -18,6 +18,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_ARGS: usize = 64;
 const MAX_ARG_BYTES: usize = 256;
 const MAX_NOTE_LINES: usize = 200;
+const STDERR_KEEP_BYTES: usize = 16 * 1024;
 
 /// A command line to run. The first word is the program; the rest are its arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,8 +90,16 @@ impl Backend {
     /// run is stopped if it exceeds the timeout or writes more than
     /// [`MAX_OUTPUT_BYTES`]. Error messages never include what the command wrote.
     pub fn run(&self, prompt: &str) -> Result<String, String> {
+        self.run_classified(prompt).map_err(String::from)
+    }
+
+    /// Like [`Backend::run`], but tells "the model's quota is used up" (and when it says
+    /// the quota returns) apart from other failures, so the caller can wait or switch
+    /// models instead of retrying at once. What the command wrote is only matched, never
+    /// repeated.
+    pub fn run_classified(&self, prompt: &str) -> Result<String, RunError> {
         if prompt.len() > MAX_PROMPT_BYTES {
-            return Err("prompt too large".into());
+            return Err("prompt too large".to_string().into());
         }
         let mut command = Command::new(&self.argv[0]);
         command.args(&self.argv[1..]).env("MEMB_INTERNAL", "1");
@@ -103,7 +112,7 @@ impl Backend {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         // Everything the command starts joins a kill-on-close job, so a program it leaves
         // running after it exits (`start /B`) is stopped too. The process starts suspended
         // and joins the job before it runs, so nothing it starts can escape. Best effort:
@@ -127,6 +136,24 @@ impl Backend {
         let mut child = command
             .spawn()
             .map_err(|_| "could not start the curation command".to_string())?;
+        // stderr is drained (a full pipe would stall the command) and its first bytes kept,
+        // only to recognise a quota message.
+        let stderr_text = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        if let Some(mut stderr) = child.stderr.take() {
+            let keep = stderr_text.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stderr.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut kept) = keep.lock() {
+                        let room = STDERR_KEEP_BYTES.saturating_sub(kept.len());
+                        kept.extend_from_slice(&buf[..n.min(room)]);
+                    }
+                }
+            });
+        }
         let mut stdin = child.stdin.take().ok_or("curation command has no stdin")?;
         let mut stdout = child
             .stdout
@@ -213,21 +240,66 @@ impl Backend {
         let out = reader
             .join()
             .map_err(|_| "curation command output failed".to_string())?;
+        // Everything the command wrote, only to look for a quota message.
+        let quota = || {
+            let mut all = String::from_utf8_lossy(&out).into_owned();
+            if let Ok(kept) = stderr_text.lock() {
+                all.push('\n');
+                all.push_str(&String::from_utf8_lossy(&kept));
+            }
+            quota::is_quota_error(&all).then(|| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                RunError::Quota(quota::parse_reset(&all, now, memb_win::local_utc_offset_minutes()))
+            })
+        };
         match status {
             Some(s) if s.success() => {
-                let text = String::from_utf8(out)
+                let text = String::from_utf8(out.clone())
                     .map_err(|_| "curation command output was not text".to_string())?;
                 if self.agy_home.is_some() {
-                    parse_agy_stream(&text)
+                    parse_agy_stream(&text).map_err(|e| quota().unwrap_or(RunError::Other(e)))
                 } else {
                     Ok(text)
                 }
             }
-            Some(s) => Err(format!(
-                "curation command failed (exit {})",
-                s.code().map_or_else(|| "signal".into(), |c| c.to_string())
-            )),
-            None => Err("curation command stopped unexpectedly".into()),
+            Some(s) => Err(quota().unwrap_or_else(|| {
+                RunError::Other(format!(
+                    "curation command failed (exit {})",
+                    s.code().map_or_else(|| "signal".into(), |c| c.to_string())
+                ))
+            })),
+            None => Err("curation command stopped unexpectedly".to_string().into()),
+        }
+    }
+}
+
+/// Why a model run failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The model's usage quota or rate limit is used up; the wait it asked for, if it said.
+    Quota(Option<Duration>),
+    Other(String),
+}
+
+impl From<String> for RunError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
+impl From<&str> for RunError {
+    fn from(s: &str) -> Self {
+        Self::Other(s.to_string())
+    }
+}
+
+impl From<RunError> for String {
+    fn from(e: RunError) -> Self {
+        match e {
+            RunError::Quota(_) => "the model's usage quota is used up".into(),
+            RunError::Other(s) => s,
         }
     }
 }

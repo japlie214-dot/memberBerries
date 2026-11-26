@@ -33,14 +33,19 @@ enabled = true               # false forces lexical-only search
 
 [curator]                    # used by `memb curate` (you run it; see wiki/Operations.md)
 backend = "cli"              # the only supported backend
-cli_command = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories"
+cli_command = "agy --model gemini-4-hydrogen-medium --disable-slash-commands --input-format stream-json --output-format stream-json --print-timeout 150s"
                              # run WITHOUT a shell, split on whitespace; it receives conversation text on stdin.
-                             # Verified: Codex, gpt-6-luna at medium reasoning (the default above). The default is "pure":
-                             # --ignore-user-config/--ignore-rules/--disable ... keep your Codex plugins, apps, skills,
-                             # hooks, memories and AGENTS.md out of the headless call (see wiki/Operations.md).
-                             # Antigravity preset (verified, agy 1.5.15): set cli_protocol = "agy-stream" and
-                             # cli_command = "agy --model gemini-4-hydrogen-medium --disable-slash-commands --input-format stream-json --output-format stream-json --print-timeout 150s"
-cli_protocol = "text"         # "text" (Codex) or "agy-stream" (Antigravity agy; isolated home, see wiki/Configuration.md)
+                             # Default: Antigravity agy, gemini-4-hydrogen-medium (verified, agy 1.5.15). An agy
+                             # command speaks agy's stream protocol and runs with an empty home directory so none
+                             # of your Antigravity plugins, MCP servers or rules load.
+# fallback_command = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories"
+                             # Tried when cli_command fails or its quota is used up. Unset (as here): Codex
+                             # gpt-6-luna at medium reasoning, shown here, when cli_command is the default agy
+                             # command, otherwise none. "" turns the fallback off. The Codex command is "pure":
+                             # --ignore-user-config/--ignore-rules/--disable ... keep your Codex plugins, apps,
+                             # skills, hooks, memories and AGENTS.md out of the headless call.
+                             # A model that reports its quota used up is not called again until the time it
+                             # named (or 15 min, doubling to 6 h); see wiki/Operations.md.
 chunk_to_chunk_threshold = 0.72   # fixed: any other value is rejected
 chunk_to_node_threshold = 0.70    # fixed: any other value is rejected
 staging_ttl_days = 30        # 1..=365: staged evidence and unanswered proposals expire after this

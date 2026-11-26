@@ -6,7 +6,7 @@
 //! only changes a note when the user types its confirmation in `proposals apply`.
 use crate::config::Config;
 use memb_curator::backend::{self, Backend, PromptNote};
-use memb_curator::{links, packets};
+use memb_curator::{links, packets, quota};
 use memb_curator::ledger::{self, Status, StoredProposal};
 use memb_curator::{CuratorAction, Proposal};
 use memb_store::Store;
@@ -20,18 +20,125 @@ const MAX_CHUNKS_PER_RUN: usize = 100;
 /// Most chunks summarized (one model call each) in one run.
 const MAX_SUMMARIES_PER_RUN: usize = 20;
 
-/// The model command for `cfg`, started in an empty sandbox directory under the data
-/// directory so the model session has no project files to read or change.
-pub fn backend_for(cfg: &Config, data_root: &std::path::Path) -> Result<Backend, String> {
+/// The models curation uses, in order: the configured command, then the fallback.
+pub struct Models {
+    list: Vec<Backend>,
+}
+
+fn build_backend(command: &str, data_root: &std::path::Path) -> Result<Backend, String> {
+    // Started in an empty sandbox directory under the data directory so the model session
+    // has no project files to read or change.
     let sandbox = data_root.join("curator-sandbox");
     std::fs::create_dir_all(&sandbox).map_err(|_| "could not create the curator sandbox directory")?;
-    let backend = Backend::from_command(&cfg.curator.cli_command)?.with_cwd(sandbox);
-    if cfg.curator.cli_protocol == "agy-stream" {
+    let backend = Backend::from_command(command)?.with_cwd(sandbox);
+    let is_agy = std::path::Path::new(backend.program())
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("agy"));
+    if is_agy {
+        // Antigravity speaks the stream protocol and has no switch to ignore the user's
+        // plugins, MCP servers and rules, so it runs with an empty home directory.
         let home = data_root.join("curator-home");
         std::fs::create_dir_all(&home).map_err(|_| "could not create the curator home directory")?;
         return Ok(backend.with_agy_stream(home));
     }
     Ok(backend)
+}
+
+pub fn models_for(cfg: &Config, data_root: &std::path::Path) -> Result<Models, String> {
+    let mut list = vec![build_backend(&cfg.curator.cli_command, data_root)?];
+    if let Some(fallback) = cfg.curator.fallback() {
+        list.push(build_backend(fallback, data_root)?);
+    }
+    Ok(Models { list })
+}
+
+/// "3h28m", "15m", "40s".
+fn in_words(ms: u64) -> String {
+    let secs = ms.div_ceil(1000);
+    match (secs / 3600, secs % 3600 / 60) {
+        (0, 0) => format!("{secs}s"),
+        (0, m) => format!("{m}m"),
+        (h, m) => format!("{h}h{m:02}m"),
+    }
+}
+
+impl Models {
+    /// Program names for notices, e.g. `agy, then codex`.
+    pub fn names(&self) -> String {
+        self.list.iter().map(Backend::program).collect::<Vec<_>>().join(", then ")
+    }
+
+    /// One model call. A model whose quota is used up is not called again until the time
+    /// it named (or a growing wait when it named none); a model that fails is skipped for
+    /// this call. The next model in the list is tried instead. If none can answer the
+    /// error says so, and for quota it says when to come back.
+    pub fn run(
+        &self,
+        store: &Store,
+        now: u64,
+        prompt: &str,
+        notice: &mut impl Write,
+    ) -> Result<String, String> {
+        let mut resume_at: Option<u64> = None;
+        let mut failure: Option<String> = None;
+        for (slot, model) in self.list.iter().enumerate() {
+            let (until, strikes) = store.with_db(|db| links::quota_backoff(db, slot))?;
+            if until > now {
+                resume_at = Some(resume_at.map_or(until, |r| r.min(until)));
+                continue;
+            }
+            match model.run_classified(prompt) {
+                Ok(reply) => {
+                    if until != 0 || strikes != 0 {
+                        store.with_db(|db| links::set_quota_backoff(db, slot, 0, 0))?;
+                    }
+                    return Ok(reply);
+                }
+                Err(backend::RunError::Quota(wait)) => {
+                    let wait = wait
+                        .unwrap_or_else(|| quota::default_backoff(strikes))
+                        .clamp(quota::MIN_BACKOFF, quota::MAX_BACKOFF);
+                    let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+                    let until = now.saturating_add(wait_ms);
+                    store.with_db(|db| links::set_quota_backoff(db, slot, until, strikes.saturating_add(1)))?;
+                    let _ = writeln!(
+                        notice,
+                        "memb: `{}` has used up its quota; not calling it for {}",
+                        model.program(),
+                        in_words(wait_ms)
+                    );
+                    resume_at = Some(resume_at.map_or(until, |r| r.min(until)));
+                }
+                Err(backend::RunError::Other(reason)) => {
+                    let _ = writeln!(notice, "memb: `{}` failed: {reason}", model.program());
+                    failure = Some(reason);
+                }
+            }
+        }
+        match (failure, resume_at) {
+            (Some(reason), _) => Err(reason),
+            (None, Some(at)) => Err(format!(
+                "the model quota is used up; curation can resume in about {} (`memb curate --retry-now` tries anyway)",
+                in_words(at.saturating_sub(now))
+            )),
+            (None, None) => Err("no model command is configured".into()),
+        }
+    }
+
+    /// Forget every quota wait (`memb curate --retry-now`).
+    pub fn clear_backoff(&self, store: &Store) -> Result<(), String> {
+        for slot in 0..self.list.len() {
+            store.with_db(|db| links::set_quota_backoff(db, slot, 0, 0))?;
+        }
+        Ok(())
+    }
+}
+
+/// False while every model is waiting for its quota to return, so nothing is started
+/// that could only fail.
+pub fn model_ready(store: &Store, cfg: &Config, now: u64) -> bool {
+    let slots = 1 + usize::from(cfg.curator.fallback().is_some());
+    (0..slots).any(|slot| store.with_db(|db| links::quota_backoff(db, slot)).map_or(true, |(until, _)| until <= now))
 }
 
 pub fn ttl_ms(cfg: &Config) -> u64 {
@@ -121,7 +228,7 @@ impl Summary {
 pub fn run_curate(
     store: &Store,
     cfg: &Config,
-    backend: &Backend,
+    models: &Models,
     now: u64,
     dry_run: bool,
     notice: &mut impl Write,
@@ -149,7 +256,7 @@ pub fn run_curate(
         if pending + backend::MAX_PROPOSALS_PER_RUN > ledger::MAX_PENDING {
             return Err("too many pending proposals; apply or reject some first".into());
         }
-        (summarized, embedded) = summarize_staged(store, backend, &staged, notice)?;
+        (summarized, embedded) = summarize_staged(store, models, now, &staged, notice)?;
         staged = store.with_db(|db| memb_scroll::list_staged_chunks(db, MAX_CHUNKS_PER_RUN))?;
     }
     let all_notes = store.load_all_notes()?;
@@ -219,10 +326,10 @@ pub fn run_curate(
         sent.len(),
         summary.chunks_sent,
         prompt.len(),
-        backend.program()
+        models.names()
     )
     .map_err(|_| "output failed")?;
-    let reply = backend.run(&prompt)?;
+    let reply = models.run(store, now, &prompt, notice)?;
     let allowed: BTreeMap<String, String> = sent
         .iter()
         .flat_map(|p| p.chunks.iter().map(|c| (c.chunk_id.clone(), c.session_id.clone())))
@@ -429,7 +536,8 @@ pub fn threshold_due(store: &Store, now: u64) -> Result<bool, String> {
 /// Returns (summarized, embedded) counts.
 fn summarize_staged(
     store: &Store,
-    backend: &Backend,
+    models: &Models,
+    now: u64,
     staged: &[memb_scroll::ScrollChunk],
     notice: &mut impl Write,
 ) -> Result<(usize, usize), String> {
@@ -444,14 +552,14 @@ fn summarize_staged(
             notice,
             "memb: sending {} chunk(s) of private conversation text to `{}` for summaries",
             todo.len(),
-            backend.program()
+            models.names()
         )
         .map_err(|_| "output failed")?;
     }
     for chunk in todo {
         let prompt = backend::build_summary_prompt(&flatten(&chunk.messages));
         memb_core::reject_secrets(&prompt).map_err(|_| "sensitive text found; nothing was sent")?;
-        let reply = backend.run(&prompt)?;
+        let reply = models.run(store, now, &prompt, notice)?;
         let Ok((text, explicit)) = backend::parse_summary(&reply) else { continue };
         if memb_core::reject_secrets(&text).is_err() {
             continue;
@@ -581,7 +689,7 @@ fn parse_status(name: &str) -> Option<Status> {
     }
 }
 
-pub const CURATE_USAGE: &str = "Usage: memb curate [--dry-run]";
+pub const CURATE_USAGE: &str = "Usage: memb curate [--dry-run | --retry-now]";
 pub const PROPOSALS_USAGE: &str = "Usage: memb proposals [--status pending|applying|applied|rejected|expired] [--limit <1-200>] | memb proposals show <id> | memb proposals apply <id> | memb proposals reject <id> | memb proposals rollback <id> | memb proposals audit [<limit>] | memb proposals pause | memb proposals resume";
 
 /// What a `proposals` command line asks for.
@@ -658,6 +766,77 @@ mod tests {
         let root = std::env::temp_dir().join(format!("memb-curate-unit-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         (Store::open(&root).unwrap(), root)
+    }
+
+    #[cfg(windows)]
+    fn fake(command: &str) -> Backend {
+        Backend::from_command(command).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_model_that_used_up_its_quota_is_skipped_until_it_returns_and_the_fallback_answers() {
+        let (store, root) = temp_store("quota-fallback");
+        let quota_msg = "cmd /C echo ERROR: You have hit your usage limit. Try again in 5 minutes. 1>&2 & exit 1";
+        let models = Models { list: vec![fake(quota_msg), fake("cmd /C echo FALLBACK-ANSWER")] };
+        let mut notice = Vec::new();
+        let now = 1_000_000_000_000u64;
+        let reply = models.run(&store, now, "prompt", &mut notice).unwrap();
+        assert!(reply.contains("FALLBACK-ANSWER"), "{reply}");
+        let (until, strikes) = store.with_db(|db| links::quota_backoff(db, 0)).unwrap();
+        assert_eq!((until, strikes), (now + 300_000, 1), "the wait it named, one strike");
+        assert_eq!(store.with_db(|db| links::quota_backoff(db, 1)).unwrap(), (0, 0));
+        assert!(String::from_utf8_lossy(&notice).contains("used up its quota"));
+        // Two minutes later the first model is still resting: it is not called, so its
+        // strike count and wait do not change; the fallback answers again.
+        let reply = models.run(&store, now + 120_000, "prompt", &mut Vec::new()).unwrap();
+        assert!(reply.contains("FALLBACK-ANSWER"));
+        assert_eq!(store.with_db(|db| links::quota_backoff(db, 0)).unwrap(), (until, 1));
+        // After the wait it is called again (and hits the quota again: second strike).
+        models.run(&store, until + 1, "prompt", &mut Vec::new()).unwrap();
+        assert_eq!(store.with_db(|db| links::quota_backoff(db, 0)).unwrap().1, 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn when_every_model_is_out_of_quota_the_error_says_when_to_come_back_and_nothing_is_retried() {
+        let (store, root) = temp_store("quota-all");
+        // No time named: the wait starts at 15 minutes and doubles.
+        let msg = "cmd /C echo RESOURCE_EXHAUSTED (code 429): Individual quota reached. 1>&2 & exit 3";
+        let models = Models { list: vec![fake(msg)] };
+        let now = 5_000_000_000_000u64;
+        let e = models.run(&store, now, "p", &mut Vec::new()).unwrap_err();
+        assert!(e.contains("quota is used up") && e.contains("15m"), "{e}");
+        assert_eq!(store.with_db(|db| links::quota_backoff(db, 0)).unwrap(), (now + 900_000, 1));
+        let again = models.run(&store, now + 60_000, "p", &mut Vec::new()).unwrap_err();
+        assert!(again.contains("14m"), "{again}");
+        assert_eq!(store.with_db(|db| links::quota_backoff(db, 0)).unwrap().1, 1, "not called while waiting");
+        assert!(!model_ready_for(&store, 1, now + 60_000));
+        assert!(model_ready_for(&store, 1, now + 900_001));
+        // A model that works again clears its wait.
+        let ok = Models { list: vec![fake("cmd /C echo fine")] };
+        ok.run(&store, now + 900_001, "p", &mut Vec::new()).unwrap();
+        assert_eq!(store.with_db(|db| links::quota_backoff(db, 0)).unwrap(), (0, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_ordinary_failure_falls_back_but_does_not_start_a_quota_wait() {
+        let (store, root) = temp_store("plain-fail");
+        let models = Models { list: vec![fake("cmd /C exit 1"), fake("cmd /C echo SECOND")] };
+        let reply = models.run(&store, 1, "p", &mut Vec::new()).unwrap();
+        assert!(reply.contains("SECOND"));
+        assert_eq!(store.with_db(|db| links::quota_backoff(db, 0)).unwrap(), (0, 0));
+        let only = Models { list: vec![fake("cmd /C exit 1")] };
+        assert!(only.run(&store, 1, "p", &mut Vec::new()).unwrap_err().contains("exit 1"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn model_ready_for(store: &Store, slots: usize, now: u64) -> bool {
+        (0..slots).any(|slot| store.with_db(|db| links::quota_backoff(db, slot)).unwrap().0 <= now)
     }
 
     #[test]
