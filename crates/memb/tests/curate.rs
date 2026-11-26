@@ -546,3 +546,25 @@ retain_tail = 2
     assert_eq!(dir.store().load_all_notes().unwrap().len(), 1, "curation changed no note");
     let _ = topic;
 }
+
+/// Same real run through Antigravity (`agy`, gemini-4-hydrogen-medium), which speaks the
+/// stream protocol and runs with an isolated home. `cargo test -p memb --test curate real_agy -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn real_agy_summarizes_and_proposes_through_memb_curate() {
+    let dir = Dir::new("realagy", "");
+    let topic = dir.seed();
+    std::fs::write(dir.0.join("config.toml"), "[scroll]\nmax_messages = 10\nretain_tail = 2\n[curator]\ncli_protocol = \"agy-stream\"\ncli_command = \"agy --model gemini-4-hydrogen-medium --disable-slash-commands --input-format stream-json --output-format stream-json --print-timeout 150s\"\n").unwrap();
+    let started = std::time::Instant::now();
+    let out = dir.run(&["curate"], "");
+    println!("elapsed: {:?}\nstderr: {}\nstdout: {}", started.elapsed(), text(&out.stderr), text(&out.stdout));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let summary = json_line(&out.stdout);
+    assert_eq!(summary["summarized"], 1, "the summary reply parsed: {summary}");
+    assert_eq!(summary["packets"], 1);
+    let chunk = dir.store().with_db(|db| memb_scroll::list_unembedded_chunks(db, 10)).unwrap();
+    println!("summary: {:?} explicit_signal: {:?}", chunk[0].summary, chunk[0].explicit_signal);
+    assert_eq!(chunk[0].explicit_signal, Some(true));
+    assert_eq!(dir.store().load_all_notes().unwrap().len(), 1, "curation changed no note");
+    let _ = topic;
+}

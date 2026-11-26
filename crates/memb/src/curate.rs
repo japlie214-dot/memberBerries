@@ -25,7 +25,13 @@ const MAX_SUMMARIES_PER_RUN: usize = 20;
 pub fn backend_for(cfg: &Config, data_root: &std::path::Path) -> Result<Backend, String> {
     let sandbox = data_root.join("curator-sandbox");
     std::fs::create_dir_all(&sandbox).map_err(|_| "could not create the curator sandbox directory")?;
-    Ok(Backend::from_command(&cfg.curator.cli_command)?.with_cwd(sandbox))
+    let backend = Backend::from_command(&cfg.curator.cli_command)?.with_cwd(sandbox);
+    if cfg.curator.cli_protocol == "agy-stream" {
+        let home = data_root.join("curator-home");
+        std::fs::create_dir_all(&home).map_err(|_| "could not create the curator home directory")?;
+        return Ok(backend.with_agy_stream(home));
+    }
+    Ok(backend)
 }
 
 pub fn ttl_ms(cfg: &Config) -> u64 {

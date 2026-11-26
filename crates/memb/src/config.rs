@@ -57,6 +57,8 @@ pub struct Embeddings {
 pub struct Curator {
     pub backend: String,
     pub cli_command: String,
+    /// `text` (default; Codex) or `agy-stream` (Antigravity `agy`, isolated home directory).
+    pub cli_protocol: String,
     pub chunk_to_chunk_threshold: f64,
     pub chunk_to_node_threshold: f64,
     pub staging_ttl_days: u32,
@@ -117,6 +119,7 @@ impl Default for Curator {
         Self {
             backend: "cli".into(),
             cli_command: "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories".into(),
+            cli_protocol: "text".into(),
             chunk_to_chunk_threshold: 0.72,
             chunk_to_node_threshold: 0.70,
             staging_ttl_days: 30,
@@ -265,6 +268,9 @@ impl Config {
         let c = &self.curator;
         if c.backend != "cli" {
             return Err("curator.backend must be \"cli\", the only supported backend".into());
+        }
+        if c.cli_protocol != "text" && c.cli_protocol != "agy-stream" {
+            return Err("curator.cli_protocol must be \"text\" or \"agy-stream\"".into());
         }
         memb_curator::backend::Backend::from_command(&c.cli_command)
             .map_err(|e| format!("curator.cli_command: {e}"))?;

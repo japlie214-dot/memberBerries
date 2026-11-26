@@ -25,9 +25,28 @@ pub struct Backend {
     argv: Vec<String>,
     timeout: Duration,
     cwd: Option<std::path::PathBuf>,
+    agy_home: Option<std::path::PathBuf>,
+}
+
+/// How the command is spoken to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Plain text on stdin, the answer as plain text on stdout (`codex exec`).
+    Text,
+    /// Antigravity `agy`: one NDJSON user message on stdin, NDJSON events on stdout.
+    AgyStream,
 }
 
 impl Backend {
+    /// Speaks the Antigravity stream protocol and runs the command with `USERPROFILE` and
+    /// `HOME` set to this (empty) directory, so none of the user's Antigravity plugins,
+    /// MCP servers, rules or skills load (Antigravity has no switch for that; its saved
+    /// sign-in is not stored in that directory, so it keeps working).
+    pub fn with_agy_stream(mut self, home: std::path::PathBuf) -> Self {
+        self.agy_home = Some(home);
+        self
+    }
+
     /// Runs the command in this directory (memb uses an empty sandbox directory, so the
     /// model session starts with no project files to read or edit).
     pub fn with_cwd(mut self, cwd: std::path::PathBuf) -> Self {
@@ -51,6 +70,7 @@ impl Backend {
             argv,
             timeout: DEFAULT_TIMEOUT,
             cwd: None,
+            agy_home: None,
         })
     }
 
@@ -74,6 +94,9 @@ impl Backend {
         }
         let mut command = Command::new(&self.argv[0]);
         command.args(&self.argv[1..]).env("MEMB_INTERNAL", "1");
+        if let Some(home) = &self.agy_home {
+            command.env("USERPROFILE", home).env("HOME", home);
+        }
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
@@ -93,7 +116,15 @@ impl Backend {
             .stdout
             .take()
             .ok_or("curation command has no stdout")?;
-        let input = prompt.as_bytes().to_vec();
+        let input = if self.agy_home.is_some() {
+            let mut line = serde_json::json!({"event": "user", "message": {"content": prompt}}).to_string();
+            line.push('\n');
+            line.into_bytes()
+        } else {
+            prompt.as_bytes().to_vec()
+        };
+        // The stream protocol repeats the answer in its events, so it may be bigger on the wire.
+        let read_cap = if self.agy_home.is_some() { MAX_OUTPUT_BYTES * 3 } else { MAX_OUTPUT_BYTES };
         let writer = std::thread::spawn(move || {
             // A command that exits without reading its input breaks the pipe; that is
             // judged by its exit status and output, not here.
@@ -108,7 +139,7 @@ impl Backend {
                 match stdout.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if out.len() + n > MAX_OUTPUT_BYTES {
+                        if out.len() + n > read_cap {
                             flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             break;
                         }
@@ -167,8 +198,15 @@ impl Backend {
             .join()
             .map_err(|_| "curation command output failed".to_string())?;
         match status {
-            Some(s) if s.success() => String::from_utf8(out)
-                .map_err(|_| "curation command output was not text".to_string()),
+            Some(s) if s.success() => {
+                let text = String::from_utf8(out)
+                    .map_err(|_| "curation command output was not text".to_string())?;
+                if self.agy_home.is_some() {
+                    parse_agy_stream(&text)
+                } else {
+                    Ok(text)
+                }
+            }
             Some(s) => Err(format!(
                 "curation command failed (exit {})",
                 s.code().map_or_else(|| "signal".into(), |c| c.to_string())
@@ -176,6 +214,22 @@ impl Backend {
             None => Err("curation command stopped unexpectedly".into()),
         }
     }
+}
+
+/// The final answer of an `agy --output-format stream-json` run: the `result` event.
+pub fn parse_agy_stream(text: &str) -> Result<String, String> {
+    for line in text.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v["event"] != "result" {
+            continue;
+        }
+        return match (v["result"]["status"].as_str(), v["result"]["response"].as_str()) {
+            (Some("SUCCESS"), Some(r)) if r.len() <= MAX_OUTPUT_BYTES => Ok(r.to_string()),
+            (Some("SUCCESS"), Some(_)) => Err("curation command wrote too much output".into()),
+            _ => Err("the model run did not succeed".into()),
+        };
+    }
+    Err("the model run returned no result".into())
 }
 
 /// Stops the command and, on Windows, the processes it started.
@@ -437,6 +491,21 @@ fn strip_fence(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agy_stream_result_is_read_strictly() {
+        let ok = concat!(
+            r#"{"event":"init"}"#, "\n",
+            r#"{"event":"step_update","step_update":{}}"#, "\n",
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"{\"a\":1}\n"}}"#, "\n",
+        );
+        assert_eq!(parse_agy_stream(ok).unwrap(), "{\"a\":1}\n");
+        let err = r#"{"event":"result","result":{"status":"ERROR","response":"","error":"secret detail"}}"#;
+        let e = parse_agy_stream(err).unwrap_err();
+        assert!(!e.contains("secret"), "{e}");
+        assert!(parse_agy_stream("not json\n{\"event\":\"init\"}").is_err());
+        assert!(parse_agy_stream("").is_err());
+    }
+
     use super::*;
 
     fn allowed() -> BTreeMap<String, String> {
