@@ -35,6 +35,27 @@ Capturing a message prints nothing on stdout. The only stdout is the retrieval c
 
 Antigravity's `Stop` payload (`conversationId`, `workspacePaths`, `transcriptPath`, `fullyIdle`, ...) carries no message text, so memb reads the end of its own transcript instead. It acts only when `fullyIdle` is true, accepts only a transcript at `.../.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl` (any other path from the payload is refused), reads at most the last 2 MiB, and ignores truncated records. A turn is the last model answer without tool calls plus the user input before it; a repeat of the same final answer is not stored twice. The record layout (`source`, `type`, `status`, `content`) was observed in real transcripts and is not in Antigravity's documentation, so a future Antigravity change can silently stop capture; the hook then does nothing rather than guessing.
 
+## Retrieval rules
+
+- Only the latest user message is used, cut at 512 bytes, and only when it is at least `scroll.min_prompt_chars` (100) characters.
+- A **slash command** (the message starts with `/` followed directly by a letter, digit, `_` or `-`, such as `/help` or `/review ...`) never triggers retrieval, however long. It is still recorded in the scroll.
+- Notes are not repeated: a note injected into a session is not injected again in the same epoch (see `scroll.dedup_reset_every_n_chunks`), **unless it was updated after it was injected**: then it comes once more, with its new text, and not again until it changes again.
+- Query cache: the 256-entry query LRU lives in the long-running MCP server only. A hook is a new process each time, so it would never hit, and a disk cache would add writes to every prompt for nothing measurable.
+
+## Hook latency (T019, 2026-11-26)
+
+Release build, this machine (Windows 11), 500 notes, 30 runs each, wall time including process start:
+
+| Run | median | p90 |
+|---|---|---|
+| `memb --version` (process start only) | 80 ms | 101 ms |
+| hook with capture off (exits at once) | 74 ms | 93 ms |
+| hook with capture on, short prompt (no retrieval) | 76 ms | 93 ms |
+| hook with capture on, slash command | 73 ms | 92 ms |
+| hook with capture on, 100+ character prompt (search plus dedup) | 74 ms | 95 ms |
+
+Starting a 26 MB executable takes about 75 ms here (most of it Windows process creation and scanning), more than the whole hook, so the plan's "under 8 ms" cannot be shown for the process and is not claimed. What can be said: the hook's own work (capture, search of 500 notes, deduplication) is below the measurement noise of a few milliseconds, because every row is within about 6 ms of the others.
+
 ## Verification status
 
 Verified here: the hook binary against synthetic payloads in each host's documented shape (`crates/memb/tests/hooks.rs`: capture, silence on stdout, every kill switch, secret and size rejection, exclusion directories, per-host retrieval output, deduplication, Antigravity transcript rules); the packaged files parse and name the packaged executable; `agy plugin validate --strict` accepts the Antigravity package; `claude plugin validate` (Claude Code 2.1.330) lists both hooks of the Cowork package and accepts its manifest with one warning about missing author details (it also prints marketplace-submission findings, which do not affect a local install).

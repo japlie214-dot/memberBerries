@@ -103,7 +103,17 @@ pub fn should_retrieve_for_prompt(latest_user_msg: &str) -> bool {
 }
 
 pub fn should_retrieve_for_prompt_with(latest_user_msg: &str, limits: &ScrollLimits) -> bool {
-    latest_user_msg.trim().chars().count() >= limits.min_prompt_chars
+    let prompt = latest_user_msg.trim();
+    !is_slash_command(prompt) && prompt.chars().count() >= limits.min_prompt_chars
+}
+
+/// A slash command (`^/[A-Za-z0-9_-]+`, such as `/help` or `/review the diff ...`) is
+/// an instruction to the host, not a question: it never triggers retrieval, however long.
+/// A path such as `/usr/bin` or `/ not a command` is not one only if it does not start
+/// with a slash followed directly by a letter, digit, `_` or `-`.
+pub fn is_slash_command(prompt: &str) -> bool {
+    let mut chars = prompt.chars();
+    chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 pub fn is_memory_disabled(cwd: Option<&str>, ignore_dirs: &[String]) -> bool {
@@ -507,6 +517,19 @@ pub fn should_inject_and_mark(
     node_id: u64,
     reset_every_n_chunks: u32,
 ) -> Result<bool, String> {
+    should_inject_and_mark_version(db, session_id, node_id, reset_every_n_chunks, 0)
+}
+
+/// Like [`should_inject_and_mark`], with the note's last-update time: a note that was
+/// updated after it was injected in this epoch is injected again (the model saw the old
+/// text), once per update.
+pub fn should_inject_and_mark_version(
+    db: &Database,
+    session_id: &str,
+    node_id: u64,
+    reset_every_n_chunks: u32,
+    note_version: u64,
+) -> Result<bool, String> {
     let divisor = reset_every_n_chunks.max(1);
     let w = db.begin_write().map_err(|e| e.to_string())?;
     let should_inject = {
@@ -521,11 +544,18 @@ pub fn should_inject_and_mark(
             .unwrap_or(0);
         let epoch = total_chunks / divisor;
         let key = format!("{}:{session_id}:{epoch}:{node_id}", session_id.len());
-        if inj.get(key.as_str()).map_err(|e| e.to_string())?.is_some() {
-            false
-        } else {
-            inj.insert(key.as_str(), b"1".as_slice()).map_err(|e| e.to_string())?;
-            true
+        // The value is the note version last injected (older entries hold a marker byte,
+        // read as version 0).
+        let seen = inj
+            .get(key.as_str())
+            .map_err(|e| e.to_string())?
+            .map(|v| <[u8; 8]>::try_from(v.value()).map(u64::from_le_bytes).unwrap_or(0));
+        match seen {
+            Some(version) if version >= note_version => false,
+            _ => {
+                inj.insert(key.as_str(), note_version.to_le_bytes().as_slice()).map_err(|e| e.to_string())?;
+                true
+            }
         }
     };
     w.commit().map_err(|e| e.to_string())?;
@@ -567,6 +597,56 @@ mod tests {
         assert!(should_retrieve_for_prompt(&"a".repeat(100)));
         assert!(!should_retrieve_for_prompt(&format!(" {} ", "a".repeat(99))));
         assert!(should_retrieve_for_prompt(&"é".repeat(100)));
+    }
+
+    #[test]
+    fn idle_sweep_leaves_a_scroll_of_44_messages_and_chunks_one_of_45() {
+        let path = std::env::temp_dir().join(format!("memb_scroll_idle_floor_{}.redb", now_ms()));
+        let db = Database::create(&path).unwrap();
+        for i in 0..44 {
+            assert!(append_message(&db, "small", "cc", Role::User, format!("m{i}"), true).unwrap().is_none());
+        }
+        for i in 0..45 {
+            assert!(append_message(&db, "big", "cc", Role::User, format!("m{i}"), true).unwrap().is_none());
+        }
+        let later = now_ms() + DEFAULT_IDLE_MS + 1000;
+        // Not idle for a day yet: nothing, whatever the size.
+        assert!(sweep_idle_scrolls(&db, now_ms(), DEFAULT_IDLE_MS).unwrap().is_empty());
+        let swept = sweep_idle_scrolls(&db, later, DEFAULT_IDLE_MS).unwrap();
+        assert_eq!(swept.len(), 1);
+        assert_eq!((swept[0].session_id.as_str(), swept[0].messages.len()), ("big", 45));
+        assert_eq!(read_scroll(&db, "small").unwrap().unwrap().messages.len(), 44);
+        assert_eq!(read_scroll(&db, "big").unwrap().unwrap().messages.len(), SCROLL_RETAIN_TAIL);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn slash_commands_never_trigger_retrieval_however_long() {
+        assert!(!should_retrieve_for_prompt("/help"));
+        let long_command = format!("/review {}", "check the diff carefully ".repeat(8));
+        assert!(long_command.chars().count() > 100);
+        assert!(!should_retrieve_for_prompt(&long_command));
+        assert!(!should_retrieve_for_prompt(&format!("  /compact {}", "x".repeat(150))));
+        assert!(!should_retrieve_for_prompt(&format!("/my_skill-2 {}", "x".repeat(150))));
+        // Not commands: a sentence that merely contains a slash, a lone slash, a slash then space.
+        assert!(should_retrieve_for_prompt(&format!("how does a/b work {}", "x".repeat(100))));
+        assert!(should_retrieve_for_prompt(&format!("/ {}", "x".repeat(120))));
+        assert!(should_retrieve_for_prompt(&format!("what is /help {}", "x".repeat(100))));
+    }
+
+    #[test]
+    fn an_updated_note_is_injected_again_in_the_same_epoch_once_per_update() {
+        let path = std::env::temp_dir().join(format!("memb_scroll_reinject_{}.redb", now_ms()));
+        let db = Database::create(&path).unwrap();
+        assert!(should_inject_and_mark_version(&db, "s1", 7, 7, 100).unwrap());
+        assert!(!should_inject_and_mark_version(&db, "s1", 7, 7, 100).unwrap(), "unchanged: not again");
+        assert!(should_inject_and_mark_version(&db, "s1", 7, 7, 101).unwrap(), "updated: again");
+        assert!(!should_inject_and_mark_version(&db, "s1", 7, 7, 101).unwrap(), "once per update");
+        assert!(!should_inject_and_mark_version(&db, "s1", 7, 7, 90).unwrap(), "an older version never re-injects");
+        assert!(should_inject_and_mark_version(&db, "s1", 8, 7, 5).unwrap(), "another note is independent");
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

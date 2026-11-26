@@ -705,7 +705,7 @@ fn hook(event: &str, cli: &str) -> Result<(), String> {
         if memb_core::reject_secrets(&text).is_err() {
             continue;
         }
-        if store.with_db(|db| memb_scroll::should_inject_and_mark(db, &session, note.id, limits.dedup_reset_chunks))? {
+        if store.with_db(|db| memb_scroll::should_inject_and_mark_version(db, &session, note.id, limits.dedup_reset_chunks, note.updated_at_ms))? {
             selected.push(note);
         }
     }

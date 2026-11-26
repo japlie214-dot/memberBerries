@@ -155,6 +155,41 @@ fn retrieval_output_matches_each_hosts_contract_and_is_deduplicated() {
     assert_eq!(e.capture("cc", "prompt-submit", &short).0, "");
 }
 
+#[test]
+fn a_long_slash_command_is_captured_but_never_retrieves_and_an_updated_note_comes_again() {
+    let e = Env::new("slash-update");
+    let store = Store::open(&e.data).unwrap();
+    let note = store
+        .remember(Draft {
+            title: "orchard irrigation".into(),
+            desc: "water the orchard each friday morning".into(),
+            kind: Kind::Topic,
+            parents: vec![],
+            properties: BTreeMap::new(),
+        })
+        .unwrap();
+    drop(store);
+    let question = format!("{} orchard irrigation schedule question", "please remind me about the ".repeat(4));
+    let command = format!("/review {question}");
+    assert!(command.chars().count() >= 100);
+    let payload = |prompt: &str| json!({"session_id": "s", "cwd": cwd(&e), "prompt": prompt});
+    // The slash command would match the note by words and is long enough, but it is a command.
+    assert_eq!(e.capture("cc", "prompt-submit", &payload(&command)).0, "");
+    assert_eq!(e.messages("cc_s").len(), 1, "it is still recorded in the scroll");
+    // The same words as a plain question retrieve the note, once.
+    assert!(e.capture("cc", "prompt-submit", &payload(&question)).0.contains("orchard irrigation"));
+    assert_eq!(e.capture("cc", "prompt-submit", &payload(&question)).0, "");
+    // After the note is updated, the same session gets the new text in the same epoch.
+    let store = Store::open(&e.data).unwrap();
+    store
+        .update(note.id, memb_core::NotePatch { desc: Some("water the orchard every thursday evening".into()), ..Default::default() })
+        .unwrap();
+    drop(store);
+    let again = e.capture("cc", "prompt-submit", &payload(&question)).0;
+    assert!(again.contains("thursday evening"), "{again}");
+    assert_eq!(e.capture("cc", "prompt-submit", &payload(&question)).0, "");
+}
+
 // ---- Antigravity ------------------------------------------------------------------------
 
 struct Agy {
@@ -280,4 +315,24 @@ fn antigravity_real_layout_transcript_full_and_wrapped_user_request() {
     let before = e.messages("agy_conv-real").len();
     let _ = e.capture("agy", "assistant-stop", &stop(&e, &a, &other, true));
     assert_eq!(e.messages("agy_conv-real").len(), before);
+}
+
+/// Seeds a data directory with notes for the hook latency measurement (T019). Not a test:
+/// `MEMB_T019_SEED=<dir> cargo test -p memb --test hooks t019_seed -- --ignored`
+#[test]
+#[ignore]
+fn t019_seed() {
+    let Ok(dir) = std::env::var("MEMB_T019_SEED") else { return };
+    let store = Store::open(std::path::Path::new(&dir)).unwrap();
+    for i in 0..500 {
+        store
+            .remember(Draft {
+                title: format!("orchard irrigation topic {i}"),
+                desc: format!("water the orchard row {i} each friday morning and check the drip lines for leaks"),
+                kind: Kind::Topic,
+                parents: vec![],
+                properties: BTreeMap::new(),
+            })
+            .unwrap();
+    }
 }

@@ -260,6 +260,21 @@ mod tests {
     }
 
     #[test]
+    fn phase_1_checklist_catch_up_after_25_hours_and_the_15_45_target() {
+        let last = 1_000_000_000u64;
+        let h = 3600 * 1000;
+        // Last success 25 hours ago: overdue, so it runs at any time of day, 07:00 or the
+        // 15:40 wake that is before the 15:45 target.
+        assert!(should_run_daily_routine(last + 25 * h, last, 7, 0));
+        assert!(should_run_daily_routine(last + 25 * h, last, 15, 40));
+        // Only 21 hours ago (cooldown of 20 h passed, not yet overdue): waits for 15:45.
+        assert!(!should_run_daily_routine(last + 21 * h, last, 15, 40));
+        assert!(should_run_daily_routine(last + 21 * h, last, 15, 45));
+        // 19 hours ago: the cooldown has not passed, so not even at the target time.
+        assert!(!should_run_daily_routine(last + 19 * h, last, 15, 45));
+    }
+
+    #[test]
     fn scheduler_boundaries_and_bad_clocks() {
         let last = 100_000_000;
         assert!(!should_run_daily_routine(last + MIN_COOLDOWN_MS - 1, last, 23, 59));
