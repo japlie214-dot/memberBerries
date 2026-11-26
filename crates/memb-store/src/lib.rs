@@ -981,6 +981,24 @@ impl Store {
         w.commit().map_err(|e| e.to_string())
     }
 
+    /// The ids that are active notes right now, in the given order (point reads).
+    pub fn filter_active(&self, ids: &[u64]) -> Result<Vec<u64>, String> {
+        let _lock = acquire_os_lock(&self.root)?;
+        let db = self.open_db()?;
+        let r = db.begin_read().map_err(|e| e.to_string())?;
+        let notes = r.open_table(NOTES_TABLE).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for &id in ids {
+            if let Some(v) = notes.get(id).map_err(|e| e.to_string())? {
+                let n: Note = serde_json::from_slice(v.value()).map_err(|e| e.to_string())?;
+                if n.status == NoteStatus::Active {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// One-hop expansion of retrieval seeds without reading every note: the seeds first, then
     /// for each seed a claim adds its active parent knowledge and a knowledge note adds up to
     /// `CLAIMS_PER_KNOWLEDGE` of its active claims, through the adjacency index and point reads.
@@ -1242,6 +1260,7 @@ mod tests {
         // A claim brings its parent knowledge; a seed that is not active, or does not exist, brings nothing.
         assert_eq!(store.expand_one_hop(&[claims[5]], 8).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![claims[5], k.id]);
         assert!(store.expand_one_hop(&[9999], 8).unwrap().is_empty());
+        assert_eq!(store.filter_active(&[claims[5], 9999, k.id]).unwrap(), vec![claims[5], k.id]);
         assert_eq!(store.expand_one_hop(&[other.id], 8).unwrap().len(), 1);
         assert_eq!(full_scan_count(), before, "no expansion read every note");
         assert_eq!(store.kb_version().unwrap(), version, "reads do not change the version");

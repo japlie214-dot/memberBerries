@@ -372,6 +372,8 @@ fn fuse(
             .collect();
         vec_scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let vector_ids: Vec<u64> = vec_scored.into_iter().take(10).map(|(_, id)| id).collect();
+        // A note retracted after the hot set was built must not take a seed slot.
+        let vector_ids = if index_is_active { store.filter_active(&vector_ids)? } else { vector_ids };
         reciprocal_rank_fusion(&lexical_ids, &vector_ids, 5)
     } else {
         lexical_ids.into_iter().take(5).collect()
@@ -522,9 +524,17 @@ mod tests {
                 properties: Default::default(),
             })
             .unwrap();
-        // Port 1 accepts no connection: any attempt to embed would fail loudly or hang the test.
-        let found = search_with_server(&store, "apples", 1, None).unwrap();
+        // A listener that records every connection: lexical-only means nobody connects.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let found = search_with_server(&store, "apples", port, None).unwrap();
         assert_eq!(found.len(), 1);
+        assert!(listener.accept().is_err(), "no embedding request may be sent without a model identity");
+        // Control: with a model identity the same call does connect (and then falls back to lexical).
+        let found = search_with_server(&store, "apples", port, Some("m")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(listener.accept().is_ok(), "the control must reach the listener, or the check above proves nothing");
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

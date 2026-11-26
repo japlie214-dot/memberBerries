@@ -5,6 +5,11 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.8.1 (2026-11-26)
+
+- Retrieval: a note retracted after the hot set was built no longer takes one of the five search seeds (the vector candidates are checked against the live notes with point reads).
+- Tests: the "no model identity" check now proves no connection is made to the embedding server, with a control that does connect.
+
 ## 0.8.0 (2026-11-26)
 
 - **Retrieval caches:** the knowledge base has a version; the i8 hot working set is kept in memory and persisted with the version it was built at, so a search with an unchanged base reads and embeds nothing. Document vectors use a stable SHA-256 content key (model, truncation, title, description) instead of the note id plus a `DefaultHasher` fingerprint; unchanged notes are never embedded again and identical text shares a vector. Old cache tables are dropped.

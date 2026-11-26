@@ -1,6 +1,6 @@
 {
   "name": "memb",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Unified local memory graph with a read-only web inspector. Requires access to the Windows runtime.",
   "mcpServers": "./.mcp.json",
   "hooks": "./hooks/hooks.json"
