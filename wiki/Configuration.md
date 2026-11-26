@@ -46,6 +46,7 @@ memb runs without any configuration. To change a limit, put a `config.toml` next
 | `embeddings.binary`, `embeddings.model_path` | memb never starts an embedding server. Start `llama-server` yourself and set `embeddings.port`, or use `embeddings.gemma_model_dir`. These keys fail with a message saying so. |
 | `curator.backend` other than `cli`, or curator thresholds other than 0.72 and 0.70 | Only the command-line backend exists, and the thresholds are fixed. Other values fail with a message instead of being ignored. |
 | `storage.max_notes` above 50000 | The built-in limit is a hard cap. |
+| `curator.cli_protocol` | Briefly present on the `build/memb` branch (commit e07ae19) and removed: memb now speaks agy's stream protocol whenever the command's program is `agy`. A `config.toml` that still has it fails with an unknown-key message; delete the line. |
 
 ## Privacy
 

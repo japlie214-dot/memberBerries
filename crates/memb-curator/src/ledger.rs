@@ -254,14 +254,15 @@ mod tests {
     use serde_json::json;
 
     fn db() -> (Database, std::path::PathBuf) {
+        // A counter, not the clock: two tests started in the same clock tick must not
+        // share a file name.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let p = std::env::temp_dir().join(format!(
             "memb_ledger_{}_{}.redb",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
+        let _ = std::fs::remove_file(&p);
         (Database::create(&p).unwrap(), p)
     }
 
