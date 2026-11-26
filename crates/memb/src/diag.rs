@@ -168,6 +168,22 @@ fn hook_files_check() -> Check {
     }
 }
 
+/// The hint when no backend is configured: which build fits this machine, or that none does.
+fn memb_embed_hint() -> String {
+    let hw = memb_win::probe_hardware();
+    match crate::models::recommend(&hw) {
+        Ok(v) => format!(
+            "no embedding backend: lexical-only search. `memb models install` downloads the EmbeddingGemma 2 {} build ({:.0} MB, verified, {}-wide vectors) that fits this machine, and memb then uses it automatically",
+            v.name(),
+            v.manifest().total_bytes() as f64 / 1e6,
+            v.mrl_dim()
+        ),
+        Err(reason) => format!(
+            "no embedding backend: lexical-only search, and this machine is below the floor for a local model ({reason})"
+        ),
+    }
+}
+
 fn embedding_check() -> Check {
     if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1") {
         return Check::new("embeddings", Status::Info, "disabled: lexical-only search");
@@ -196,7 +212,7 @@ fn embedding_check() -> Check {
         None => Check::new(
             "embeddings",
             Status::Info,
-            "no embedding backend: lexical-only search. `memb models install` downloads EmbeddingGemma 2 (207 MB, verified) and memb then uses it automatically",
+            memb_embed_hint(),
         ),
     }
 }

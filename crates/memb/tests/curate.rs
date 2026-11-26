@@ -548,6 +548,71 @@ fn real_codex_summarizes_and_proposes_through_memb_curate() {
     let _ = topic;
 }
 
+/// The durability gate on a real model: two sessions that both open with a standing-sounding
+/// directive, one about a durable release policy and one about a throwaway scratch value.
+/// The durable one must produce a proposal that cites its chunk; the throwaway one must not.
+/// `cargo test -p memb --test curate real_agy_defers -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn real_agy_defers_a_throwaway_fact_and_proposes_a_durable_one() {
+    let dir = Dir::new("realdefer", "");
+    let store = dir.store();
+    store
+        .remember(Draft {
+            title: "Release process".into(),
+            desc: "How releases are cut".into(),
+            kind: Kind::Topic,
+            parents: vec![],
+            properties: Default::default(),
+        })
+        .unwrap();
+    std::fs::write(dir.0.join("config.toml"), "[scroll]\nmax_messages = 10\nretain_tail = 2\n").unwrap();
+    let limits = ScrollLimits { max_messages: 10, retain_tail: 2, ..ScrollLimits::default() };
+    let fill = |session: &str, first: &str, rest: &[&str]| {
+        for i in 0..10 {
+            let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+            let content = if i == 0 { first.to_string() } else { rest[(i - 1) % rest.len()].to_string() };
+            store
+                .with_db(|db| memb_scroll::append_message_with(db, session, "cc", role, content, true, &limits))
+                .unwrap();
+        }
+    };
+    fill(
+        "durable",
+        "From now on, always run the release gate before tagging any release; this is our standing release policy.",
+        &[
+            "Understood: the gate runs the unit tests, the package build and the changelog check before every tag.",
+            "Good. A release that skipped the gate must be treated as not released, and this applies to every future release.",
+            "Noted: I will document the gate in the release process and refuse to tag without it.",
+        ],
+    );
+    fill(
+        "scratch",
+        "From now on until I say stop, use 7 as the thread count for this throwaway experiment; it is only a test value.",
+        &[
+            "Set the scratch thread count to 7 in the temp file C:\\tmp\\scratch.txt for this one experiment.",
+            "Run it once and print the number. I will delete the scratch file after lunch.",
+            "Done, the experiment finished and there is nothing to keep from it.",
+        ],
+    );
+    let started = std::time::Instant::now();
+    let out = dir.run(&["curate"], "");
+    println!("elapsed: {:?}\nstderr: {}\nstdout: {}", started.elapsed(), text(&out.stderr), text(&out.stdout));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let summary = json_line(&out.stdout);
+    assert_eq!(summary["packets"], 2, "both chunks must reach the model, or the gate is not exercised: {summary}");
+    // A scratch proposal dropped as invalid would also count as "none": nothing may be skipped.
+    assert_eq!(summary["skipped"], 0, "{summary}");
+    let pending = dir
+        .store()
+        .with_db(|db| memb_curator::ledger::list(db, Some(&memb_curator::ledger::Status::Pending), 50))
+        .unwrap();
+    let cites = |session: &str| pending.iter().filter(|p| p.sources.iter().any(|(s, _)| s == session)).count();
+    println!("proposals citing the durable chunk: {}, the scratch chunk: {}", cites("durable"), cites("scratch"));
+    assert!(cites("durable") >= 1, "a durable release policy should be proposed: {pending:?}");
+    assert_eq!(cites("scratch"), 0, "a throwaway test value must be deferred: {pending:?}");
+}
+
 /// The real run with the shipped defaults: agy (gemini-4-hydrogen-medium) first, Codex as
 /// the fallback. `cargo test -p memb --test curate real_agy -- --ignored --nocapture`
 #[test]

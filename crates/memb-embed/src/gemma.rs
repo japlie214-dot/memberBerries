@@ -28,18 +28,28 @@ fn tokens(values: &[u32], query: bool) -> Vec<i64> {
     values
 }
 
-const FILES: [&str; 3] = [
-    "tokenizer.json",
-    "onnx/model_q4.onnx",
-    "onnx/model_q4.onnx_data",
+/// The two ONNX variants the loader accepts (one per model directory): the 4-bit one and
+/// the 8-bit one. The directory decides; the file names and sizes are part of the identity.
+const VARIANTS: [[&str; 3]; 2] = [
+    ["tokenizer.json", "onnx/model_q4.onnx", "onnx/model_q4.onnx_data"],
+    ["tokenizer.json", "onnx/model_quantized.onnx", "onnx/model_quantized.onnx_data"],
 ];
+
+/// The files of the variant present in `directory` (the 4-bit one when neither is, so
+/// that a missing model is reported by its default file names).
+fn files(directory: &Path) -> &'static [&'static str; 3] {
+    VARIANTS
+        .iter()
+        .find(|v| directory.join(v[1]).is_file())
+        .unwrap_or(&VARIANTS[0])
+}
 // Increment when tokenization, pooling, normalization or output semantics change.
 const CONTRACT: &str =
     "gemma-text-v2:document-title-text:sentence_embedding:l2:query-head30-tail70-512";
 
 type FileStamp = Vec<(u64, SystemTime)>;
 fn file_stamp(directory: &Path) -> Result<FileStamp, String> {
-    FILES
+    files(directory)
         .iter()
         .map(|file| {
             let meta = std::fs::metadata(directory.join(file))
@@ -58,7 +68,7 @@ fn model_identity(directory: &Path) -> Result<String, String> {
     hash.update(QUERY_PREFIX.as_bytes());
     hash.update((MAX_TOKENS as u64).to_le_bytes());
     hash.update((QUERY_MAX_TOKENS as u64).to_le_bytes());
-    for file in FILES {
+    for file in files(directory) {
         hash.update(file.as_bytes());
         let mut reader = std::fs::File::open(directory.join(file)).map_err(|e| e.to_string())?;
         hash.update(
@@ -131,7 +141,7 @@ impl GemmaEmbedder {
             .map_err(|e| e.to_string())?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| e.to_string())?
-            .commit_from_file(self.directory.join("onnx/model_q4.onnx"))
+            .commit_from_file(self.directory.join(files(&self.directory)[1]))
             .map_err(|e| format!("cannot load ONNX model: {e}"))?;
         if file_stamp(&self.directory)? != stamp {
             return Err("model files changed while loading".into());
@@ -249,17 +259,37 @@ mod tests {
     fn identity_changes_for_each_model_file() {
         let dir = std::env::temp_dir().join(format!("memb-gemma-identity-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("onnx")).unwrap();
-        for file in FILES {
+        for file in VARIANTS[0] {
             std::fs::write(dir.join(file), b"synthetic").unwrap();
         }
         let initial = model_identity(&dir).unwrap();
         assert_eq!(initial, model_identity(&dir).unwrap());
-        for file in FILES {
+        for file in VARIANTS[0] {
             std::fs::write(dir.join(file), b"changed synthetic").unwrap();
             assert_ne!(initial, model_identity(&dir).unwrap());
             std::fs::write(dir.join(file), b"synthetic").unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn the_variant_present_in_a_directory_decides_which_files_are_used() {
+        let base = std::env::temp_dir().join(format!("memb-gemma-variant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (q4, q8, none) = (base.join("q4"), base.join("q8"), base.join("none"));
+        for (dir, variant) in [(&q4, 0), (&q8, 1)] {
+            std::fs::create_dir_all(dir.join("onnx")).unwrap();
+            for file in VARIANTS[variant] {
+                std::fs::write(dir.join(file), b"same bytes").unwrap();
+            }
+        }
+        std::fs::create_dir_all(&none).unwrap();
+        assert_eq!(files(&q4)[1], "onnx/model_q4.onnx");
+        assert_eq!(files(&q8)[1], "onnx/model_quantized.onnx");
+        assert_eq!(files(&none)[1], "onnx/model_q4.onnx", "a missing model is reported by the default names");
+        assert!(file_stamp(&q8).is_ok() && file_stamp(&none).is_err());
+        // Identical bytes in the two variants still give different identities (so vectors never mix).
+        assert_ne!(model_identity(&q4).unwrap(), model_identity(&q8).unwrap());
+        std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
     fn missing_model_returns_error() {

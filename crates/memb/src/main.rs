@@ -525,11 +525,13 @@ fn ensure_embedding_model(root: &Path, cfg: &config::Config) {
     {
         return;
     }
-    let manifest = models::Manifest::embeddinggemma();
-    let dir = models::default_dir(root);
-    if models::is_complete(&dir, &manifest) {
+    // The build that fits this machine; a machine below the floor downloads nothing.
+    let hw = memb_win::probe_hardware();
+    let Ok(variant) = models::recommend(&hw) else { return };
+    if models::installed_variant(root, &hw).is_some() {
         return;
     }
+    let (manifest, dir) = (variant.manifest(), models::variant_dir(root, variant));
     let mut log = Vec::new();
     match models::install(&dir, &manifest, false, &mut log) {
         Ok(n) => {

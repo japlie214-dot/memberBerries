@@ -5,6 +5,11 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.10.0 (2026-11-26)
+
+- **Hardware-aware model build (Phase 2 tiers):** `memb models install` picks the EmbeddingGemma 2 build that fits the machine: 4-bit with 256-wide vectors on a weaker machine, 8-bit with 512-wide vectors with AVX2 or AVX-512, 8 physical cores and 16 GB. A machine below the floor (no AVX2 with FMA or AVX-512, or under 8 GB RAM) is told so; `--variant q4|int8` overrides. memb uses the installed build and its paired width automatically (a width you set in `embeddings.mrl_dim` wins). `memb models status` and `memb doctor` show the machine and the recommendation. The in-process loader accepts either build.
+- **Curator prompt:** adds the Phase 3 rubric: defer what will not matter in two weeks, do not repeat numbers a claim already carries, prefer a claim over a longer description.
+
 ## 0.9.0 (2026-11-26)
 
 - **EmbeddingGemma 2 install pipeline:** `memb models install | status [--verify] | remove`. One consent step, a pinned Hugging Face revision, size and SHA-256 verification, resume after interruption, files visible only once verified. When the model is installed and no other backend is chosen, memb uses it with no configuration. `embeddings.auto_download = true` lets the daily routine fetch it. `memb doctor` reports the model and points to the command.

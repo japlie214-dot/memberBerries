@@ -28,29 +28,90 @@ pub struct Manifest {
     pub files: Vec<ModelFile>,
 }
 
-impl Manifest {
-    /// The pinned revision. Sizes and hashes come from the repository's file listing at
-    /// that revision; the in-process loader (`memb-embed`) needs exactly these three files.
-    pub fn embeddinggemma() -> Self {
-        let file = |path: &str, size: u64, sha256: &str| ModelFile { path: path.into(), size, sha256: sha256.into() };
-        Self {
-            base_url: format!("https://huggingface.co/{REPOSITORY}/resolve/{REVISION}"),
-            files: vec![
-                file("tokenizer.json", 32_170_510, "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"),
-                file("onnx/model_q4.onnx", 490_742, "f9eeba97acddf139b8ee2ddf04bc30dceafa88de93fadf74d7644e0d61a477a9"),
-                file("onnx/model_q4.onnx_data", 174_028_800, "c3975f2d1ab7a1878ae31a7d7a9b7804a827aff3800b60dfceafce21cac3df49"),
-            ],
+/// Which ONNX build of the model. The 4-bit one is the small, fast one (Phase 2 `CpuLite`,
+/// 256-wide vectors); the 8-bit one is larger and more precise (`CpuBalanced`, 512-wide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    Q4,
+    Int8,
+}
+
+impl Variant {
+    pub const ALL: [Variant; 2] = [Variant::Q4, Variant::Int8];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Variant::Q4 => "q4",
+            Variant::Int8 => "int8",
         }
     }
 
+    pub fn parse(text: &str) -> Option<Variant> {
+        Variant::ALL.into_iter().find(|v| v.name() == text)
+    }
+
+    /// The vector width this variant is paired with (Phase 2 tiers).
+    pub fn mrl_dim(self) -> usize {
+        match self {
+            Variant::Q4 => memb_win::Tier::CpuLite.mrl_dim(),
+            Variant::Int8 => memb_win::Tier::CpuBalanced.mrl_dim(),
+        }
+    }
+
+    pub fn manifest(self) -> Manifest {
+        let file = |path: &str, size: u64, sha256: &str| ModelFile { path: path.into(), size, sha256: sha256.into() };
+        let tokenizer = file("tokenizer.json", 32_170_510, "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4");
+        let files = match self {
+            Variant::Q4 => vec![
+                tokenizer,
+                file("onnx/model_q4.onnx", 490_742, "f9eeba97acddf139b8ee2ddf04bc30dceafa88de93fadf74d7644e0d61a477a9"),
+                file("onnx/model_q4.onnx_data", 174_028_800, "c3975f2d1ab7a1878ae31a7d7a9b7804a827aff3800b60dfceafce21cac3df49"),
+            ],
+            Variant::Int8 => vec![
+                tokenizer,
+                file("onnx/model_quantized.onnx", 495_165, "d06edd601f851c633a2519304cbeb8dc6170d7ceb61b436625c17fb9b6e74953"),
+                file("onnx/model_quantized.onnx_data", 313_724_928, "278a7ff1248c3618e4bd11a607fc54f7bdc7778854230f3956d3f86bd9db4f3b"),
+            ],
+        };
+        Manifest { base_url: format!("https://huggingface.co/{REPOSITORY}/resolve/{REVISION}"), files }
+    }
+}
+
+/// The variant that fits this machine, or why none does (see `memb_win::plan_local`).
+pub fn recommend(hw: &memb_win::Hardware) -> Result<Variant, &'static str> {
+    match memb_win::plan_local(hw) {
+        memb_win::LocalPlan::Local(memb_win::Tier::CpuLite) => Ok(Variant::Q4),
+        memb_win::LocalPlan::Local(memb_win::Tier::CpuBalanced) => Ok(Variant::Int8),
+        memb_win::LocalPlan::Unsupported(reason) => Err(reason),
+    }
+}
+
+impl Manifest {
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
 }
 
 /// Where the model is kept: inside the data directory, so uninstalling the data removes it too.
-pub fn default_dir(root: &Path) -> PathBuf {
-    root.join("models").join("embeddinggemma-2")
+/// One directory per variant; the 4-bit one keeps the plain name.
+pub fn variant_dir(root: &Path, variant: Variant) -> PathBuf {
+    match variant {
+        Variant::Q4 => root.join("models").join("embeddinggemma-2"),
+        Variant::Int8 => root.join("models").join("embeddinggemma-2-int8"),
+    }
+}
+
+/// The complete installed variant memb should use: the one that fits this machine if it is
+/// installed, otherwise any other complete one (for example a build the user chose to
+/// install with `--variant` on a machine below the floor).
+pub fn installed_variant(root: &Path, hw: &memb_win::Hardware) -> Option<(Variant, PathBuf)> {
+    let preferred = recommend(hw).ok();
+    let mut order: Vec<Variant> = preferred.into_iter().collect();
+    order.extend(Variant::ALL.into_iter().filter(|v| Some(*v) != preferred));
+    order.into_iter().find_map(|v| {
+        let dir = variant_dir(root, v);
+        is_complete(&dir, &v.manifest()).then_some((v, dir))
+    })
 }
 
 fn file_path(dir: &Path, file: &ModelFile) -> PathBuf {
@@ -75,9 +136,12 @@ pub fn apply_default(root: &Path) {
     {
         return;
     }
-    let dir = default_dir(root);
-    if is_complete(&dir, &Manifest::embeddinggemma()) {
+    if let Some((variant, dir)) = installed_variant(root, &memb_win::probe_hardware()) {
         std::env::set_var("MEMB_GEMMA_MODEL_DIR", dir);
+        // The vector width paired with the variant, unless the user chose one.
+        if !set("MEMB_EMBED_MRL_DIM") {
+            std::env::set_var("MEMB_EMBED_MRL_DIM", variant.mrl_dim().to_string());
+        }
     }
 }
 
@@ -196,44 +260,111 @@ fn confirm(prompt: &str) -> bool {
     stdin.lock().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("yes")
 }
 
+/// Which variant `install` should fetch: the one asked for with `--variant`, otherwise the
+/// one that fits this machine. A machine below the floor gets an explanation, not a model
+/// that cannot serve a search (the user can still ask for one with `--variant`).
+pub fn plan_install(hw: &memb_win::Hardware, requested: Option<Variant>) -> Result<Variant, String> {
+    match (requested, recommend(hw)) {
+        (Some(v), _) => Ok(v),
+        (None, Ok(v)) => Ok(v),
+        (None, Err(reason)) => Err(format!(
+            "this machine cannot run EmbeddingGemma 2 well: {reason}. Pass --variant q4 to install the smallest build anyway"
+        )),
+    }
+}
+
+fn describe(hw: &memb_win::Hardware) -> String {
+    let plan = match memb_win::plan_local(hw) {
+        memb_win::LocalPlan::Local(tier) => match recommend(hw) {
+            Ok(v) => format!("tier {tier:?}: recommended build {} with {}-wide vectors", v.name(), v.mrl_dim()),
+            Err(_) => format!("tier {tier:?}"),
+        },
+        memb_win::LocalPlan::Unsupported(reason) => format!("below the floor for a local model: {reason}"),
+    };
+    format!(
+        "{} physical cores, {} MiB RAM, AVX-512 {}, AVX2+FMA {}; {plan}",
+        hw.physical_cores, hw.total_ram_mib, hw.avx512, hw.avx2_fma
+    )
+}
+
 /// `memb models status|install|remove`. Returns the exit code.
 pub fn run(root: &Path, args: &[String]) -> i32 {
-    let manifest = Manifest::embeddinggemma();
-    let dir = default_dir(root);
-    let usage = "Usage: memb models status [--verify] | install [--yes] | remove [--yes]";
-    let yes = args.iter().any(|a| a == "--yes");
-    let verify = args.iter().any(|a| a == "--verify");
-    let known = |flag: &str| matches!(flag, "--yes" | "--verify");
-    if args.is_empty() || args[1..].iter().any(|a| !known(a)) {
+    let usage = "Usage: memb models status [--verify] | install [--variant q4|int8] [--yes] | remove [--yes]";
+    let mut yes = false;
+    let mut verify = false;
+    let mut requested: Option<Variant> = None;
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--yes" => yes = true,
+            "--verify" => verify = true,
+            "--variant" => match rest.next().and_then(|v| Variant::parse(v)) {
+                Some(v) => requested = Some(v),
+                None => {
+                    eprintln!("memb: --variant takes q4 or int8\n{usage}");
+                    return 2;
+                }
+            },
+            _ => {
+                eprintln!("{usage}");
+                return 2;
+            }
+        }
+    }
+    let Some(command) = args.first() else {
         eprintln!("{usage}");
         return 2;
-    }
-    match args[0].as_str() {
+    };
+    let hw = memb_win::probe_hardware();
+    match command.as_str() {
         "status" => {
-            println!("EmbeddingGemma 2 (ONNX q4), revision {REVISION}");
-            println!("directory: {}", dir.display());
-            let states = inspect(&dir, &manifest, verify);
-            for (path, state) in &states {
-                let text = match state {
-                    FileState::Missing => "missing".to_string(),
-                    FileState::WrongSize(n) => format!("wrong size ({n} bytes)"),
-                    FileState::Present => "present (size matches; use --verify to check the content)".to_string(),
-                    FileState::Verified => "verified (SHA-256 matches)".to_string(),
-                    FileState::Corrupt => "CORRUPT (SHA-256 does not match)".to_string(),
-                };
-                println!("  {path}: {text}");
+            println!("EmbeddingGemma 2 (ONNX), revision {REVISION}");
+            println!("this machine: {}", describe(&hw));
+            for variant in Variant::ALL {
+                let (dir, manifest) = (variant_dir(root, variant), variant.manifest());
+                println!("{} ({:.0} MB, {}-wide vectors): {}", variant.name(), manifest.total_bytes() as f64 / 1e6, variant.mrl_dim(), dir.display());
+                for (path, state) in inspect(&dir, &manifest, verify) {
+                    let text = match state {
+                        FileState::Missing => "missing".to_string(),
+                        FileState::WrongSize(n) => format!("wrong size ({n} bytes)"),
+                        FileState::Present => "present (size matches; use --verify to check the content)".to_string(),
+                        FileState::Verified => "verified (SHA-256 matches)".to_string(),
+                        FileState::Corrupt => "CORRUPT (SHA-256 does not match)".to_string(),
+                    };
+                    println!("  {path}: {text}");
+                }
             }
-            if is_complete(&dir, &manifest) && !states.iter().any(|(_, s)| *s == FileState::Corrupt) {
-                println!("ready: memb uses this model automatically unless you chose another backend");
-                0
-            } else {
-                println!("not installed: run `memb models install` ({:.0} MB)", manifest.total_bytes() as f64 / 1e6);
-                1
+            match installed_variant(root, &hw) {
+                Some((v, dir)) => {
+                    // The loader does not hash files, so a corrupt file must not be called ready.
+                    if inspect(&dir, &v.manifest(), verify).iter().any(|(_, s)| *s == FileState::Corrupt) {
+                        println!("NOT ready: the {} build in {} has a corrupt file; run `memb models remove` and `memb models install`", v.name(), dir.display());
+                        return 1;
+                    }
+                    println!("ready: memb uses the {} build in {} automatically unless you chose another backend", v.name(), dir.display());
+                    0
+                }
+                None => {
+                    match recommend(&hw) {
+                        Ok(v) => println!("not installed: run `memb models install` (fetches the {} build, {:.0} MB)", v.name(), v.manifest().total_bytes() as f64 / 1e6),
+                        Err(reason) => println!("not installed, and this machine is below the floor for a local model ({reason})"),
+                    }
+                    1
+                }
             }
         }
         "install" => {
+            let variant = match plan_install(&hw, requested) {
+                Ok(v) => v,
+                Err(reason) => {
+                    eprintln!("memb: {reason}");
+                    return 1;
+                }
+            };
+            let (dir, manifest) = (variant_dir(root, variant), variant.manifest());
             println!(
-                "memb will download {} files ({:.0} MB) from {}\nto {}\nEvery file is checked against a pinned size and SHA-256. Nothing else is downloaded.",
+                "memb will download the {} build: {} files ({:.0} MB) from {}\nto {}\nEvery file is checked against a pinned size and SHA-256. Nothing else is downloaded.",
+                variant.name(),
                 manifest.files.len(),
                 manifest.total_bytes() as f64 / 1e6,
                 manifest.base_url,
@@ -245,7 +376,7 @@ pub fn run(root: &Path, args: &[String]) -> i32 {
             }
             match install(&dir, &manifest, std::io::stderr().is_terminal(), &mut std::io::stdout()) {
                 Ok(n) => {
-                    println!("done: {n} file(s) downloaded; memb now uses the model automatically (restart a running memb server or host to pick it up)");
+                    println!("done: {n} file(s) downloaded; memb now uses the model automatically with {}-wide vectors (restart a running memb server or host to pick it up)", variant.mrl_dim());
                     0
                 }
                 Err(reason) => {
@@ -255,24 +386,24 @@ pub fn run(root: &Path, args: &[String]) -> i32 {
             }
         }
         "remove" => {
-            if !dir.exists() {
-                println!("nothing to remove: {} does not exist", dir.display());
+            let present: Vec<PathBuf> = Variant::ALL.into_iter().map(|v| variant_dir(root, v)).filter(|d| d.exists()).collect();
+            if present.is_empty() {
+                println!("nothing to remove: no model directory exists under {}", root.join("models").display());
                 return 0;
             }
-            if !yes && !confirm(&format!("Type yes to delete {}: ", dir.display())) {
+            let list = present.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ");
+            if !yes && !confirm(&format!("Type yes to delete {list}: ")) {
                 eprintln!("memb: not removed (pass --yes to confirm without a prompt)");
                 return 1;
             }
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {
-                    println!("removed {}; search is lexical again unless another backend is configured", dir.display());
-                    0
-                }
-                Err(e) => {
+            for dir in &present {
+                if let Err(e) = std::fs::remove_dir_all(dir) {
                     eprintln!("memb: cannot remove {}: {e}", dir.display());
-                    1
+                    return 1;
                 }
             }
+            println!("removed {list}; search is lexical again unless another backend is configured");
+            0
         }
         _ => {
             eprintln!("{usage}");
@@ -358,7 +489,7 @@ mod tests {
 
     #[test]
     fn the_pinned_manifest_names_exactly_the_files_the_loader_needs() {
-        let m = Manifest::embeddinggemma();
+        let m = Variant::Q4.manifest();
         let paths: Vec<&str> = m.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["tokenizer.json", "onnx/model_q4.onnx", "onnx/model_q4.onnx_data"]);
         assert!(m.base_url.starts_with("https://huggingface.co/") && m.base_url.ends_with(REVISION));
@@ -426,14 +557,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir2);
     }
 
+    fn hw(avx2: bool, avx512: bool, cores: usize, ram_mib: usize) -> memb_win::Hardware {
+        memb_win::Hardware { avx512, avx2_fma: avx2, physical_cores: cores, total_ram_mib: ram_mib }
+    }
+
+    #[test]
+    fn the_variant_follows_the_machine_and_a_machine_below_the_floor_gets_an_explanation() {
+        // (hardware, expected build or reason fragment)
+        let table = [
+            (hw(true, false, 12, 16 * 1024), Ok(Variant::Int8)),   // 8+ cores, 16 GB, AVX2: balanced
+            (hw(false, true, 8, 32 * 1024), Ok(Variant::Int8)),    // AVX-512 only, still balanced
+            (hw(true, false, 12, 15 * 1024), Ok(Variant::Q4)),     // under 16 GB: lite
+            (hw(true, false, 4, 32 * 1024), Ok(Variant::Q4)),      // under 8 cores: lite
+            (hw(true, false, 4, 8 * 1024), Ok(Variant::Q4)),       // exactly 8 GB: lite, still allowed
+            (hw(true, false, 16, 8 * 1024 - 1), Err("RAM")),       // under 8 GB: below the floor
+            (hw(false, false, 16, 32 * 1024), Err("AVX2")),        // no AVX2/FMA or AVX-512: below the floor
+        ];
+        for (hardware, expected) in table {
+            match (recommend(&hardware), expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{hardware:?}"),
+                (Err(reason), Err(fragment)) => assert!(reason.contains(fragment), "{reason}"),
+                (got, want) => panic!("{hardware:?}: got {got:?}, wanted {want:?}"),
+            }
+        }
+        // Each build is paired with its Phase 2 vector width, and they differ.
+        assert_eq!((Variant::Q4.mrl_dim(), Variant::Int8.mrl_dim()), (256, 512));
+        // install without --variant refuses below the floor and says how to override; with it, it proceeds.
+        let weak = hw(false, false, 2, 4 * 1024);
+        let err = plan_install(&weak, None).unwrap_err();
+        assert!(err.contains("cannot run EmbeddingGemma 2 well") && err.contains("--variant q4"), "{err}");
+        assert_eq!(plan_install(&weak, Some(Variant::Q4)).unwrap(), Variant::Q4);
+        assert_eq!(plan_install(&hw(true, false, 12, 16 * 1024), Some(Variant::Q4)).unwrap(), Variant::Q4, "the user's choice wins");
+        assert_eq!(plan_install(&hw(true, false, 12, 16 * 1024), None).unwrap(), Variant::Int8);
+        assert_eq!(Variant::parse("int8"), Some(Variant::Int8));
+        assert_eq!(Variant::parse("q8"), None);
+    }
+
+    #[test]
+    fn status_is_not_ready_when_verification_finds_a_corrupt_file_and_arguments_are_checked() {
+        let _guard = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp("status");
+        // Right sizes, wrong content: present by size, corrupt by hash.
+        let v = Variant::Q4;
+        for f in &v.manifest().files {
+            let p = file_path(&variant_dir(&root, v), f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::File::create(&p).unwrap().set_len(f.size).unwrap();
+        }
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Only the 4-bit build exists, so this is the build status reports on any hardware.
+        assert_eq!(run(&root, &args(&["status"])), 0, "sizes match: ready without hashing");
+        assert_eq!(run(&root, &args(&["status", "--verify"])), 1, "the content does not match the pinned SHA-256");
+        // Argument handling: unknown flags, a missing or unknown --variant value, no command.
+        assert_eq!(run(&root, &args(&["status", "--bogus"])), 2);
+        assert_eq!(run(&root, &args(&["install", "--variant"])), 2);
+        assert_eq!(run(&root, &args(&["install", "--variant", "q8"])), 2);
+        assert_eq!(run(&root, &args(&[])), 2);
+        assert_eq!(run(&root, &args(&["frobnicate"])), 2);
+        // remove deletes the directory only with --yes (a test has no terminal to type in).
+        assert_eq!(run(&root, &args(&["remove"])), 1);
+        assert!(variant_dir(&root, v).exists());
+        assert_eq!(run(&root, &args(&["remove", "--yes"])), 0);
+        assert!(!variant_dir(&root, v).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_pinned_int8_manifest_and_the_installed_variant_choice() {
+        let m = Variant::Int8.manifest();
+        let paths: Vec<&str> = m.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["tokenizer.json", "onnx/model_quantized.onnx", "onnx/model_quantized.onnx_data"]);
+        assert_eq!(m.total_bytes(), 346_390_603);
+        assert!(m.files.iter().all(|f| f.sha256.len() == 64));
+        assert_ne!(variant_dir(Path::new("r"), Variant::Q4), variant_dir(Path::new("r"), Variant::Int8));
+        // A balanced machine prefers int8 when both are present, falls back to q4 when only that is,
+        // and a below-floor machine still uses what the user chose to install.
+        let root = temp("variants");
+        let (balanced, weak) = (hw(true, false, 12, 16 * 1024), hw(false, false, 2, 4 * 1024));
+        assert!(installed_variant(&root, &balanced).is_none());
+        let fill = |v: Variant| {
+            for f in &v.manifest().files {
+                let p = file_path(&variant_dir(&root, v), f);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::File::create(&p).unwrap().set_len(f.size).unwrap();
+            }
+        };
+        fill(Variant::Q4);
+        assert_eq!(installed_variant(&root, &balanced).unwrap().0, Variant::Q4);
+        assert_eq!(installed_variant(&root, &weak).unwrap().0, Variant::Q4);
+        fill(Variant::Int8);
+        assert_eq!(installed_variant(&root, &balanced).unwrap().0, Variant::Int8);
+        assert_eq!(installed_variant(&root, &hw(true, false, 4, 8 * 1024)).unwrap().0, Variant::Q4, "a lite machine prefers q4");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_complete_default_directory_is_used_unless_a_backend_was_chosen() {
         let _guard = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let m = Manifest::embeddinggemma();
+        let m = Variant::Q4.manifest();
         let root = temp("default");
-        let dir = default_dir(&root);
+        let dir = variant_dir(&root, Variant::Q4);
         assert!(dir.ends_with("models\\embeddinggemma-2") || dir.ends_with("models/embeddinggemma-2"));
-        let saved: Vec<_> = ["MEMB_GEMMA_MODEL_DIR", "MEMB_EMBED_PORT", "MEMB_EMBED_DISABLE"].iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let saved: Vec<_> = ["MEMB_GEMMA_MODEL_DIR", "MEMB_EMBED_PORT", "MEMB_EMBED_DISABLE", "MEMB_EMBED_MRL_DIM"].iter().map(|k| (*k, std::env::var_os(k))).collect();
         for (k, _) in &saved {
             std::env::remove_var(k);
         }
@@ -459,6 +684,11 @@ mod tests {
         std::env::remove_var("MEMB_EMBED_DISABLE");
         apply_default(&root);
         assert_eq!(std::env::var_os("MEMB_GEMMA_MODEL_DIR").map(PathBuf::from), Some(dir.clone()));
+        assert_eq!(std::env::var("MEMB_EMBED_MRL_DIM").unwrap(), "256", "the width paired with the 4-bit build");
+        std::env::remove_var("MEMB_GEMMA_MODEL_DIR");
+        std::env::set_var("MEMB_EMBED_MRL_DIM", "512");
+        apply_default(&root);
+        assert_eq!(std::env::var("MEMB_EMBED_MRL_DIM").unwrap(), "512", "a width the user chose is kept");
         // A size that is off by one makes it incomplete again.
         std::fs::File::options().write(true).open(file_path(&dir, &m.files[1])).unwrap().set_len(m.files[1].size - 1).unwrap();
         assert!(!is_complete(&dir, &m));

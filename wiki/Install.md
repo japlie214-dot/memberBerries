@@ -28,7 +28,7 @@ To uninstall, remove only the `memb` extension/plugin or configuration entry and
 
 ### Verification matrix
 
-v0.9.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
+v0.10.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
 
 ### Cross-client smoke test
 
@@ -40,15 +40,15 @@ v0.9.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate
 
 ## Semantic search (EmbeddingGemma 2)
 
-Out of the box memb searches lexically. For meaning-based search it can run Google's EmbeddingGemma 2 on your CPU, inside memb, with nothing sent anywhere. The model is not in the package (about 207 MB), so it is fetched once:
+Out of the box memb searches lexically. For meaning-based search it can run Google's EmbeddingGemma 2 on your CPU, inside memb, with nothing sent anywhere. The model is not in the package (207 MB for the 4-bit build, 346 MB for the 8-bit build), so it is fetched once:
 
 ```powershell
 memb models install
 ```
 
-The command says what it will download and from where, and asks you to type `yes` (or pass `--yes`). It fetches three files from one pinned revision of `onnx-community/embeddinggemma-2-ONNX` on Hugging Face into `%LOCALAPPDATA%\memberBerries\models\embeddinggemma-2`, checks each file's size and SHA-256 against values built into memb, and makes a file visible only after it matches. An interrupted download resumes when you run the command again. A running memb server or host picks the model up when it restarts.
+memb reads your machine (CPU features, physical cores, RAM) and picks the build that fits: a weaker machine gets the 4-bit build with 256-wide vectors, a machine with AVX2 or AVX-512, at least 8 physical cores and 16 GB gets the 8-bit build with 512-wide vectors. A machine without AVX2 with FMA (or AVX-512), or with under 8 GB of RAM, is told it cannot run the model well and nothing is installed; `memb models install --variant q4` overrides that. The command says what it will download and from where, and asks you to type `yes` (or pass `--yes`). It fetches three files from one pinned revision of `onnx-community/embeddinggemma-2-ONNX` on Hugging Face into `%LOCALAPPDATA%\memberBerries\models\embeddinggemma-2` (4-bit) or `...\embeddinggemma-2-int8` (8-bit), checks each file's size and SHA-256 against values built into memb, and makes a file visible only after it matches. An interrupted download resumes when you run the command again. A running memb server or host picks the model up when it restarts.
 
-- `memb models status` shows what is installed (`--verify` also hashes the files); `memb doctor` reports it too.
+- `memb models status` shows this machine, the recommended build and what is installed (`--verify` also hashes the files); `memb doctor` reports it too.
 - `memb models remove` deletes it; search is lexical again.
 - To let memb do this on its own, set `embeddings.auto_download = true`: the daily routine then downloads the model once if none is installed and no other backend is chosen.
 - An explicit choice always wins: `embeddings.gemma_model_dir`, `embeddings.port` or `embeddings.enabled = false`.

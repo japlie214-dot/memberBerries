@@ -77,6 +77,14 @@ pub enum Tier {
 }
 
 impl Tier {
+    /// The Matryoshka width Phase 2 assigns to the tier: 256 for `CpuLite`, 512 for `CpuBalanced`.
+    pub fn mrl_dim(self) -> usize {
+        match self {
+            Tier::CpuLite => 256,
+            Tier::CpuBalanced => 512,
+        }
+    }
+
     /// Seconds the model may sit unused before it is unloaded and its memory returned.
     pub fn idle_unload_secs(self) -> u64 {
         match self {
@@ -84,6 +92,27 @@ impl Tier {
             Tier::CpuBalanced => 600,
         }
     }
+}
+
+/// Whether this machine can run the in-process embedding model, and at which tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalPlan {
+    Local(Tier),
+    /// The model would run too slowly or not at all; the reason is one short sentence.
+    Unsupported(&'static str),
+}
+
+/// The floor for running EmbeddingGemma 2 on the CPU: AVX2 with FMA (or AVX-512), and at
+/// least 8 GB of installed RAM. Below it embedding a note takes seconds, so memb says so
+/// instead of installing a model that cannot serve a search.
+pub fn plan_local(hw: &Hardware) -> LocalPlan {
+    if !(hw.avx512 || hw.avx2_fma) {
+        return LocalPlan::Unsupported("the CPU lacks AVX2 with FMA");
+    }
+    if hw.total_ram_mib < 8 * 1024 {
+        return LocalPlan::Unsupported("under 8 GB of RAM is installed");
+    }
+    LocalPlan::Local(choose_tier(hw))
 }
 
 /// Phase 2: `CpuBalanced` needs AVX2 (with FMA) or AVX-512, at least 8 physical cores
