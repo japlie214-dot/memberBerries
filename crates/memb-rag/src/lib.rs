@@ -37,6 +37,112 @@ type ModelMap = std::sync::Mutex<
     std::collections::HashMap<std::path::PathBuf, std::sync::Arc<memb_embed::gemma::GemmaEmbedder>>,
 >;
 
+/// How this process reaches the embedding model. Set once at start by `memb` itself; a
+/// library user or a test that never sets it loads the model in-process.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// The service's pipe name (see `memb_embed::service::pipe_name`).
+    pub name: String,
+    /// The executable that is started as `<exe> embed-service` when no service is running.
+    pub exe: std::path::PathBuf,
+    /// `Wait`: start it and wait for the answer (MCP server, CLI). `Kick`: start it for next
+    /// time and answer lexically now (hooks, which must not wait for a model to load).
+    pub start: StartMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartMode {
+    Wait,
+    Kick,
+}
+
+static SERVICE: std::sync::OnceLock<ServiceConfig> = std::sync::OnceLock::new();
+
+pub fn configure_service(config: ServiceConfig) {
+    let _ = SERVICE.set(config);
+}
+
+/// Starts `<exe> embed-service` detached from this process. It first asks to leave this
+/// process's job object (a host-started memb would otherwise take the shared service down
+/// with it when it exits); if that is refused it starts the service the ordinary way.
+#[cfg(windows)]
+pub fn start_service(exe: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let spawn = |flags: u32| {
+        Command::new(exe)
+            .arg("embed-service")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+            .map(|_| ())
+    };
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    spawn(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base))
+}
+
+/// Embeds through the shared service. `Err` means "no vector now": the callers fall back
+/// to lexical search, they never load the model themselves.
+#[cfg(windows)]
+fn service_embed(config: &ServiceConfig, text: &str, is_query: bool) -> Result<(String, Vec<f32>), String> {
+    use memb_embed::service::{call, CallError, Request};
+    use std::time::{Duration, Instant};
+    let request = Request::Embed { text: text.to_owned(), query: is_query };
+    let answer = |r: memb_embed::service::Response| {
+        if r.ok {
+            match (r.tag, r.vector) {
+                (Some(tag), Some(vector)) => Ok((tag, vector)),
+                _ => Err("the embedding service answered without a vector".to_string()),
+            }
+        } else {
+            Err(r.error.unwrap_or_else(|| "the embedding service failed".into()))
+        }
+    };
+    match call(&config.name, &request, Duration::from_secs(90)) {
+        Ok(r) => answer(r),
+        Err(CallError::Failed(reason)) => Err(reason),
+        Err(CallError::NotRunning) => {
+            start_service(&config.exe).map_err(|e| format!("cannot start the embedding service: {e}"))?;
+            if config.start == StartMode::Kick {
+                return Err("the embedding service was just started; lexical search for now".into());
+            }
+            // The pipe appears within a moment; the first embedding then waits for the model to load.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+                match call(&config.name, &request, Duration::from_secs(120)) {
+                    Err(CallError::NotRunning) => continue,
+                    Ok(r) => return answer(r),
+                    Err(CallError::Failed(reason)) => return Err(reason),
+                }
+            }
+            Err("the embedding service did not come up in time".into())
+        }
+    }
+}
+
+/// One embedding by the local model: through the service when this process was configured
+/// for it (and is not the service itself), otherwise in this process (the service, tests,
+/// `MEMB_EMBED_SERVICE=0`).
+fn gemma_embed(directory: &std::path::Path, text: &str, is_query: bool) -> Result<(String, Vec<f32>), String> {
+    let in_process = std::env::var("MEMB_IN_SERVICE").ok().as_deref() == Some("1")
+        || std::env::var("MEMB_EMBED_SERVICE").ok().as_deref() == Some("0");
+    #[cfg(windows)]
+    if !in_process {
+        if let Some(config) = SERVICE.get() {
+            return service_embed(config, text, is_query);
+        }
+    }
+    let _ = in_process;
+    gemma_model(directory.to_path_buf()).ok_or("embedding model unavailable")?.embed_tagged(text, is_query)
+}
+
 fn model_map() -> &'static ModelMap {
     static MODELS: std::sync::OnceLock<ModelMap> = std::sync::OnceLock::new();
     MODELS.get_or_init(Default::default)
@@ -100,8 +206,7 @@ pub fn embed_text(text: &str, is_query: bool) -> Result<Option<(String, Quantize
     }
     let mrl = memb_embed::mrl_dim_from_env()?;
     if let Some(directory) = std::env::var_os("MEMB_GEMMA_MODEL_DIR").filter(|p| !p.is_empty()) {
-        let model = gemma_model(std::path::PathBuf::from(directory)).ok_or("embedding model unavailable")?;
-        let (tag, v) = model.embed_tagged(text, is_query)?;
+        let (tag, v) = gemma_embed(std::path::Path::new(&directory), text, is_query)?;
         return Ok(Some((
             memb_embed::mrl_tag(&tag, mrl),
             QuantizedVec::from_f32(&memb_embed::apply_mrl(v, mrl)?),
@@ -379,23 +484,18 @@ fn search_with_gemma(
     query: &str,
     directory: std::path::PathBuf,
 ) -> Result<Vec<Note>, String> {
-    let Some(model) = gemma_model(directory) else {
-        return hybrid_search(store, query, None, &[]);
-    };
     // An unsupported MEMB_EMBED_MRL_DIM or a failed embedding degrades to lexical search.
     let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
         return hybrid_search(store, query, None, &[]);
     };
-    let (tag, q) = match model.embed_tagged(query, true).and_then(|(tag, v)| {
+    let (tag, q) = match gemma_embed(&directory, query, true).and_then(|(tag, v)| {
         Ok((memb_embed::mrl_tag(&tag, mrl), memb_embed::apply_mrl(v, mrl)?))
     }) {
         Ok((tag, v)) => (tag, QuantizedVec::from_f32(&v)),
         Err(_) => return hybrid_search(store, query, None, &[]),
     };
     let hot = hot_set(store, &tag, |note| {
-        let (doc_tag, v) = model
-            .embed_tagged(&memb_embed::document_text(&note.title, &note.desc), false)
-            .ok()?;
+        let (doc_tag, v) = gemma_embed(&directory, &memb_embed::document_text(&note.title, &note.desc), false).ok()?;
         let v = memb_embed::apply_mrl(v, mrl).ok()?;
         (memb_embed::mrl_tag(&doc_tag, mrl) == tag && v.len() == q.data.len()).then(|| QuantizedVec::from_f32(&v))
     })?;

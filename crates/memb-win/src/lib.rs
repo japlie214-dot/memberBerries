@@ -1,3 +1,6 @@
+#[cfg(windows)]
+pub mod pipe;
+
 pub const HARD_CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const GOVERNOR_WARN_MIB: usize = 1200;
 pub const GOVERNOR_TRIM_MIB: usize = 1550;
@@ -188,7 +191,7 @@ pub fn attach_job_object_2gb_cap() -> Result<JobGuard, String> {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -202,7 +205,10 @@ pub fn attach_job_object_2gb_cap() -> Result<JobGuard, String> {
         // The cap is for the whole job: this process and everything it starts after
         // this call (the model command, its helpers) share 2 GiB, and when the last
         // handle to the job closes, everything in it is stopped.
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Breakaway is allowed so that the shared embedding service, which several hosts use,
+        // can be started outside this process's job instead of dying with the first host that
+        // happened to start it (a child still has to ask for it explicitly).
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         info.JobMemoryLimit = HARD_CAP_BYTES;
 
         let ok = SetInformationJobObject(

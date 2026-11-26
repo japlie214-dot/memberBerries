@@ -1,6 +1,6 @@
 # Phase coverage and retirement gate
 
-This is a requirements ledger, not a release claim. **Implemented** means the current (workspace 0.12.0) implementation exists; native host verification is separate. **Replaced** means the design intention is addressed differently. **Open** means the phase software and notes must be retained until implementation or an approved disposition.
+This is a requirements ledger, not a release claim. **Implemented** means the current (workspace 0.13.0) implementation exists; native host verification is separate. **Replaced** means the design intention is addressed differently. **Open** means the phase software and notes must be retained until implementation or an approved disposition.
 
 | Source | Requirement | Current disposition |
 |---|---|---|
@@ -48,7 +48,7 @@ On 2026-11-26 the user approved, in chat, **every departure below except the per
 | 15 | No f32 top-20 rescore in retrieval | i8 ranking matched f32 on 99.5% of the top 10; a rescore needs f32 vectors on disk or 20 extra embeddings per query | Approved |
 | 16 | The adjacency index holds knowledge-to-claim edges only | The other direction is the note's own `parents`, one point read | Approved |
 | 17 | The knowledge-base version is checked on every query by opening the database (about 45 ms in a debug build) | Simplest correct invalidation | **Rejected: ticket T029** |
-| 18 | One shared embedding service (one resident model over a per-user named pipe) instead of the stdio-only rule, so hosts and hooks share one model (ticket T042, not built yet) | A hook is a new process per prompt and each host starts its own server: one model each costs 165 MiB or more and 3 to 6 s per hook | **Approved 2026-11-26** |
+| 18 | One shared embedding service (one resident model over a per-user named pipe) instead of the stdio-only rule, so hosts and hooks share one model (ticket T042, built in 0.13.0) | A hook is a new process per prompt and each host starts its own server: one model each costs 165 MiB or more and 3 to 6 s per hook | **Approved 2026-11-26** |
 | 19 | Snowflake AI_EMBED as a cloud embedding backend, local model first (ticket T031) | Machines below the floor for a local model, and a quality reference (recall@1 0.93) | **Requested and approved by the user 2026-11-26**; it sends note text to Snowflake and is used only when configured |
 
 Query truncation is not a departure: it was changed to 512 tokens at the user's request (see the EmbeddingGemma row above).

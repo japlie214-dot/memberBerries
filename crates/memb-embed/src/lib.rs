@@ -1,5 +1,6 @@
 pub mod gemma;
 pub mod idle;
+pub mod service;
 pub mod snowflake;
 
 use redb::{Database, TableDefinition};

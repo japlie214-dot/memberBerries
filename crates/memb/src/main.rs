@@ -1,6 +1,7 @@
 mod config;
 mod curate;
 mod diag;
+mod embed_service;
 mod models;
 mod viewer;
 mod web;
@@ -46,6 +47,15 @@ fn main() {
     if args.first().is_some_and(|a| a == "models") {
         match data_root() {
             Ok(root) => std::process::exit(models::run(&root, &args[1..])),
+            Err(reason) => {
+                eprintln!("memb: {reason}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.first().is_some_and(|a| a == "embed-service") {
+        match data_root().and_then(|root| load_config(&root).map(|_| root)) {
+            Ok(root) => std::process::exit(embed_service::run(&root, &args[1..])),
             Err(reason) => {
                 eprintln!("memb: {reason}");
                 std::process::exit(1);
@@ -870,6 +880,7 @@ fn agy_turn(transcript: &Path) -> Result<Vec<(memb_scroll::Role, String)>, Strin
 }
 
 fn hook(event: &str, cli: &str) -> Result<(), String> {
+    env::set_var("MEMB_EMBED_SERVICE_START", "kick");
     // A disabled hook must not open the store or process conversation content.
     if env::var("MEMB_SCROLL_CAPTURE").ok().as_deref() != Some("1")
         || memb_scroll::is_memory_disabled(None, &[])
@@ -1037,7 +1048,22 @@ fn load_config(root: &Path) -> Result<config::Config, String> {
     })?;
     // No backend chosen and a complete model installed (`memb models install`): use it.
     models::apply_default(root);
+    configure_embedding_service(root);
     Ok(cfg)
+}
+
+/// A local model is shared through the embedding service (one resident model for every host
+/// and hook). Hooks only start it for next time (`MEMB_EMBED_SERVICE_START=kick`); everything
+/// else waits for it. Not used by the service itself, with `MEMB_EMBED_SERVICE=0`, or without
+/// a local model.
+fn configure_embedding_service(root: &Path) {
+    let off = env::var("MEMB_EMBED_SERVICE").ok().as_deref() == Some("0") || env::var("MEMB_IN_SERVICE").ok().as_deref() == Some("1");
+    if off || env::var_os("MEMB_GEMMA_MODEL_DIR").is_none() {
+        return;
+    }
+    let Ok(exe) = env::current_exe() else { return };
+    let start = if env::var("MEMB_EMBED_SERVICE_START").ok().as_deref() == Some("kick") { memb_rag::StartMode::Kick } else { memb_rag::StartMode::Wait };
+    memb_rag::configure_service(memb_rag::ServiceConfig { name: memb_embed::service::pipe_name(root), exe, start });
 }
 
 fn open_store(root: &Path, cfg: &config::Config) -> Result<Store, String> {

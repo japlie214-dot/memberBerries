@@ -5,6 +5,11 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.13.0 (2026-11-26)
+
+- **Shared embedding service (T042):** with a local model, every memb process (each host's MCP server, every hook) now asks one resident `memb embed-service` for vectors over a per-user named pipe (`\.\pipe\memb-embed-v1-<hash>`, current-user-only access list, remote clients refused, no TCP port). One model in memory instead of one per host; hooks no longer load it. The service starts on demand (hooks only start it for next time and answer lexically meanwhile), unloads the model after 5 idle minutes and exits after 15 (`MEMB_EMBED_SERVICE_IDLE_SECS`). `memb embed-service status|stop`; `MEMB_EMBED_SERVICE=0` keeps the model in-process.
+- The host job object now allows breakaway so the service outlives the process that started it.
+
 ## 0.12.0 (2026-11-26)
 
 - **Snowflake AI_EMBED backend:** `[embeddings.snowflake]` (account, user, warehouse, key file, optional role and model). memb signs in with an unencrypted PKCS#8 key (RS256 JWT, the key never leaves the file), calls the SQL API through Windows' curl.exe, embeds notes 16 per statement, handles partitioned results and tags vectors with the model and prompt policy. The default model `snowflake-arctic-embed-m-v1.5` gets the retrieval prefix on queries; `snowflake-arctic-embed-l-v2.0` gets none (measured). Used only when configured and when no local model is chosen or installed. `memb doctor` reports it and checks the key file without any request.
