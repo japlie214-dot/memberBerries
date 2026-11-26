@@ -36,7 +36,7 @@ Codex's usage quota is used up until 2026-11-28 21:23 local (see T025 transcript
 ## Claude Desktop (Code tab, installed plugin 0.5.0): VERIFIED live
 
 Method: the user installed `memb.plugin` (0.4.0 build with hooks, later reinstalled as 0.5.0) in Claude Desktop. This
-project's local settings got a temporary `env` block (`MEMB_SCROLL_CAPTURE=1`, `MEMB_DATA_DIR=C:	mp	013\cc\data`;
+project's local settings got a temporary `env` block (`MEMB_SCROLL_CAPTURE=1`, `MEMB_DATA_DIR=C:\tmp\t013\cc\data`;
 the original file was backed up and restored afterwards, the temporary data directory was deleted). The hooks that ran
 are the plugin's own `hooks/hooks.json` (`${CLAUDE_PLUGIN_ROOT}/server/memb.exe` with `args`), so the
 plugin-root substitution and the direct (no shell) command are confirmed for Claude Desktop.
