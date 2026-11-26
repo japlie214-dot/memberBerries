@@ -76,8 +76,13 @@ fn sources_of(note: &Note) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The most notes compared in one run (pairs grow with the square): the newest ones, since
+/// vectors arrive in note-id order. 2000 notes is about two million comparisons.
+pub const MAX_SCAN: usize = 2000;
+
 /// Up to `max` merge plans, most similar first. A note appears in at most one plan.
 pub fn find_merges(notes: &BTreeMap<u64, Note>, vectors: &[(u64, QuantizedVec)], max: usize) -> Vec<MergePlan> {
+    let vectors = &vectors[vectors.len().saturating_sub(MAX_SCAN)..];
     let has_active_children = |id: u64| notes.values().any(|n| n.status == NoteStatus::Active && n.parents.contains(&id));
     let mut pairs: Vec<(f32, u64, u64)> = Vec::new();
     for (i, (a_id, a_vec)) in vectors.iter().enumerate() {
@@ -226,5 +231,15 @@ mod tests {
         assert!(find_merges(&notes, &apart, 3).is_empty());
         // The limit caps the number of plans.
         assert!(find_merges(&notes, &dup, 0).is_empty());
+        // Only the newest MAX_SCAN notes are compared: a duplicate pair that starts before
+        // that window is not seen, one inside it is.
+        notes.insert(8, note(8, Kind::Knowledge, vec![1], true));
+        notes.insert(9, note(9, Kind::Knowledge, vec![1], true));
+        let pair = vec![(8, unit(1.0, 0.0)), (9, unit(1.0, 0.02))];
+        let filler = |n: usize| (0..n).map(|i| (1000 + i as u64, unit(0.0, 1.0)));
+        let inside: Vec<_> = pair.iter().cloned().chain(filler(MAX_SCAN - 2)).collect();
+        assert_eq!(find_merges(&notes, &inside, 3).len(), 1, "the pair is inside the window");
+        let outside: Vec<_> = pair.iter().cloned().chain(filler(MAX_SCAN)).collect();
+        assert!(find_merges(&notes, &outside, 3).is_empty(), "older than the newest {MAX_SCAN}: not seen");
     }
 }
