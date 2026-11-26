@@ -525,12 +525,11 @@ fn the_kill_switch_and_cascade_rule_hold_back_automatic_edits() {
 fn real_codex_summarizes_and_proposes_through_memb_curate() {
     let dir = Dir::new("realcodex", "");
     let topic = dir.seed();
-    let command = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral";
-    std::fs::write(
-        dir.0.join("config.toml"),
-        format!("[scroll]\nmax_messages = 10\nretain_tail = 2\n[curator]\ncli_command = \"{command}\"\n"),
-    )
-    .unwrap();
+    // No cli_command: the shipped default command is what is being verified.
+    std::fs::write(dir.0.join("config.toml"), "[scroll]
+max_messages = 10
+retain_tail = 2
+").unwrap();
     let started = std::time::Instant::now();
     let out = dir.run(&["curate"], "");
     println!("elapsed: {:?}\nstderr: {}\nstdout: {}", started.elapsed(), text(&out.stderr), text(&out.stdout));

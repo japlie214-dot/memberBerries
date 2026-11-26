@@ -33,9 +33,11 @@ enabled = true               # false forces lexical-only search
 
 [curator]                    # used by `memb curate` (you run it; see wiki/Operations.md)
 backend = "cli"              # the only supported backend
-cli_command = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral"
+cli_command = "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories"
                              # run WITHOUT a shell, split on whitespace; it receives conversation text on stdin.
-                             # Verified: Codex, gpt-6-luna at medium reasoning (the default above).
+                             # Verified: Codex, gpt-6-luna at medium reasoning (the default above). The default is "pure":
+                             # --ignore-user-config/--ignore-rules/--disable ... keep your Codex plugins, apps, skills,
+                             # hooks, memories and AGENTS.md out of the headless call (see wiki/Operations.md).
                              # Planned preset (own ticket, not verified yet): agy -p with gemini-4-hydrogen-medium.
 chunk_to_chunk_threshold = 0.72   # fixed: any other value is rejected
 chunk_to_node_threshold = 0.70    # fixed: any other value is rejected

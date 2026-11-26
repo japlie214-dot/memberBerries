@@ -116,7 +116,7 @@ impl Default for Curator {
     fn default() -> Self {
         Self {
             backend: "cli".into(),
-            cli_command: "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral".into(),
+            cli_command: "codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories".into(),
             chunk_to_chunk_threshold: 0.72,
             chunk_to_node_threshold: 0.70,
             staging_ttl_days: 30,
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn defaults_match_the_kit_example() {
         let kit = Config::parse(
-            "[storage]\nmax_notes = 50000\n[scroll]\nmax_messages = 90\nretain_tail = 10\nmin_prompt_chars = 100\ndedup_reset_every_n_chunks = 7\nignore_dirs = [\"*/tmp/*\", \"*/playground/*\"]\n[curator]\nbackend = \"cli\"\ncli_command = \"codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral\"\nchunk_to_chunk_threshold = 0.72\nchunk_to_node_threshold = 0.70\nstaging_ttl_days = 30\n[scheduler]\nroutine_wib_hour = 15\nroutine_wib_minute = 45\ncooldown_hours = 20\nidle_sweep_hours = 24\nidle_sweep_min_messages = 45\n",
+            "[storage]\nmax_notes = 50000\n[scroll]\nmax_messages = 90\nretain_tail = 10\nmin_prompt_chars = 100\ndedup_reset_every_n_chunks = 7\nignore_dirs = [\"*/tmp/*\", \"*/playground/*\"]\n[curator]\nbackend = \"cli\"\ncli_command = \"codex exec -m gpt-6-luna -c model_reasoning_effort=medium -s read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c project_doc_max_bytes=0 --disable apps --disable plugins --disable hooks --disable goals --disable multi_agent --disable in_app_browser --disable browser_use --disable computer_use --disable tool_suggest --disable skill_search --disable skill_mcp_dependency_install --disable view_image --disable sleep_tool --disable remote_plugin --disable plugin_sharing --disable memories\"\nchunk_to_chunk_threshold = 0.72\nchunk_to_node_threshold = 0.70\nstaging_ttl_days = 30\n[scheduler]\nroutine_wib_hour = 15\nroutine_wib_minute = 45\ncooldown_hours = 20\nidle_sweep_hours = 24\nidle_sweep_min_messages = 45\n",
         )
         .unwrap();
         assert_eq!(kit.scroll.ignore_dirs.len(), 2);

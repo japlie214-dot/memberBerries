@@ -15,7 +15,7 @@ pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 96 * 1024;
 pub const MAX_PROPOSALS_PER_RUN: usize = 8;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
-const MAX_ARGS: usize = 16;
+const MAX_ARGS: usize = 64;
 const MAX_ARG_BYTES: usize = 256;
 const MAX_NOTE_LINES: usize = 200;
 
@@ -39,7 +39,7 @@ impl Backend {
     pub fn from_command(command: &str) -> Result<Self, String> {
         let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
         if argv.is_empty() || argv.len() > MAX_ARGS {
-            return Err("command must have between 1 and 16 words".into());
+            return Err("command must have between 1 and 64 words".into());
         }
         if argv
             .iter()
@@ -448,7 +448,7 @@ mod tests {
         let b = Backend::from_command("claude -p").unwrap();
         assert_eq!(b.program(), "claude");
         assert!(Backend::from_command("   ").is_err());
-        assert!(Backend::from_command(&"x ".repeat(17)).is_err());
+        assert!(Backend::from_command(&"x ".repeat(65)).is_err());
         assert!(Backend::from_command(&"y".repeat(300)).is_err());
         let err = Backend::from_command(&"y".repeat(300)).unwrap_err();
         assert!(!err.contains("yyy"));
