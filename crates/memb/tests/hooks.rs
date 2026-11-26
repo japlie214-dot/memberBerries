@@ -309,12 +309,24 @@ fn antigravity_real_layout_transcript_full_and_wrapped_user_request() {
         (Role::Assistant, "MANGO".to_string()),
     ];
     assert_eq!(e.messages("agy_conv-real"), want);
-    // Any other file name in that directory is still refused.
-    let other = dir.join("transcript_other.jsonl");
-    std::fs::copy(&transcript, &other).unwrap();
-    let before = e.messages("agy_conv-real").len();
-    let _ = e.capture("agy", "assistant-stop", &stop(&e, &a, &other, true));
-    assert_eq!(e.messages("agy_conv-real").len(), before);
+    // Any other file name in that directory is still refused. Use a fresh conversation with
+    // a different reply, so the once-per-turn repeat check cannot be what stops it.
+    let id2 = "conv-real-2";
+    let dir2 = e.root.join(".gemini/antigravity-cli/brain").join(id2).join(".system_generated/logs");
+    std::fs::create_dir_all(&dir2).unwrap();
+    let other = dir2.join("transcript_other.jsonl");
+    let text2 = format!("{}
+{}
+", rec("USER_EXPLICIT", "USER_INPUT", "another question"), rec("MODEL", "PLANNER_RESPONSE", "another answer"));
+    std::fs::write(&other, &text2).unwrap();
+    let a2 = Agy { transcript: other.clone(), id: id2.into() };
+    let _ = e.capture("agy", "assistant-stop", &stop(&e, &a2, &other, true));
+    assert!(e.messages("agy_conv-real-2").is_empty(), "a transcript with another file name is refused");
+    // The same content under the accepted name is captured, so the refusal was about the name.
+    let accepted = dir2.join("transcript_full.jsonl");
+    std::fs::write(&accepted, &text2).unwrap();
+    let _ = e.capture("agy", "assistant-stop", &stop(&e, &a2, &accepted, true));
+    assert_eq!(e.messages("agy_conv-real-2").len(), 2);
 }
 
 /// Seeds a data directory with notes for the hook latency measurement (T019). Not a test:
