@@ -46,6 +46,10 @@ pub struct Embeddings {
     pub port: Option<u16>,
     pub model_id: Option<String>,
     pub gemma_model_dir: Option<String>,
+    /// Let the daily routine download the EmbeddingGemma 2 model (about 207 MB, from
+    /// Hugging Face, checked against pinned SHA-256 values) when none is installed and no
+    /// other backend is chosen. Off by default: `memb models install` does it on request.
+    pub auto_download: bool,
     pub mrl_dim: Option<u32>,
     // Accepted only to give a clear error: memb does not launch an embedding server.
     pub binary: Option<String>,
@@ -108,6 +112,7 @@ impl Default for Embeddings {
             port: None,
             model_id: None,
             gemma_model_dir: None,
+            auto_download: false,
             mrl_dim: None,
             binary: None,
             model_path: None,
@@ -356,11 +361,15 @@ impl Config {
     }
 }
 
+/// Tests that change the process environment take this lock (config and models tests share it).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::ENV_LOCK as ENV;
     const EMBED_VARS: [&str; 6] = [
         "MEMB_EMBED_PORT",
         "MEMB_EMBED_MODEL_ID",

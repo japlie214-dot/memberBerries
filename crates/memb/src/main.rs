@@ -1,6 +1,7 @@
 mod config;
 mod curate;
 mod diag;
+mod models;
 mod viewer;
 mod web;
 
@@ -41,6 +42,15 @@ fn main() {
             std::process::exit(2);
         }
         std::process::exit(run_doctor());
+    }
+    if args.first().is_some_and(|a| a == "models") {
+        match data_root() {
+            Ok(root) => std::process::exit(models::run(&root, &args[1..])),
+            Err(reason) => {
+                eprintln!("memb: {reason}");
+                std::process::exit(1);
+            }
+        }
     }
     if args.first().is_some_and(|a| a == "inspect") {
         let [_, what, id] = args.as_slice() else {
@@ -481,6 +491,7 @@ fn daemon_once_report(
         report.pruned_scrolls = store.with_db(|db| {
             memb_scroll::prune_thin_idle_scrolls(db, now, d.idle_sweep_min_messages, 14 * 24 * 3600 * 1000)
         })?;
+        ensure_embedding_model(store.root(), cfg);
         // Phase 4 consolidation: near-duplicate knowledge or claims become pending merge
         // proposals (needs an embedding backend; nothing is applied here).
         report.merges_proposed = curate::consolidate_routine(store, cfg, now);
@@ -497,6 +508,36 @@ fn daemon_once_report(
     let done = now.saturating_add(started.elapsed().as_millis() as u64);
     store.with_db(|db| memb_ops::finish_daily_routine(db, claim, done, outcome.is_ok()))?;
     outcome.map(Some)
+}
+
+/// The routine's model step: with `embeddings.auto_download = true`, no backend chosen and
+/// no model installed, fetch EmbeddingGemma 2 (verified; resumes after an interruption).
+/// Never fails the routine; the next run tries again.
+fn ensure_embedding_model(root: &Path, cfg: &config::Config) {
+    let e = &cfg.embeddings;
+    let chosen = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    if !e.auto_download
+        || !e.enabled
+        || e.port.is_some()
+        || e.gemma_model_dir.is_some()
+        || chosen("MEMB_EMBED_PORT")
+        || chosen("MEMB_GEMMA_MODEL_DIR")
+    {
+        return;
+    }
+    let manifest = models::Manifest::embeddinggemma();
+    let dir = models::default_dir(root);
+    if models::is_complete(&dir, &manifest) {
+        return;
+    }
+    let mut log = Vec::new();
+    match models::install(&dir, &manifest, false, &mut log) {
+        Ok(n) => {
+            eprintln!("memb: embedding model installed ({n} file(s) downloaded)");
+            models::apply_default(root);
+        }
+        Err(reason) => eprintln!("memb: embedding model download failed, will retry on the next run: {reason}"),
+    }
 }
 
 /// The daemon's curation step: only with `curator.daemon_enabled`. A failing or missing
@@ -992,6 +1033,8 @@ fn load_config(root: &Path) -> Result<config::Config, String> {
         eprintln!("memb: {message}");
         message
     })?;
+    // No backend chosen and a complete model installed (`memb models install`): use it.
+    models::apply_default(root);
     Ok(cfg)
 }
 

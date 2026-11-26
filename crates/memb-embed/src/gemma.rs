@@ -16,7 +16,7 @@ pub const MODEL_ID: &str =
 pub const DOC_PREFIX: &str = "title: ";
 pub const QUERY_PREFIX: &str = "task: search result | query: ";
 const MAX_TOKENS: usize = 8192;
-const QUERY_MAX_TOKENS: usize = 128;
+const QUERY_MAX_TOKENS: usize = 512;
 
 fn tokens(values: &[u32], query: bool) -> Vec<i64> {
     let mut values: Vec<i64> = values.iter().map(|&v| i64::from(v)).collect();
@@ -35,7 +35,7 @@ const FILES: [&str; 3] = [
 ];
 // Increment when tokenization, pooling, normalization or output semantics change.
 const CONTRACT: &str =
-    "gemma-text-v1:document-title-newline-description:sentence_embedding:l2:query-head30-tail70";
+    "gemma-text-v2:document-title-text:sentence_embedding:l2:query-head30-tail70-512";
 
 type FileStamp = Vec<(u64, SystemTime)>;
 fn file_stamp(directory: &Path) -> Result<FileStamp, String> {
@@ -237,12 +237,13 @@ mod tests {
     use super::*;
     #[test]
     fn query_truncation_preserves_head_and_tail() {
-        let values: Vec<u32> = (0..300).collect();
+        let values: Vec<u32> = (0..1000).collect();
         let capped = tokens(&values, true);
-        assert_eq!(capped.len(), 128);
-        assert_eq!(capped[37], 37);
-        assert_eq!(capped[38], 210);
-        assert_eq!(tokens(&values, false).len(), 300);
+        assert_eq!(capped.len(), 512);
+        assert_eq!(capped[152], 152);
+        assert_eq!(capped[153], 641);
+        assert_eq!(tokens(&values, false).len(), 1000);
+        assert_eq!(tokens(&values[..400], true).len(), 400, "a query under the budget is untouched");
     }
     #[test]
     fn identity_changes_for_each_model_file() {

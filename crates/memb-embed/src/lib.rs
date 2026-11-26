@@ -15,15 +15,32 @@ pub const HOT_SET: TableDefinition<&str, &[u8]> = TableDefinition::new("hot_set_
 const OLD_DOC_CACHE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new("doc_embed_cache_v1");
 const OLD_DOC_CACHE_V2: TableDefinition<u64, &[u8]> = TableDefinition::new("doc_embed_cache_v2");
 
+/// SHA-256 of a file, streamed (the model files are hundreds of megabytes), as lower-case hex.
+pub fn sha256_file(path: &std::path::Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 /// The text a note is embedded as: with the document prefix this is
 /// `title: <title> | text: <desc>`, the EmbeddingGemma retrieval-document format.
 pub fn document_text(title: &str, desc: &str) -> String {
     format!("{title} | text: {desc}")
 }
 
-/// The longest query sent to a loopback server, in characters (about 128 tokens, the same
+/// The longest query sent to a loopback server, in characters (about 512 tokens, the same
 /// budget the in-process model applies); longer queries keep their head and tail.
-pub const SERVER_QUERY_MAX_CHARS: usize = 512;
+pub const SERVER_QUERY_MAX_CHARS: usize = 2048;
 
 /// The text sent to a loopback server for a query: the retrieval prefix plus the capped query.
 pub fn server_query_text(query: &str) -> String {
@@ -446,13 +463,13 @@ mod tests {
         assert_eq!(server_document_text("Redb", "an embedded store"), "title: Redb | text: an embedded store");
         assert_eq!(server_query_text("find redb"), "task: search result | query: find redb");
         // A long query keeps its head and tail within the same budget as the in-process model.
-        let long: String = (0..2000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let long: String = (0..6000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
         let sent = server_query_text(&long);
         let body = sent.strip_prefix(gemma::QUERY_PREFIX).unwrap();
         assert_eq!(body.chars().count(), SERVER_QUERY_MAX_CHARS);
         assert!(body.starts_with(&long[..100]) && body.ends_with(&long[long.len() - 100..]));
         // Multi-byte characters are never split.
-        let wide: String = "\u{00e9}".repeat(2000);
+        let wide: String = "\u{00e9}".repeat(5000);
         assert_eq!(server_query_text(&wide).strip_prefix(gemma::QUERY_PREFIX).unwrap().chars().count(), SERVER_QUERY_MAX_CHARS);
     }
 

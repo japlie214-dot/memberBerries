@@ -5,6 +5,12 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.9.0 (2026-11-26)
+
+- **EmbeddingGemma 2 install pipeline:** `memb models install | status [--verify] | remove`. One consent step, a pinned Hugging Face revision, size and SHA-256 verification, resume after interruption, files visible only once verified. When the model is installed and no other backend is chosen, memb uses it with no configuration. `embeddings.auto_download = true` lets the daily routine fetch it. `memb doctor` reports the model and points to the command.
+- **Query budget is 512 tokens** (was 128) on the in-process path, and about 2,048 characters on the loopback path. The model contract changed, so vectors are re-embedded once.
+- Departure ledger (T024) recorded in `wiki/Phase-Coverage.md`: all approved except the per-query version check, which becomes T029.
+
 ## 0.8.1 (2026-11-26)
 
 - Retrieval: a note retracted after the hot set was built no longer takes one of the five search seeds (the vector candidates are checked against the live notes with point reads).

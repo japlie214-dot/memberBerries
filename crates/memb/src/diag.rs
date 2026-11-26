@@ -174,11 +174,13 @@ fn embedding_check() -> Check {
     }
     if let Some(dir) = std::env::var_os("MEMB_GEMMA_MODEL_DIR").filter(|d| !d.is_empty()) {
         let dir = PathBuf::from(dir);
-        let ready = dir.join("tokenizer.json").is_file() && dir.join("onnx").join("model_q4.onnx").is_file();
+        let ready = dir.join("tokenizer.json").is_file()
+            && dir.join("onnx").join("model_q4.onnx").is_file()
+            && dir.join("onnx").join("model_q4.onnx_data").is_file();
         return if ready {
             Check::new("embeddings", Status::Ok, format!("in-process EmbeddingGemma 2 model files present in {}", dir.display()))
         } else {
-            Check::new("embeddings", Status::Warn, format!("MEMB_GEMMA_MODEL_DIR={} lacks tokenizer.json or onnx/model_q4.onnx; search falls back to lexical", dir.display()))
+            Check::new("embeddings", Status::Warn, format!("MEMB_GEMMA_MODEL_DIR={} lacks tokenizer.json, onnx/model_q4.onnx or onnx/model_q4.onnx_data (run `memb models install` to fetch the verified model); search falls back to lexical", dir.display()))
         };
     }
     let port = std::env::var("MEMB_EMBED_PORT").ok().and_then(|p| p.parse::<u16>().ok()).filter(|p| *p != 0);
@@ -191,7 +193,11 @@ fn embedding_check() -> Check {
                 Err(_) => Check::new("embeddings", Status::Warn, format!("nothing is listening on 127.0.0.1:{port}; search falls back to lexical")),
             }
         }
-        None => Check::new("embeddings", Status::Info, "no embedding backend configured: lexical-only search"),
+        None => Check::new(
+            "embeddings",
+            Status::Info,
+            "no embedding backend: lexical-only search. `memb models install` downloads EmbeddingGemma 2 (207 MB, verified) and memb then uses it automatically",
+        ),
     }
 }
 
