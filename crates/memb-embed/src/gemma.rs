@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    sync::Mutex,
     time::SystemTime,
 };
 use tokenizers::{utils::truncation::TruncationParams, Tokenizer};
@@ -89,14 +88,29 @@ struct Model {
 /// Lazily loads a caller-specified local model; inference never uses the network.
 pub struct GemmaEmbedder {
     directory: PathBuf,
-    model: Mutex<Option<Model>>,
+    model: crate::idle::IdleSlot<Model>,
 }
 impl GemmaEmbedder {
     pub fn new(directory: PathBuf) -> Self {
         Self {
             directory,
-            model: Mutex::new(None),
+            model: crate::idle::IdleSlot::new(),
         }
+    }
+
+    /// Drops the loaded model if it has been unused for `idle` (its memory is returned;
+    /// the next embedding loads it again). True if it was dropped.
+    pub fn unload_if_idle(&self, idle: std::time::Duration) -> bool {
+        self.model.unload_if_idle(idle, std::time::Instant::now())
+    }
+
+    /// Drops the loaded model now. True if one was loaded.
+    pub fn unload(&self) -> bool {
+        self.model.unload()
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.model.is_loaded()
     }
     fn load(&self) -> Result<Model, String> {
         let stamp = file_stamp(&self.directory)?;
@@ -136,11 +150,9 @@ impl GemmaEmbedder {
         self.embed_tagged(text, false).map(|(_, v)| v)
     }
     pub fn embed_tagged(&self, text: &str, query: bool) -> Result<(String, Vec<f32>), String> {
-        let mut guard = self.model.lock().map_err(|e| e.to_string())?;
-        if guard.is_none() {
-            *guard = Some(self.load()?);
-        }
-        let model = guard.as_mut().unwrap();
+        self.model.with(|| self.load(), |model| self.infer(model, text, query))
+    }
+    fn infer(&self, model: &mut Model, text: &str, query: bool) -> Result<(String, Vec<f32>), String> {
         if file_stamp(&self.directory)? != model.stamp {
             return Err("model files changed; restart to reload".into());
         }

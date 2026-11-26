@@ -29,15 +29,50 @@ pub fn search(store: &Store, query: &str) -> Result<Vec<Note>, String> {
     hybrid_search(store, query, None, &[])
 }
 
-/// One loaded EmbeddingGemma 2 model per directory for the life of the process.
+type ModelMap = std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Arc<memb_embed::gemma::GemmaEmbedder>>,
+>;
+
+fn model_map() -> &'static ModelMap {
+    static MODELS: std::sync::OnceLock<ModelMap> = std::sync::OnceLock::new();
+    MODELS.get_or_init(Default::default)
+}
+
+fn query_cache() -> &'static std::sync::Mutex<memb_embed::QueryLru> {
+    static QUERIES: std::sync::OnceLock<std::sync::Mutex<memb_embed::QueryLru>> = std::sync::OnceLock::new();
+    QUERIES.get_or_init(|| std::sync::Mutex::new(memb_embed::QueryLru::new(memb_embed::QUERY_LRU_CAP)))
+}
+
+fn clear_query_cache() {
+    if let Ok(mut cache) = query_cache().lock() {
+        cache.clear();
+    }
+}
+
+/// Drops every in-process embedding model that has been unused for `idle` (the memory is
+/// returned; the next search loads it again). Returns how many were dropped.
+pub fn unload_idle_models(idle: std::time::Duration) -> usize {
+    let Ok(models) = model_map().lock() else { return 0 };
+    models.values().filter(|m| m.unload_if_idle(idle)).count()
+}
+
+/// Memory pressure: drops every in-process embedding model and the query cache now.
+/// Returns how many models were dropped.
+pub fn trim_caches() -> usize {
+    let dropped = model_map()
+        .lock()
+        .map(|models| models.values().filter(|m| m.unload()).count())
+        .unwrap_or(0);
+    clear_query_cache();
+    dropped
+}
+
+/// One embedding model per directory, loaded on first use and unloaded when idle.
 fn gemma_model(
     directory: std::path::PathBuf,
 ) -> Option<std::sync::Arc<memb_embed::gemma::GemmaEmbedder>> {
-    use std::sync::{Arc, Mutex, OnceLock};
-    static MODELS: OnceLock<
-        Mutex<std::collections::HashMap<std::path::PathBuf, Arc<memb_embed::gemma::GemmaEmbedder>>>,
-    > = OnceLock::new();
-    let mut models = MODELS.get_or_init(Default::default).lock().ok()?;
+    use std::sync::Arc;
+    let mut models = model_map().lock().ok()?;
     Some(
         models
             .entry(directory.clone())
@@ -183,8 +218,6 @@ fn search_with_server(
     port: u16,
     model: Option<&str>,
 ) -> Result<Vec<Note>, String> {
-    use std::sync::{Mutex, OnceLock};
-    static QUERIES: OnceLock<Mutex<memb_embed::QueryLru>> = OnceLock::new();
     store.search_lexical_ids(query, 1)?;
     let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
         return hybrid_search(store, query, None, &[]);
@@ -192,8 +225,7 @@ fn search_with_server(
     // The truncation size is part of the identity of every cached vector.
     let model = model.map(|m| memb_embed::mrl_tag(m, mrl));
     let model = model.as_deref();
-    let cache =
-        QUERIES.get_or_init(|| Mutex::new(memb_embed::QueryLru::new(memb_embed::QUERY_LRU_CAP)));
+    let cache = query_cache();
     let key = model.map(|m| format!("{port}:{m}:{}:{query}", query.len()));
     let cached = key
         .as_ref()

@@ -10,7 +10,7 @@ These commands run on your machine against the local database. None of them star
 
 A foreground loop for a background process or a scheduled task. **memb does not install the scheduled task itself**; you start the process yourself or run the reviewed installer yourself (see "Scheduled task" below).
 
-- **Start:** applies Windows' 2 GiB job-object memory cap to itself, reads [config.toml](Configuration.md), opens the store, waits 30 seconds, then checks once a minute.
+- **Start:** applies Windows' 2 GiB job-wide memory cap (with kill-on-close) to itself, starts the memory governor (unloads the idle embedding model; at 1550 MiB drops it and the query cache; at 1750 MiB the daemon pauses the routine and curation until memory falls), reads [config.toml](Configuration.md), opens the store, waits 30 seconds, then checks once a minute.
 - **When it runs:** once a day, at or after the configured WIB time (default 15:45, UTC+7), at least `cooldown_hours` (default 20) after the last *successful* run, and in any case once 24 hours (or the cooldown, if longer) have passed since then. The very first run is due immediately.
 - **One run at a time:** a run takes a 30-minute lease stored in the database, so a second daemon (or a restart) does not start the routine while a lease is held. The lease is not renewed: a run that takes longer than 30 minutes can overlap a later claim, but it is then refused when it tries to record its result, so it can never mark the routine successful. A clock that moves backwards is refused.
 - **A run does, in order:**

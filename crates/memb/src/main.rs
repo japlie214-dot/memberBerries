@@ -260,6 +260,12 @@ fn main() {
         );
         std::process::exit(2);
     }
+    // The MCP server is long-lived and may hold the embedding model: it shares the same
+    // 2 GiB job-wide cap as the daemon (best effort; a hook is short-lived and does not
+    // attach) and the same memory governor.
+    #[cfg(windows)]
+    let _job = memb_win::attach_job_object_2gb_cap().ok();
+    start_resource_governor();
     if run().is_err() {
         eprintln!("memb: invalid startup configuration or stdio failure");
         std::process::exit(1);
@@ -423,6 +429,30 @@ fn daemon_curate(store: &Store, cfg: &config::Config, now: u64) {
     }
 }
 
+/// Memory pressure of this process against the governor thresholds (1200/1550/1750 MiB).
+fn memory_pressure() -> memb_win::PressureLevel {
+    memb_win::classify_pressure(memb_win::process_private_mib().unwrap_or(0))
+}
+
+/// Starts the memory governor thread of a long-running process: every 15 seconds the
+/// in-process embedding model is unloaded once it has been idle for its tier's time
+/// (300 s on CpuLite, 600 s on CpuBalanced), and from the trim threshold (1550 MiB) the
+/// model and the query cache are dropped at once. The model loads again on next use.
+fn start_resource_governor() {
+    let tier = memb_win::choose_tier(&memb_win::probe_hardware());
+    let idle = std::time::Duration::from_secs(tier.idle_unload_secs());
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        if memb_win::should_trim_caches(memory_pressure()) {
+            if memb_rag::trim_caches() > 0 {
+                eprintln!("memb: memory pressure; embedding model unloaded");
+            }
+        } else {
+            memb_rag::unload_idle_models(idle);
+        }
+    });
+}
+
 fn daemon(cli_mirror_root: Option<&Path>) -> Result<(), String> {
     #[cfg(windows)]
     let _job = memb_win::attach_job_object_2gb_cap()?;
@@ -435,8 +465,16 @@ fn daemon(cli_mirror_root: Option<&Path>) -> Result<(), String> {
             return Err("mirror root must be an existing absolute directory".into());
         }
     }
+    start_resource_governor();
     std::thread::sleep(std::time::Duration::from_secs(30));
     loop {
+        // Heavy background work (the routine, curation) waits while this process is at
+        // the shed threshold (1750 MiB); the governor thread frees caches meanwhile.
+        if !memb_win::allow_background_jobs(memory_pressure()) {
+            eprintln!("memb: memory pressure; background work paused");
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            continue;
+        }
         match daemon_once(&store, &cfg, now_ms()?, mirror_root) {
             Ok(Some((swept, staged))) => eprintln!("memb: routine done; swept {swept}, staged {staged}"),
             Ok(None) => {}

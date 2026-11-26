@@ -1,4 +1,5 @@
 pub mod gemma;
+pub mod idle;
 
 use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,11 @@ impl QueryLru {
             self.order.push_back(key.to_owned());
         }
         self.map.get(key)
+    }
+    /// Forgets every entry (memory pressure).
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.map.clear();
     }
     pub fn insert(&mut self, key: String, val: QuantizedVec) {
         if self.cap == 0 {
