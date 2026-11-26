@@ -500,7 +500,8 @@ const MAX_HOOK_MESSAGE: usize = 16 * 1024;
 const MAX_TRANSCRIPT_TAIL: u64 = 2 * 1024 * 1024;
 
 /// Antigravity only lets a hook read its own transcript, in its own layout:
-/// `.../.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl`.
+/// `.../.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript_full.jsonl`
+/// (agy 1.5.15; `transcript.jsonl` in earlier layouts).
 /// The path comes from the hook payload, so anything else is refused.
 fn agy_transcript_path(path: &str, conversation: &str) -> Result<PathBuf, String> {
     let canonical = Path::new(path).canonicalize().map_err(|_| "transcript")?;
@@ -509,19 +510,23 @@ fn agy_transcript_path(path: &str, conversation: &str) -> Result<PathBuf, String
         .map(|c| c.as_os_str().to_str().unwrap_or(""))
         .collect();
     let n = parts.len();
-    let layout = [
-        ".gemini",
-        "antigravity-cli",
-        "brain",
-        conversation,
-        ".system_generated",
-        "logs",
-        "transcript.jsonl",
-    ];
-    if n < layout.len() || parts[n - layout.len()..] != layout || !canonical.is_file() {
+    let matches_layout = |name: &str| {
+        let layout = [".gemini", "antigravity-cli", "brain", conversation, ".system_generated", "logs", name];
+        n >= layout.len() && parts[n - layout.len()..] == layout
+    };
+    if !(matches_layout("transcript_full.jsonl") || matches_layout("transcript.jsonl")) || !canonical.is_file() {
         return Err("transcript outside the Antigravity layout".into());
     }
     Ok(canonical)
+}
+
+/// agy wraps what the user typed in `<USER_REQUEST>...</USER_REQUEST>` and appends its own
+/// metadata blocks; only what the user typed is a message.
+fn unwrap_user_request(content: &str) -> String {
+    match (content.find("<USER_REQUEST>"), content.find("</USER_REQUEST>")) {
+        (Some(start), Some(end)) if start + 14 <= end => content[start + 14..end].trim().to_owned(),
+        _ => content.to_owned(),
+    }
 }
 
 /// The latest completed turn in an Antigravity transcript: the last final model answer
@@ -556,7 +561,7 @@ fn agy_turn(transcript: &Path) -> Result<Vec<(memb_scroll::Role, String)>, Strin
             continue;
         }
         match (field("source"), field("type"), field("status")) {
-            (Some("USER_EXPLICIT"), Some("USER_INPUT"), Some("DONE")) => user = Some(content.to_owned()),
+            (Some("USER_EXPLICIT"), Some("USER_INPUT"), Some("DONE")) => user = Some(unwrap_user_request(content)),
             (Some("MODEL"), Some("PLANNER_RESPONSE"), Some("DONE"))
                 if record.get("tool_calls").and_then(Value::as_array).is_none_or(|c| c.is_empty()) =>
             {

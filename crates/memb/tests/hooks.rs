@@ -232,3 +232,52 @@ fn antigravity_ignores_unfinished_unknown_or_foreign_input() {
         assert!(e.messages(id).is_empty(), "{id}");
     }
 }
+
+/// Reads back what a real host's hook stored (task T013). Not a test of its own:
+/// `MEMB_T013_DATA=<dir> MEMB_T013_SESSION=<id> cargo test -p memb --test hooks t013_read_scroll -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn t013_read_scroll() {
+    let (Ok(data), Ok(session)) = (std::env::var("MEMB_T013_DATA"), std::env::var("MEMB_T013_SESSION")) else {
+        return;
+    };
+    let store = Store::open(std::path::Path::new(&data)).unwrap();
+    let scroll = store.with_db(|db| memb_scroll::read_scroll(db, &session)).unwrap();
+    match scroll {
+        None => println!("T013-RESULT messages=0 (no scroll)"),
+        Some(s) => {
+            println!("T013-RESULT messages={}", s.messages.len());
+            for m in s.messages {
+                println!("T013-MSG {:?}: {}", m.role, m.content.chars().take(80).collect::<String>());
+            }
+        }
+    }
+}
+
+/// The layout a real agy 1.5.15 session wrote (T013): `transcript_full.jsonl`, and the
+/// user's text wrapped in `<USER_REQUEST>` with agy's own metadata after it.
+#[test]
+fn antigravity_real_layout_transcript_full_and_wrapped_user_request() {
+    let e = Env::new("agy-real");
+    let id = "conv-real";
+    let dir = e.root.join(".gemini/antigravity-cli/brain").join(id).join(".system_generated/logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let transcript = dir.join("transcript_full.jsonl");
+    let wrapped = "<USER_REQUEST>\nReply with exactly the single word: MANGO\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-26T11:05:59+07:00.\n</ADDITIONAL_METADATA>";
+    let text = format!("{}\n{}\n", rec("USER_EXPLICIT", "USER_INPUT", wrapped), rec("MODEL", "PLANNER_RESPONSE", "MANGO"));
+    std::fs::write(&transcript, text).unwrap();
+    let a = Agy { transcript: transcript.clone(), id: id.into() };
+    let payload = stop(&e, &a, &transcript, true);
+    assert_eq!(e.capture("agy", "assistant-stop", &payload), (String::new(), true));
+    let want = vec![
+        (Role::User, "Reply with exactly the single word: MANGO".to_string()),
+        (Role::Assistant, "MANGO".to_string()),
+    ];
+    assert_eq!(e.messages("agy_conv-real"), want);
+    // Any other file name in that directory is still refused.
+    let other = dir.join("transcript_other.jsonl");
+    std::fs::copy(&transcript, &other).unwrap();
+    let before = e.messages("agy_conv-real").len();
+    let _ = e.capture("agy", "assistant-stop", &stop(&e, &a, &other, true));
+    assert_eq!(e.messages("agy_conv-real").len(), before);
+}
