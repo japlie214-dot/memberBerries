@@ -21,6 +21,8 @@ def check_versions():
         found = json.loads((ROOT / "packages" / host / manifest).read_text(encoding="utf-8"))["version"]
         if found != version:
             raise ValueError(f"{host} manifest version {found} != workspace {version}")
+    if f"## {version}" not in (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"):
+        raise ValueError(f"CHANGELOG.md has no '## {version}' entry: every iteration needs its own version")
     return version
 
 
