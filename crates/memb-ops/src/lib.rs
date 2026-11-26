@@ -87,6 +87,17 @@ pub fn claim_daily_routine(db: &redb::Database, now_ms: u64, hour: u8, minute: u
 }
 
 pub fn claim_daily_routine_with(policy: &RoutinePolicy, db: &redb::Database, now_ms: u64, hour: u8, minute: u8, lease_ms: u64) -> Result<Option<RoutineClaim>, String> {
+    claim_routine(policy, db, now_ms, hour, minute, lease_ms, false)
+}
+
+/// `memb routine run-now`: claims the routine without waiting for the schedule or the
+/// cooldown. It still refuses while another run holds an unexpired lease, and a clock
+/// that moved backwards still fails, so it cannot run beside the daemon.
+pub fn claim_routine_now(db: &redb::Database, now_ms: u64, lease_ms: u64) -> Result<Option<RoutineClaim>, String> {
+    claim_routine(&RoutinePolicy::default(), db, now_ms, 0, 0, lease_ms, true)
+}
+
+fn claim_routine(policy: &RoutinePolicy, db: &redb::Database, now_ms: u64, hour: u8, minute: u8, lease_ms: u64, force: bool) -> Result<Option<RoutineClaim>, String> {
     if lease_ms == 0 || lease_ms > MAX_ROUTINE_LEASE_MS || hour > 23 || minute > 59 {
         return Err("invalid routine time or lease duration".into());
     }
@@ -100,7 +111,7 @@ pub fn claim_daily_routine_with(policy: &RoutinePolicy, db: &redb::Database, now
         };
         if now_ms < state.last_observed_ms { return Err("clock moved backwards".into()); }
         state.last_observed_ms = now_ms;
-        let claim = if state.claim.is_some_and(|c| now_ms < c.expires_at_ms) || !should_run_daily_routine_with(policy, now_ms, state.last_success_ms, hour, minute) {
+        let claim = if state.claim.is_some_and(|c| now_ms < c.expires_at_ms) || (!force && !should_run_daily_routine_with(policy, now_ms, state.last_success_ms, hour, minute)) {
             None
         } else {
             state.generation = state.generation.checked_add(1).ok_or("claim generation exhausted")?;
@@ -272,6 +283,30 @@ mod tests {
         assert!(should_run_daily_routine(last + 21 * h, last, 15, 45));
         // 19 hours ago: the cooldown has not passed, so not even at the target time.
         assert!(!should_run_daily_routine(last + 19 * h, last, 15, 45));
+    }
+
+    #[test]
+    fn run_now_bypasses_the_schedule_but_not_the_lease() {
+        let dir = std::env::temp_dir().join(format!("memb-ops-runnow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let p = RoutinePolicy::default();
+        let t0 = 5_000_000_000u64;
+        let first = store.with_db(|db| claim_daily_routine_with(&p, db, t0, 15, 45, 1000)).unwrap().unwrap();
+        store.with_db(|db| finish_daily_routine(db, first, t0 + 10, true)).unwrap();
+        // Five minutes later the schedule says no (cooldown), but run-now claims.
+        let soon = t0 + 5 * 60_000;
+        assert!(store.with_db(|db| claim_daily_routine_with(&p, db, soon, 15, 45, 1000)).unwrap().is_none());
+        let forced = store.with_db(|db| claim_routine_now(db, soon, 60_000)).unwrap();
+        assert!(forced.is_some(), "run-now ignores the cooldown and the time of day");
+        // While that claim is unexpired, neither a second run-now nor the schedule gets one.
+        assert!(store.with_db(|db| claim_routine_now(db, soon + 1, 60_000)).unwrap().is_none());
+        assert!(store.with_db(|db| claim_daily_routine_with(&p, db, soon + 2, 15, 45, 1000)).unwrap().is_none());
+        // A clock that went backwards still fails closed.
+        assert!(store.with_db(|db| claim_routine_now(db, t0, 60_000)).is_err());
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

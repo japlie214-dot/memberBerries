@@ -77,6 +77,23 @@ The task runs as you, interactively and not elevated, with no execution time lim
 
 Writes one Markdown file per active note (retracted and superseded notes get no file) into an **existing, empty directory outside the data directory** (create it first), with a link to each of the note's active parents. It is create-only: it never overwrites, updates or deletes a file and is not a sync; edits made in Obsidian are never imported. The snapshot is checked for credentials first and refused if any are found. A failure part-way can leave partial output, so use a fresh directory each time. The daemon does the same into `mirror-<timestamp>` subfolders.
 
+## Diagnostics
+
+Read-only commands for when something seems off. None of them prints note text or conversation text, except `chunk read`, and none sends anything to a model.
+
+```powershell
+.\memb.exe doctor                        # health check, exit code 1 if a core check fails
+.\memb.exe inspect session <id>          # <id> or <cli>_<id>, e.g. cc_<session id>
+.\memb.exe chunk read <chunk id> [--offset N] [--limit 1-50]
+.\memb.exe history [--note <id>] [--limit 1-200]   # the same command as `revisions`
+.\memb.exe routine run-now               # one daemon pass now
+```
+
+- **`doctor`** prints one line per check: `ok`, `info`, `warn` or `FAIL`. Core checks (`FAIL` makes the exit code 1): the data directory, opening `memory.redb` (which takes the lock), and `config.toml`. The rest are `ok`, `info` or `warn`: the embedding backend you configured (a port is only connected to, nothing is sent; a model directory is checked for its files), whether the curation model and fallback commands can be found on `PATH` without running them (a `.cmd` shim is flagged because memb starts commands without a shell), whether a model is waiting for its quota or auto-apply is paused, Job Object availability, CPU features, cores, RAM, the hardware tier and this process's memory, whether the plugin folder has its hooks file and whether capture or the kill switch is set in this environment, and the state of the optional `MemberBerriesDaemon` scheduled task (a task that points at a program that no longer exists is a warning: reinstall it with `scripts/install-daemon-task.ps1`).
+- **`inspect session`** prints one JSON line per match: messages out of `max_messages`, `total_chunks`, `dedup_epoch` (`total_chunks` divided by `scroll.dedup_reset_every_n_chunks`), the ids of the notes injected in that epoch, and memb's own memory use. Exit code 1 if the session does not exist.
+- **`chunk read`** prints a bounded page of a captured chunk as JSON. It needs `MEMB_SCROLL_CAPTURE=1` and refuses with `MEMB_NO_MEMORY=1` or in an ignored directory, exactly like the `scroll_chunk_read` tool. The text is untrusted and may be private.
+- **`routine run-now`** runs the daily routine (sweep, staging, mirror, expiry, and curation if `curator.daemon_enabled`) immediately, ignoring the time of day and the cooldown. It still takes the lease, so it prints `"ran": false` and exits 1 if the daemon, or another run, holds it.
+
 ## Revision history and rollback
 
 Every `remember`, `update`, `supersede` (two revisions: the old and the new note) and `retract` records numbered revisions with before and after images.

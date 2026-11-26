@@ -511,6 +511,59 @@ pub fn read_scroll(db: &Database, session_id: &str) -> Result<Option<ChatScroll>
     serde_json::from_slice(raw.value()).map(Some).map_err(|e| e.to_string())
 }
 
+/// What `memb inspect session` shows about one scroll. No message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionState {
+    pub cli: String,
+    pub messages: usize,
+    pub total_chunks: u32,
+    pub last_active_ms: u64,
+    /// The dedup epoch (`total_chunks / reset_every_n_chunks`) and the notes injected in it.
+    pub dedup_epoch: u32,
+    pub injected_note_ids: Vec<u64>,
+}
+
+/// The state of session `session_id` (the stored key, such as `cc_<id>`), or `None`.
+pub fn session_state(db: &Database, session_id: &str, reset_every_n_chunks: u32) -> Result<Option<SessionState>, String> {
+    let Some(scroll) = read_scroll(db, session_id)? else { return Ok(None) };
+    let r = db.begin_read().map_err(|e| e.to_string())?;
+    let meta = match r.open_table(SESSION_META_TABLE) {
+        Ok(t) => t
+            .get(session_id)
+            .map_err(|e| e.to_string())?
+            .map(|v| serde_json::from_slice::<SessionMeta>(v.value()).map_err(|e| e.to_string()))
+            .transpose()?,
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let (total_chunks, last_active_ms) = meta.map_or((0, scroll.updated_at_ms), |m| (m.total_chunks, m.last_active_ms));
+    let epoch = total_chunks / reset_every_n_chunks.max(1);
+    let prefix = format!("{}:{session_id}:{epoch}:", session_id.len());
+    let mut injected = Vec::new();
+    match r.open_table(INJECTIONS_TABLE) {
+        Ok(t) => {
+            for entry in t.range(prefix.as_str()..).map_err(|e| e.to_string())? {
+                let (key, _) = entry.map_err(|e| e.to_string())?;
+                let Some(note) = key.value().strip_prefix(prefix.as_str()) else { break };
+                if let Ok(id) = note.parse::<u64>() {
+                    injected.push(id);
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    injected.sort_unstable();
+    Ok(Some(SessionState {
+        cli: scroll.cli,
+        messages: scroll.messages.len(),
+        total_chunks,
+        last_active_ms,
+        dedup_epoch: epoch,
+        injected_note_ids: injected,
+    }))
+}
+
 pub fn should_inject_and_mark(
     db: &Database,
     session_id: &str,
@@ -617,6 +670,25 @@ mod tests {
         assert_eq!((swept[0].session_id.as_str(), swept[0].messages.len()), ("big", 45));
         assert_eq!(read_scroll(&db, "small").unwrap().unwrap().messages.len(), 44);
         assert_eq!(read_scroll(&db, "big").unwrap().unwrap().messages.len(), SCROLL_RETAIN_TAIL);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_state_reports_counts_epoch_and_injected_notes_without_text() {
+        let path = std::env::temp_dir().join(format!("memb_scroll_state_{}.redb", now_ms()));
+        let db = Database::create(&path).unwrap();
+        assert!(session_state(&db, "cc_none", 7).unwrap().is_none());
+        for i in 0..5 {
+            append_message(&db, "cc_s", "cc", Role::User, format!("secret text {i}"), true).unwrap();
+        }
+        assert!(should_inject_and_mark(&db, "cc_s", 42, 7).unwrap());
+        assert!(should_inject_and_mark(&db, "cc_s", 7, 7).unwrap());
+        assert!(should_inject_and_mark(&db, "cc_other", 99, 7).unwrap(), "another session's note");
+        let state = session_state(&db, "cc_s", 7).unwrap().unwrap();
+        assert_eq!((state.messages, state.total_chunks, state.dedup_epoch), (5, 0, 0));
+        assert_eq!(state.injected_note_ids, vec![7, 42]);
+        assert_eq!(state.cli, "cc");
         drop(db);
         let _ = std::fs::remove_file(path);
     }

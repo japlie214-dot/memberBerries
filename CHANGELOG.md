@@ -5,6 +5,10 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.6.0 (2026-11-26)
+
+- **Diagnostics:** new `memb doctor`, `memb inspect session <id>`, `memb chunk read <chunk id>` (gated like the `scroll_chunk_read` tool), `memb routine run-now` (skips the schedule, not the lease) and `memb history` (the Phase 4 name for `memb revisions`, which still works). Output never contains note or chat text, except `chunk read`.
+
 ## 0.5.0 (2026-11-26)
 
 - **Curation models:** the default headless model is Antigravity `agy` (gemini-4-hydrogen-medium, stream protocol, run with an empty home so none of your Antigravity plugins, MCP servers or rules load); Codex (gpt-6-luna, medium, isolated from your Codex plugins, skills, hooks, memories and AGENTS.md) is the fallback. New `curator.fallback_command`; `curator.cli_protocol` was removed again (an `agy` program is detected by name).

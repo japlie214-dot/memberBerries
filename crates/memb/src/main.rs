@@ -1,5 +1,6 @@
 mod config;
 mod curate;
+mod diag;
 mod viewer;
 mod web;
 
@@ -34,7 +35,50 @@ fn main() {
         eprintln!("Usage: memb mirror --out <existing-empty-directory>");
         std::process::exit(2);
     }
-    if args.first().is_some_and(|a| a == "revisions") {
+    if args.first().is_some_and(|a| a == "doctor") {
+        if args.len() != 1 {
+            eprintln!("Usage: memb doctor");
+            std::process::exit(2);
+        }
+        std::process::exit(run_doctor());
+    }
+    if args.first().is_some_and(|a| a == "inspect") {
+        let [_, what, id] = args.as_slice() else {
+            eprintln!("Usage: memb inspect session <session id>");
+            std::process::exit(2);
+        };
+        if what != "session" {
+            eprintln!("Usage: memb inspect session <session id>");
+            std::process::exit(2);
+        }
+        match settings_with_config().and_then(|(store, cfg)| diag::inspect_session(&store, &cfg, id)) {
+            Ok(found) if !found.is_empty() => {
+                for session in found {
+                    println!("{session}");
+                }
+                return;
+            }
+            Ok(_) => {
+                eprintln!("memb: no such session (captured sessions are stored as <cli>_<id>)");
+                std::process::exit(1);
+            }
+            Err(reason) => {
+                eprintln!("memb: inspect failed: {reason}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.first().is_some_and(|a| a == "chunk") {
+        std::process::exit(run_chunk_read(&args[1..]));
+    }
+    if args.first().is_some_and(|a| a == "routine") {
+        if args.as_slice() != ["routine", "run-now"] {
+            eprintln!("Usage: memb routine run-now");
+            std::process::exit(2);
+        }
+        std::process::exit(run_routine_now());
+    }
+    if args.first().is_some_and(|a| a == "revisions" || a == "history") {
         let parsed = match args.as_slice() {
             [_] => Some((None, 20)),
             [_, f, id] if f == "--note" => id.parse::<u64>().ok().filter(|n| *n > 0).map(|n| (Some(n), 20)),
@@ -45,7 +89,7 @@ fn main() {
             _ => None,
         };
         let Some((note, limit)) = parsed else {
-            eprintln!("Usage: memb revisions [--note <id>] [--limit <1-200>]");
+            eprintln!("Usage: memb history [--note <id>] [--limit <1-200>]   (memb revisions is the same command)");
             std::process::exit(2);
         };
         match settings().and_then(|store| store.list_revisions(note, limit)) {
@@ -256,7 +300,7 @@ fn main() {
     }
     if args != ["mcp"] {
         eprintln!(
-            "Usage: memb mcp | memb search <query> | memb web [--port PORT] | memb mirror --out <dir> | memb revisions [--note <id>] | memb rollback --rev <id> | memb daemon [--mirror-out <dir>] | memb curate [--dry-run] | memb proposals [...] | memb --version"
+            "Usage: memb mcp | memb search <query> | memb web [--port PORT] | memb mirror --out <dir> | memb revisions [--note <id>] | memb rollback --rev <id> | memb daemon [--mirror-out <dir>] | memb curate [--dry-run | --retry-now] | memb proposals [...] | memb doctor | memb inspect session <id> | memb chunk read <id> | memb history [--note <id>] | memb routine run-now | memb --version"
         );
         std::process::exit(2);
     }
@@ -381,11 +425,22 @@ fn now_ms() -> Result<u64, String> {
 /// is set, curate. Proposals never apply themselves.
 /// Returns None when no routine was due or another process holds the claim.
 fn daemon_once(store: &Store, cfg: &config::Config, now: u64, mirror_root: Option<&Path>) -> Result<Option<(usize, usize)>, String> {
+    daemon_once_with(store, cfg, now, mirror_root, false)
+}
+
+/// One routine pass. `force` (`memb routine run-now`) skips the schedule and the
+/// cooldown but not the lease, so it cannot run beside the daemon.
+fn daemon_once_with(store: &Store, cfg: &config::Config, now: u64, mirror_root: Option<&Path>, force: bool) -> Result<Option<(usize, usize)>, String> {
     let d = &cfg.scheduler;
     let policy = memb_ops::RoutinePolicy::new(d.routine_wib_hour, d.routine_wib_minute, d.cooldown_hours)?;
     let minute_of_day = ((now / 60_000) % 1440 + 7 * 60) % 1440; // WIB
     let (h, m) = ((minute_of_day / 60) as u8, (minute_of_day % 60) as u8);
-    let Some(claim) = store.with_db(|db| memb_ops::claim_daily_routine_with(&policy, db, now, h, m, 30 * 60 * 1000))? else {
+    let claimed = if force {
+        store.with_db(|db| memb_ops::claim_routine_now(db, now, 30 * 60 * 1000))?
+    } else {
+        store.with_db(|db| memb_ops::claim_daily_routine_with(&policy, db, now, h, m, 30 * 60 * 1000))?
+    };
+    let Some(claim) = claimed else {
         return Ok(None);
     };
     let started = std::time::Instant::now();
@@ -426,6 +481,109 @@ fn daemon_curate(store: &Store, cfg: &config::Config, now: u64) {
     match curated {
         Ok(summary) => eprintln!("memb: curation done; {} proposal(s) now await review", summary.proposals.len()),
         Err(reason) => eprintln!("memb: curation skipped: {reason}"),
+    }
+}
+
+/// `memb doctor`: prints one line per check; exit code 1 if any check failed.
+fn run_doctor() -> i32 {
+    let root = match data_root() {
+        Ok(root) => root,
+        Err(_) => {
+            println!("FAIL data dir: no local data directory (set MEMB_DATA_DIR or LOCALAPPDATA)");
+            return 1;
+        }
+    };
+    let config = config::Config::load(&root).and_then(|cfg| cfg.apply_embedding_env().map(|_| cfg));
+    let store = config
+        .as_ref()
+        .ok()
+        .and_then(|cfg| open_store(&root, cfg).ok())
+        .or_else(|| Store::open(&root).ok());
+    let now = now_ms().unwrap_or(0);
+    let checks = diag::doctor(&root, &config, store.as_ref(), now);
+    for check in &checks {
+        println!("{}", check.line());
+    }
+    let failed = checks.iter().filter(|c| c.status == diag::Status::Fail).count();
+    let warned = checks.iter().filter(|c| c.status == diag::Status::Warn).count();
+    println!("{} check(s), {failed} failed, {warned} warning(s)", checks.len());
+    i32::from(failed > 0)
+}
+
+/// `memb chunk read <chunk_id> [--offset N] [--limit N]`: the CLI twin of the
+/// `scroll_chunk_read` tool, behind the same capture gate. This is the one diagnostic that
+/// prints conversation text (untrusted, possibly private), so it is off unless capture is.
+fn run_chunk_read(args: &[String]) -> i32 {
+    const USAGE: &str = "Usage: memb chunk read <chunk id> [--offset <n>] [--limit <1-50>]";
+    let [read, id, rest @ ..] = args else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    if read != "read"
+        || id.is_empty()
+        || id.len() > 160
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        eprintln!("{USAGE}");
+        return 2;
+    }
+    let (mut offset, mut limit) = (0usize, 20usize);
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        let value = it.next().and_then(|v| v.parse::<usize>().ok());
+        match (flag.as_str(), value) {
+            ("--offset", Some(v)) => offset = v,
+            ("--limit", Some(v)) if (1..=50).contains(&v) => limit = v,
+            _ => {
+                eprintln!("{USAGE}");
+                return 2;
+            }
+        }
+    }
+    let cwd = env::current_dir().ok().and_then(|p| p.to_str().map(str::to_owned));
+    let (store, cfg) = match settings_with_config() {
+        Ok(pair) => pair,
+        Err(_) => return 1,
+    };
+    if !hook_allowed(cwd.as_deref(), &cfg.scroll.ignore_dirs) {
+        eprintln!("memb: scroll access is disabled (set MEMB_SCROLL_CAPTURE=1; not allowed in an ignored directory or with MEMB_NO_MEMORY)");
+        return 1;
+    }
+    match store.with_db(|db| memb_scroll::read_chunk(db, id, offset, limit)) {
+        Ok(Some(chunk)) => {
+            println!("{chunk}");
+            0
+        }
+        Ok(None) => {
+            eprintln!("memb: no such chunk");
+            1
+        }
+        Err(_) => {
+            eprintln!("memb: could not read the chunk");
+            1
+        }
+    }
+}
+
+/// `memb routine run-now`: one daemon pass now, bypassing the schedule but not the lease.
+fn run_routine_now() -> i32 {
+    let result = settings_with_config().and_then(|(store, cfg)| {
+        let mirror = cfg.mirror_root(None)?;
+        daemon_once_with(&store, &cfg, now_ms()?, mirror.as_deref(), true)
+    });
+    match result {
+        Ok(Some((swept, staged))) => {
+            println!("{}", json!({"ran": true, "swept": swept, "staged": staged}));
+            0
+        }
+        Ok(None) => {
+            println!("{}", json!({"ran": false, "reason": "another routine run holds the lease"}));
+            1
+        }
+        Err(reason) => {
+            eprintln!("memb: routine failed: {reason}");
+            1
+        }
     }
 }
 
