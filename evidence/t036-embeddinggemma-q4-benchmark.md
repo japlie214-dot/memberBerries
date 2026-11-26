@@ -1,4 +1,4 @@
-# EmbeddingGemma 2 (ONNX q4) benchmark on this machine (memb 0.10.0, release build, 2026-11-26)
+# EmbeddingGemma 2 (ONNX q4) benchmark on this machine (release build, 2026-11-26; the main table ran on memb 0.10.0 with the default 2 threads, the thread table on 0.11.0 where `MEMB_EMBED_THREADS` exists)
 
 12 physical cores, 15897 MiB RAM, AVX-512 false, AVX2+FMA true; tier CpuLite; model uses 2 intra-op threads
 
@@ -65,4 +65,4 @@
 - **A warm search takes 210 to 330 ms**, of which only 86 to 154 ms is the model; the rest is the database opened several times per search (version check about 45 ms, lexical scan about 34 ms, expansion) which is T029.
 - **Building the hot set blocks the search.** 30 notes took 13.4 s on the first search; 470 new notes took 150.8 s (321 ms per note). The search that triggers it waits.
 - **Memory:** 164 MiB with the model loaded; it grew to 689 MiB after long inputs and 854 MiB after 500 notes; after `trim_caches` (the governor's unload) 691 MiB were still held, so unloading does not return all of it.
-- **A short-lived process pays the load every time:** 3 to 6 s to load the model. That is fine for the long-running MCP server, but a hook is a new process per prompt.
+- **A short-lived process pays the load every time.** Measured with the release binary running a real `memb hook prompt-submit --cli cc` on an empty store with a 150-character prompt (retrieval on, 256-wide vectors, 2 threads): 369 and 489 ms with the model disabled (lexical), 6,326, 3,272 and 3,822 ms with the model installed. That is fine for the long-running MCP server, but a hook is a new process per prompt (T040, T042).

@@ -131,7 +131,7 @@ fn embeddinggemma_q4_speed_memory_and_retrieval_quality_on_this_machine() {
     }
     let hw = memb_win::probe_hardware();
     line!("# EmbeddingGemma 2 (ONNX q4) on this machine\n");
-    line!("{} physical cores, {} MiB RAM, AVX-512 {}, AVX2+FMA {}; tier {:?}; model uses 2 intra-op threads\n", hw.physical_cores, hw.total_ram_mib, hw.avx512, hw.avx2_fma, memb_win::choose_tier(&hw));
+    line!("{} physical cores, {} MiB RAM, AVX-512 {}, AVX2+FMA {}; tier {:?}; MEMB_EMBED_THREADS={}\n", hw.physical_cores, hw.total_ram_mib, hw.avx512, hw.avx2_fma, memb_win::choose_tier(&hw), std::env::var("MEMB_EMBED_THREADS").unwrap_or_else(|_| "unset (2)".into()));
 
     // ---- load and memory
     let before = mib();
