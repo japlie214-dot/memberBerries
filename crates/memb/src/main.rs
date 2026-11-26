@@ -454,8 +454,12 @@ fn start_resource_governor() {
 }
 
 fn daemon(cli_mirror_root: Option<&Path>) -> Result<(), String> {
+    // Best effort, like the MCP server: if the job cannot be set up (a restricted
+    // environment), the daemon still runs, only without the cap.
     #[cfg(windows)]
-    let _job = memb_win::attach_job_object_2gb_cap()?;
+    let _job = memb_win::attach_job_object_2gb_cap()
+        .map_err(|_| eprintln!("memb: could not apply the 2 GiB job limit; continuing without it"))
+        .ok();
     let (store, cfg) = settings_with_config()?;
     // A directory given on the command line wins over `scheduler.obsidian_mirror_dir`.
     let mirror_root = cfg.mirror_root(cli_mirror_root)?;
