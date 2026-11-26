@@ -18,6 +18,15 @@ pub const QUERY_PREFIX: &str = "task: search result | query: ";
 const MAX_TOKENS: usize = 8192;
 const QUERY_MAX_TOKENS: usize = 512;
 
+/// Threads ONNX Runtime may use inside one embedding: 2 unless `MEMB_EMBED_THREADS` (1 to 64) says otherwise.
+fn intra_threads() -> usize {
+    std::env::var("MEMB_EMBED_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(2)
+}
+
 fn tokens(values: &[u32], query: bool) -> Vec<i64> {
     let mut values: Vec<i64> = values.iter().map(|&v| i64::from(v)).collect();
     if query && values.len() > QUERY_MAX_TOKENS {
@@ -135,7 +144,7 @@ impl GemmaEmbedder {
             .map_err(|e| e.to_string())?;
         let session = Session::builder()
             .map_err(|e| e.to_string())?
-            .with_intra_threads(2)
+            .with_intra_threads(intra_threads())
             .map_err(|e| e.to_string())?
             .with_inter_threads(1)
             .map_err(|e| e.to_string())?

@@ -101,6 +101,17 @@ pub fn variant_dir(root: &Path, variant: Variant) -> PathBuf {
     }
 }
 
+/// `memb models disable` leaves the files where they are but stops memb from using them
+/// automatically. It is a marker file in the data directory; an explicit backend choice
+/// (`embeddings.gemma_model_dir`, a port) is not affected.
+pub fn disabled_marker(root: &Path) -> PathBuf {
+    root.join("models").join("disabled")
+}
+
+pub fn is_disabled(root: &Path) -> bool {
+    disabled_marker(root).is_file()
+}
+
 /// The complete installed variant memb should use: the one that fits this machine if it is
 /// installed, otherwise any other complete one (for example a build the user chose to
 /// install with `--variant` on a machine below the floor).
@@ -130,7 +141,8 @@ pub fn is_complete(dir: &Path, manifest: &Manifest) -> bool {
 /// the default directory holds a complete model, use it. An explicit choice always wins.
 pub fn apply_default(root: &Path) {
     let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-    if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1")
+    if is_disabled(root)
+        || std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1")
         || set("MEMB_GEMMA_MODEL_DIR")
         || set("MEMB_EMBED_PORT")
     {
@@ -289,7 +301,7 @@ fn describe(hw: &memb_win::Hardware) -> String {
 
 /// `memb models status|install|remove`. Returns the exit code.
 pub fn run(root: &Path, args: &[String]) -> i32 {
-    let usage = "Usage: memb models status [--verify] | install [--variant q4|int8] [--yes] | remove [--yes]";
+    let usage = "Usage: memb models status [--verify] | install [--variant q4|int8] [--yes] | disable | enable | remove [--yes]";
     let mut yes = false;
     let mut verify = false;
     let mut requested: Option<Variant> = None;
@@ -334,7 +346,14 @@ pub fn run(root: &Path, args: &[String]) -> i32 {
                     println!("  {path}: {text}");
                 }
             }
+            if is_disabled(root) {
+                println!("disabled: memb does not use an installed model automatically (`memb models enable` turns it back on; an explicit embeddings setting still applies)");
+            }
             match installed_variant(root, &hw) {
+                Some((v, dir)) if is_disabled(root) => {
+                    println!("installed but not in use: the {} build in {}", v.name(), dir.display());
+                    1
+                }
                 Some((v, dir)) => {
                     // The loader does not hash files, so a corrupt file must not be called ready.
                     if inspect(&dir, &v.manifest(), verify).iter().any(|(_, s)| *s == FileState::Corrupt) {
@@ -362,6 +381,9 @@ pub fn run(root: &Path, args: &[String]) -> i32 {
                 }
             };
             let (dir, manifest) = (variant_dir(root, variant), variant.manifest());
+            if is_disabled(root) {
+                println!("note: automatic use is disabled; installing turns it back on");
+            }
             println!(
                 "memb will download the {} build: {} files ({:.0} MB) from {}\nto {}\nEvery file is checked against a pinned size and SHA-256. Nothing else is downloaded.",
                 variant.name(),
@@ -376,6 +398,7 @@ pub fn run(root: &Path, args: &[String]) -> i32 {
             }
             match install(&dir, &manifest, std::io::stderr().is_terminal(), &mut std::io::stdout()) {
                 Ok(n) => {
+                    let _ = std::fs::remove_file(disabled_marker(root));
                     println!("done: {n} file(s) downloaded; memb now uses the model automatically with {}-wide vectors (restart a running memb server or host to pick it up)", variant.mrl_dim());
                     0
                 }
@@ -385,6 +408,30 @@ pub fn run(root: &Path, args: &[String]) -> i32 {
                 }
             }
         }
+        "disable" => match std::fs::create_dir_all(root.join("models")).and_then(|()| std::fs::write(disabled_marker(root), b"disabled by `memb models disable`\n")) {
+            Ok(()) => {
+                println!("disabled: memb no longer uses an installed model automatically (files are kept; `memb models enable` undoes this; restart a running memb server or host)");
+                0
+            }
+            Err(e) => {
+                eprintln!("memb: cannot write {}: {e}", disabled_marker(root).display());
+                1
+            }
+        },
+        "enable" => match std::fs::remove_file(disabled_marker(root)) {
+            Ok(()) => {
+                println!("enabled: memb uses an installed model automatically again (restart a running memb server or host)");
+                0
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("already enabled");
+                0
+            }
+            Err(e) => {
+                eprintln!("memb: cannot remove {}: {e}", disabled_marker(root).display());
+                1
+            }
+        },
         "remove" => {
             let present: Vec<PathBuf> = Variant::ALL.into_iter().map(|v| variant_dir(root, v)).filter(|d| d.exists()).collect();
             if present.is_empty() {
@@ -619,6 +666,52 @@ mod tests {
         assert!(variant_dir(&root, v).exists());
         assert_eq!(run(&root, &args(&["remove", "--yes"])), 0);
         assert!(!variant_dir(&root, v).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disable_stops_automatic_use_without_deleting_and_enable_restores_it() {
+        let _guard = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp("disable");
+        let v = Variant::Q4;
+        for f in &v.manifest().files {
+            let p = file_path(&variant_dir(&root, v), f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::File::create(&p).unwrap().set_len(f.size).unwrap();
+        }
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let saved: Vec<_> = ["MEMB_GEMMA_MODEL_DIR", "MEMB_EMBED_PORT", "MEMB_EMBED_DISABLE", "MEMB_EMBED_MRL_DIM"].iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+        // Installed and enabled: used.
+        assert!(!is_disabled(&root));
+        assert_eq!(run(&root, &args(&["status"])), 0);
+        apply_default(&root);
+        assert!(std::env::var_os("MEMB_GEMMA_MODEL_DIR").is_some());
+        std::env::remove_var("MEMB_GEMMA_MODEL_DIR");
+        std::env::remove_var("MEMB_EMBED_MRL_DIM");
+        // Disabled: the files stay, nothing is selected, status says so.
+        assert_eq!(run(&root, &args(&["disable"])), 0);
+        assert!(is_disabled(&root) && variant_dir(&root, v).exists());
+        apply_default(&root);
+        assert!(std::env::var_os("MEMB_GEMMA_MODEL_DIR").is_none() && std::env::var_os("MEMB_EMBED_MRL_DIM").is_none());
+        assert_eq!(run(&root, &args(&["status"])), 1, "installed but not in use");
+        assert_eq!(run(&root, &args(&["disable"])), 0, "disabling twice is fine");
+        // Enabled again: used.
+        assert_eq!(run(&root, &args(&["enable"])), 0);
+        assert_eq!(run(&root, &args(&["enable"])), 0, "enabling twice is fine");
+        assert!(!is_disabled(&root));
+        apply_default(&root);
+        assert!(std::env::var_os("MEMB_GEMMA_MODEL_DIR").is_some());
+        // Extra arguments are refused.
+        assert_eq!(run(&root, &args(&["disable", "--bogus"])), 2);
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

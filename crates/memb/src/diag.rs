@@ -184,7 +184,7 @@ fn memb_embed_hint() -> String {
     }
 }
 
-fn embedding_check() -> Check {
+fn embedding_check(root: &Path) -> Check {
     if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1") {
         return Check::new("embeddings", Status::Info, "disabled: lexical-only search");
     }
@@ -200,6 +200,25 @@ fn embedding_check() -> Check {
         };
     }
     let port = std::env::var("MEMB_EMBED_PORT").ok().and_then(|p| p.parse::<u16>().ok()).filter(|p| *p != 0);
+    // No backend was chosen: a model installed by `memb models install` is used automatically
+    // (the doctor does not load the environment the way the server does, so look for it here).
+    if port.is_none() && crate::models::is_disabled(root) {
+        let installed = crate::models::installed_variant(root, &memb_win::probe_hardware()).is_some();
+        return Check::new(
+            "embeddings",
+            Status::Info,
+            format!("automatic local model disabled by `memb models disable` ({}); lexical-only search; `memb models enable` turns it back on", if installed { "a model is installed" } else { "none installed" }),
+        );
+    }
+    if port.is_none() {
+        if let Some((variant, dir)) = crate::models::installed_variant(root, &memb_win::probe_hardware()) {
+            return Check::new(
+                "embeddings",
+                Status::Ok,
+                format!("EmbeddingGemma 2 {} build installed in {}; memb uses it automatically with {}-wide vectors", variant.name(), dir.display(), variant.mrl_dim()),
+            );
+        }
+    }
     match port {
         Some(port) => {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -268,7 +287,7 @@ pub fn doctor(root: &Path, config: &Result<Config, String>, store: Option<&Store
     match config {
         Ok(cfg) => {
             checks.push(Check::new("config", Status::Ok, "config.toml is valid (or absent: defaults)"));
-            checks.push(embedding_check());
+            checks.push(embedding_check(root));
             checks.push(command_check("curation model", &cfg.curator.cli_command, "main model"));
             if let Some(fallback) = cfg.curator.fallback() {
                 checks.push(command_check("curation fallback", fallback, "fallback model"));

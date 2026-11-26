@@ -516,7 +516,7 @@ fn daemon_once_report(
 fn ensure_embedding_model(root: &Path, cfg: &config::Config) {
     let e = &cfg.embeddings;
     let chosen = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-    if !e.auto_download
+    if models::is_disabled(root) || !e.auto_download
         || !e.enabled
         || e.port.is_some()
         || e.gemma_model_dir.is_some()

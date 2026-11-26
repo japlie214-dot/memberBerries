@@ -5,6 +5,13 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.11.0 (2026-11-26)
+
+- `memb models disable` and `memb models enable`: stop or resume automatic use of an installed model without deleting it. `memb models install` re-enables; `remove` deletes. Status and doctor say when it is disabled.
+- `memb doctor` now reports an installed model (it said lexical-only while one was installed, because it does not load the environment the way the server does).
+- `MEMB_EMBED_THREADS` sets the ONNX Runtime threads per embedding (default 2).
+- An opt-in benchmark (`crates/memb/tests/embed_bench.rs`) and the recorded 4-bit results on a 12-core, 16 GB, AVX2 machine (`evidence/t036-embeddinggemma-q4-benchmark.md`).
+
 ## 0.10.0 (2026-11-26)
 
 - **Hardware-aware model build (Phase 2 tiers):** `memb models install` picks the EmbeddingGemma 2 build that fits the machine: 4-bit with 256-wide vectors on a weaker machine, 8-bit with 512-wide vectors with AVX2 or AVX-512, 8 physical cores and 16 GB. A machine below the floor (no AVX2 with FMA or AVX-512, or under 8 GB RAM) is told so; `--variant q4|int8` overrides. memb uses the installed build and its paired width automatically (a width you set in `embeddings.mrl_dim` wins). `memb models status` and `memb doctor` show the machine and the recommendation. The in-process loader accepts either build.
