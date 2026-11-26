@@ -129,6 +129,32 @@ impl KillOnCloseJob {
         Ok(())
     }
 
+    /// Starts `command` already inside this job: the process is created suspended,
+    /// assigned to the job and only then resumed, so it cannot start a grandchild that
+    /// escapes the job in between. Returns the child and whether the assignment worked
+    /// (if not, the child still runs, unconfined).
+    pub fn spawn(&self, command: &mut std::process::Command) -> std::io::Result<(std::process::Child, bool)> {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtResumeProcess(process: windows_sys::Win32::Foundation::HANDLE) -> i32;
+        }
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        command.creation_flags(CREATE_SUSPENDED);
+        let child = command.spawn()?;
+        let assigned = self.assign(&child).is_ok();
+        // Resume even if the assignment failed: a suspended process would hang forever.
+        let status = unsafe { NtResumeProcess(child.as_raw_handle() as _) };
+        if status < 0 {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other("could not resume the started process"));
+        }
+        Ok((child, assigned))
+    }
+
     /// Kills every process in the job now.
     pub fn terminate(&self) {
         unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1); }

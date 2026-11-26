@@ -100,17 +100,33 @@ impl Backend {
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // Everything the command starts joins a kill-on-close job, so a program it leaves
+        // running after it exits (`start /B`) is stopped too. The process starts suspended
+        // and joins the job before it runs, so nothing it starts can escape. Best effort:
+        // without a job the process-tree stop below still applies.
+        #[cfg(windows)]
+        let (mut child, mut job) = match memb_win::KillOnCloseJob::new() {
+            Ok(j) => {
+                let (child, assigned) = j
+                    .spawn(&mut command)
+                    .map_err(|_| "could not start the curation command".to_string())?;
+                (child, assigned.then_some(j))
+            }
+            Err(_) => (
+                command
+                    .spawn()
+                    .map_err(|_| "could not start the curation command".to_string())?,
+                None,
+            ),
+        };
+        #[cfg(not(windows))]
+        let mut child = command
             .spawn()
             .map_err(|_| "could not start the curation command".to_string())?;
-        // Everything the command starts joins a kill-on-close job, so a program it leaves
-        // running after it exits (`start /B`) is stopped too. Best effort: without a job
-        // the process-tree stop below still applies.
-        #[cfg(windows)]
-        let mut job = memb_win::KillOnCloseJob::new().ok().filter(|j| j.assign(&child).is_ok());
         let mut stdin = child.stdin.take().ok_or("curation command has no stdin")?;
         let mut stdout = child
             .stdout
@@ -405,6 +421,8 @@ pub fn parse_summary(text: &str) -> Result<(String, bool), String> {
     let explicit = match value.get("explicit_signal") {
         None => false,
         Some(Value::Bool(b)) => *b,
+        // A model that has nothing to flag may write null: that means "no".
+        Some(Value::Null) => false,
         Some(_) => return Err("explicit_signal must be true or false".into()),
     };
     Ok((lines.join("\n"), explicit))
@@ -571,6 +589,7 @@ mod tests {
 
     #[test]
     fn summaries_are_parsed_strictly_and_the_prompt_is_bounded() {
+        assert!(!parse_summary(r#"{"summary":["a"],"explicit_signal":null}"#).unwrap().1);
         let (text, explicit) = parse_summary(r#"{"summary":["Uses redb","Prefers\nlexical fallback"],"explicit_signal":true}"#).unwrap();
         assert_eq!(text, "- Uses redb\n- Prefers lexical fallback");
         assert!(explicit);
