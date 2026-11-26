@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/memb", "crates/memb-core", "crates/memb-store", "crates/memb-scroll", "crates/memb-win", "crates/memb-embed", "crates/memb-rag", "crates/memb-curator", "crates/memb-ops"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.89"
 

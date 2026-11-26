@@ -175,6 +175,19 @@ impl Store {
         result
     }
 
+    /// Compacts `memory.redb` (Phase 4 storage hygiene) while holding the store lock.
+    /// Returns the file size before and after. Notes, revisions and every other table
+    /// are unchanged; only unused pages are returned to the file system.
+    pub fn compact(&self) -> Result<(u64, u64), String> {
+        let _lock = acquire_os_lock(&self.root)?;
+        let mut db = self.open_db()?;
+        let before = fs::metadata(self.db_path()).map(|m| m.len()).unwrap_or(0);
+        db.compact().map_err(|e| format!("compact redb: {e}"))?;
+        drop(db);
+        let after = fs::metadata(self.db_path()).map(|m| m.len()).unwrap_or(0);
+        Ok((before, after))
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -1271,6 +1284,46 @@ mod tests {
 
         let err = Store::open(&dir).err().expect("must fail closed on corrupt legacy project");
         assert!(err.contains("aborting v1->v2 migration"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use memb_core::{Draft, Kind};
+
+    #[test]
+    fn compaction_keeps_every_note_and_revision_and_never_grows_the_file() {
+        let dir = std::env::temp_dir().join(format!("memb-compact-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..200 {
+            let note = store
+                .remember(Draft {
+                    title: format!("note {i}"),
+                    desc: "x".repeat(2000),
+                    kind: Kind::Topic,
+                    parents: vec![],
+                    properties: Default::default(),
+                })
+                .unwrap();
+            ids.push(note.id);
+        }
+        for id in &ids[..150] {
+            store.retract(*id, None, false).unwrap();
+        }
+        let notes_before = store.load_all_notes().unwrap();
+        let revisions_before = store.list_revisions(None, 200).unwrap().len();
+        let (before, after) = store.compact().unwrap();
+        assert!(after <= before, "{after} > {before}");
+        assert_eq!(store.load_all_notes().unwrap(), notes_before, "notes are untouched");
+        assert_eq!(store.list_revisions(None, 200).unwrap().len(), revisions_before);
+        // A second pass has nothing left to give back and still works.
+        let (again_before, again_after) = store.compact().unwrap();
+        assert!(again_after <= again_before);
+        drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
 }

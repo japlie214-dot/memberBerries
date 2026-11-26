@@ -424,13 +424,30 @@ fn now_ms() -> Result<u64, String> {
 /// One maintenance pass: sweep, stage, mirror, expire and, only if `curator.daemon_enabled`
 /// is set, curate. Proposals never apply themselves.
 /// Returns None when no routine was due or another process holds the claim.
+#[cfg(test)]
 fn daemon_once(store: &Store, cfg: &config::Config, now: u64, mirror_root: Option<&Path>) -> Result<Option<(usize, usize)>, String> {
-    daemon_once_with(store, cfg, now, mirror_root, false)
+    daemon_once_report(store, cfg, now, mirror_root, false, &mut Maintenance::default())
+}
+
+/// What the Phase 4 maintenance steps of one routine pass did.
+#[derive(Default, Debug)]
+struct Maintenance {
+    pruned_scrolls: usize,
+    merges_proposed: usize,
+    /// Database file size before and after compaction, if it ran.
+    compacted: Option<(u64, u64)>,
 }
 
 /// One routine pass. `force` (`memb routine run-now`) skips the schedule and the
 /// cooldown but not the lease, so it cannot run beside the daemon.
-fn daemon_once_with(store: &Store, cfg: &config::Config, now: u64, mirror_root: Option<&Path>, force: bool) -> Result<Option<(usize, usize)>, String> {
+fn daemon_once_report(
+    store: &Store,
+    cfg: &config::Config,
+    now: u64,
+    mirror_root: Option<&Path>,
+    force: bool,
+    report: &mut Maintenance,
+) -> Result<Option<(usize, usize)>, String> {
     let d = &cfg.scheduler;
     let policy = memb_ops::RoutinePolicy::new(d.routine_wib_hour, d.routine_wib_minute, d.cooldown_hours)?;
     let minute_of_day = ((now / 60_000) % 1440 + 7 * 60) % 1440; // WIB
@@ -458,11 +475,23 @@ fn daemon_once_with(store: &Store, cfg: &config::Config, now: u64, mirror_root: 
             mirror_snapshot(store, &dir)?;
         }
         curate::expire_old(store, cfg, now)?;
+        // Phase 4 storage hygiene: a scroll that never reached the idle-sweep floor (or is
+        // what is left of a session after its chunks were saved) is dropped after 14 days.
+        // Notes and chunks are never touched.
+        report.pruned_scrolls = store.with_db(|db| {
+            memb_scroll::prune_thin_idle_scrolls(db, now, d.idle_sweep_min_messages, 14 * 24 * 3600 * 1000)
+        })?;
+        // Phase 4 consolidation: near-duplicate knowledge or claims become pending merge
+        // proposals (needs an embedding backend; nothing is applied here).
+        report.merges_proposed = curate::consolidate_routine(store, cfg, now);
         // Opt-in only: this sends conversation text to the configured command with nobody
         // at the keyboard. A failing or unavailable model never fails the routine (the
         // sweep, staging and mirror succeeded, and the chunks stay staged for the next
         // run); it only produces pending proposals that wait for the user.
         daemon_curate(store, cfg, now);
+        // Last, so the file is compacted after this pass's own writes. A failure here never
+        // fails the routine.
+        report.compacted = store.compact().ok();
         Ok((swept, staged))
     })();
     let done = now.saturating_add(started.elapsed().as_millis() as u64);
@@ -569,14 +598,26 @@ fn run_chunk_read(args: &[String]) -> i32 {
 fn run_routine_now() -> i32 {
     let result = settings_with_config().and_then(|(store, cfg)| {
         let mirror = cfg.mirror_root(None)?;
-        daemon_once_with(&store, &cfg, now_ms()?, mirror.as_deref(), true)
+        let mut report = Maintenance::default();
+        daemon_once_report(&store, &cfg, now_ms()?, mirror.as_deref(), true, &mut report).map(|ran| (ran, report))
     });
     match result {
-        Ok(Some((swept, staged))) => {
-            println!("{}", json!({"ran": true, "swept": swept, "staged": staged}));
+        Ok((Some((swept, staged)), report)) => {
+            println!(
+                "{}",
+                json!({
+                    "ran": true,
+                    "swept": swept,
+                    "staged": staged,
+                    "pruned_scrolls": report.pruned_scrolls,
+                    "merges_proposed": report.merges_proposed,
+                    "db_bytes_before": report.compacted.map(|c| c.0),
+                    "db_bytes_after": report.compacted.map(|c| c.1),
+                })
+            );
             0
         }
-        Ok(None) => {
+        Ok((None, _)) => {
             println!("{}", json!({"ran": false, "reason": "another routine run holds the lease"}));
             1
         }
@@ -637,8 +678,14 @@ fn daemon(cli_mirror_root: Option<&Path>) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_secs(60));
             continue;
         }
-        match daemon_once(&store, &cfg, now_ms()?, mirror_root) {
-            Ok(Some((swept, staged))) => eprintln!("memb: routine done; swept {swept}, staged {staged}"),
+        let mut report = Maintenance::default();
+        match daemon_once_report(&store, &cfg, now_ms()?, mirror_root, false, &mut report) {
+            Ok(Some((swept, staged))) => eprintln!(
+                "memb: routine done; swept {swept}, staged {staged}, pruned {} thin scroll(s), proposed {} merge(s){}",
+                report.pruned_scrolls,
+                report.merges_proposed,
+                report.compacted.map_or(String::new(), |(a, b)| format!(", database {} -> {} KiB", a / 1024, b / 1024))
+            ),
             Ok(None) => {}
             Err(_) => {
                 // A failed run does not start the cooldown, so without a pause a persistent
@@ -1549,6 +1596,53 @@ mod daemon_tests {
         assert_eq!(std::fs::read_dir(&mirror_root).unwrap().count(), 1);
         // Success starts the cooldown; a second pass does nothing.
         assert_eq!(daemon_once(&store, &config::Config::default(), now + 60_000, Some(&mirror_root)).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_routine_prunes_only_thin_scrolls_idle_for_14_days_and_compacts_without_touching_notes() {
+        let dir = std::env::temp_dir().join(format!("memb-daemon-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let note = store
+            .remember(memb_core::Draft {
+                title: "kept".into(),
+                desc: "a note the routine must never touch".into(),
+                kind: memb_core::Kind::Topic,
+                parents: vec![],
+                properties: Default::default(),
+            })
+            .unwrap();
+        store.with_db(|db| {
+            for i in 0..5 {
+                memb_scroll::append_message(db, "thin", "test", memb_scroll::Role::User, format!("m {i}"), true)?;
+            }
+            for i in 0..45 {
+                memb_scroll::append_message(db, "thick", "test", memb_scroll::Role::User, format!("m {i}"), true)?;
+            }
+            Ok(())
+        }).unwrap();
+        let day = 24 * 3600 * 1000u64;
+        let at = |days: u64| (now_ms().unwrap() / day + days) * day + 9 * 3600 * 1000;
+        // 13 days on: thin scroll is not old enough (the 45-message one is swept into a chunk).
+        let mut report = Maintenance::default();
+        daemon_once_report(&store, &config::Config::default(), at(13), None, false, &mut report).unwrap();
+        assert_eq!(report.pruned_scrolls, 0);
+        assert!(store.with_db(|db| memb_scroll::read_scroll(db, "thin")).unwrap().is_some());
+        // 16 days on: the thin one is pruned, and what the sweep left of the thick one
+        // (its 10-message tail) is thin and old too. Notes and chunks stay.
+        let mut report = Maintenance::default();
+        daemon_once_report(&store, &config::Config::default(), at(16), None, true, &mut report).unwrap();
+        assert_eq!(report.pruned_scrolls, 2, "{report:?}");
+        assert!(store.with_db(|db| memb_scroll::read_scroll(db, "thin")).unwrap().is_none());
+        assert!(store.with_db(|db| memb_scroll::read_scroll(db, "thick")).unwrap().is_none());
+        assert_eq!(store.load_all_notes().unwrap().get(&note.id).unwrap().desc, "a note the routine must never touch");
+        let chunks = store.with_db(|db| memb_scroll::list_uncurated_chunks(db, 10).map(|c| c.len())).unwrap()
+            + store.with_db(|db| memb_scroll::list_staged_chunks(db, 10).map(|c| c.len())).unwrap();
+        assert!(chunks >= 1, "the chunk saved by the sweep is kept");
+        let (before, after) = report.compacted.expect("the routine compacted the database");
+        assert!(after <= before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

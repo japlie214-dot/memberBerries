@@ -528,6 +528,60 @@ pub fn threshold_due(store: &Store, now: u64) -> Result<bool, String> {
     Ok(now.saturating_sub(last) >= THRESHOLD_COOLDOWN_MS)
 }
 
+/// Merge plans one routine run may turn into proposals (two proposals each).
+const MAX_MERGES_PER_RUN: usize = 3;
+
+/// Phase 4 graph consolidation: turns near-duplicate knowledge or claim notes into pending
+/// proposals (an update of the survivor and a retraction of the duplicate), at most
+/// [`MAX_MERGES_PER_RUN`] per run, and never the same pair twice until one of the two
+/// notes changes. Nothing is applied here: the proposals wait for you like any other, and
+/// `memb proposals rollback` reverses an applied merge. Returns how many merges were proposed.
+pub fn consolidation_pass(
+    store: &Store,
+    cfg: &Config,
+    now: u64,
+    vectors: &[(u64, memb_embed::QuantizedVec)],
+) -> Result<usize, String> {
+    let pending = store.with_db(|db| ledger::list(db, Some(&Status::Pending), 200))?.len();
+    if pending + 2 * MAX_MERGES_PER_RUN > ledger::MAX_PENDING {
+        return Ok(0);
+    }
+    let notes = store.load_all_notes()?;
+    let ttl = ttl_ms(cfg);
+    let mut made = 0;
+    for plan in memb_curator::consolidate::find_merges(&notes, vectors, MAX_MERGES_PER_RUN) {
+        if store.with_db(|db| links::hash_seen(db, &plan.hash, now, ttl))? {
+            continue;
+        }
+        let (update, retract) = plan.action_json();
+        // Validated now and again when applied, like every other proposal.
+        let valid = [&update, &retract].iter().all(|json| {
+            serde_json::from_value::<CuratorAction>((*json).clone())
+                .ok()
+                .is_some_and(|action| Proposal::prepare(action, &plan.sources).is_ok())
+        });
+        if !valid || memb_core::reject_secrets(&format!("{update}{retract}")).is_err() {
+            continue;
+        }
+        store.with_db(|db| {
+            ledger::add(db, now, update.clone(), plan.sources.clone())?;
+            ledger::add(db, now, retract.clone(), plan.sources.clone())?;
+            links::record_hashes(db, &[plan.hash.clone()], now, ttl)
+        })?;
+        made += 1;
+    }
+    Ok(made)
+}
+
+/// The routine's consolidation step: needs an embedding backend (without one there are no
+/// vectors, so nothing is proposed). Failures never fail the routine.
+pub fn consolidate_routine(store: &Store, cfg: &Config, now: u64) -> usize {
+    match memb_rag::note_vectors(store) {
+        Ok(Some((_tag, vectors))) => consolidation_pass(store, cfg, now, &vectors).unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// Layer 1: one model call per staged chunk that has no summary yet (at most
 /// `MAX_SUMMARIES_PER_RUN`), then a local embedding of each summary. A model that
 /// cannot start or fails aborts the run before anything is recorded for that chunk; a
@@ -837,6 +891,77 @@ mod tests {
     #[cfg(windows)]
     fn model_ready_for(store: &Store, slots: usize, now: u64) -> bool {
         (0..slots).any(|slot| store.with_db(|db| links::quota_backoff(db, slot)).unwrap().0 <= now)
+    }
+
+    fn knowledge(store: &Store, title: &str, parent: u64, chunk: &str) -> u64 {
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert("source_chunks".to_owned(), json!([{"session_id": "s", "chunk_id": chunk}]));
+        store
+            .remember(memb_core::Draft {
+                title: title.into(),
+                desc: format!("{title} body"),
+                kind: memb_core::Kind::Knowledge,
+                parents: vec![parent],
+                properties,
+            })
+            .unwrap()
+            .id
+    }
+
+    fn unit(x: f32, y: f32) -> memb_embed::QuantizedVec {
+        let n = (x * x + y * y).sqrt();
+        memb_embed::QuantizedVec::from_f32(&[x / n, y / n])
+    }
+
+    #[test]
+    fn a_seeded_near_duplicate_pair_is_proposed_once_merged_on_approval_and_the_merge_is_reversible() {
+        let (store, root) = temp_store("consolidate");
+        let cfg = Config::default();
+        let topic = store
+            .remember(memb_core::Draft { title: "topic".into(), desc: "t".into(), kind: memb_core::Kind::Topic, parents: vec![], properties: Default::default() })
+            .unwrap()
+            .id;
+        let other_topic = store
+            .remember(memb_core::Draft { title: "other".into(), desc: "t".into(), kind: memb_core::Kind::Topic, parents: vec![], properties: Default::default() })
+            .unwrap()
+            .id;
+        let a = knowledge(&store, "use redb", topic, "c1");
+        let b = knowledge(&store, "we use redb", other_topic, "c2");
+        let c = knowledge(&store, "something else", topic, "c3");
+        let vectors = vec![(a, unit(1.0, 0.0)), (b, unit(0.99, 0.1)), (c, unit(0.0, 1.0))];
+        let now = 5_000_000_000_000u64;
+        assert_eq!(consolidation_pass(&store, &cfg, now, &vectors).unwrap(), 1);
+        let pending = store.with_db(|db| ledger::list(db, Some(&Status::Pending), 50)).unwrap();
+        assert_eq!(pending.len(), 2, "an update of the survivor and a retraction of the duplicate");
+        // Not proposed again for the same pair at the same versions.
+        assert_eq!(consolidation_pass(&store, &cfg, now + 1000, &vectors).unwrap(), 0);
+        assert_eq!(store.with_db(|db| ledger::list(db, Some(&Status::Pending), 50)).unwrap().len(), 2);
+        // Nothing changed until the user approves.
+        assert_eq!(store.load_all_notes().unwrap().get(&b).unwrap().status, memb_core::NoteStatus::Active);
+        let ids: Vec<u64> = pending.iter().map(|p| p.id).collect();
+        for id in &ids {
+            let mut out = Vec::new();
+            let applied = apply_interactive(&store, &cfg, *id, now + 2000, &mut std::io::Cursor::new(format!("APPLY {id}\n")), &mut out).unwrap();
+            assert!(applied, "{}", String::from_utf8_lossy(&out));
+        }
+        let notes = store.load_all_notes().unwrap();
+        assert_eq!(notes.get(&b).unwrap().status, memb_core::NoteStatus::Retracted);
+        let survivor = notes.get(&a).unwrap();
+        assert_eq!(survivor.properties["merged_from"], json!([b]));
+        assert!(survivor.parents.contains(&topic) && survivor.parents.contains(&other_topic), "the duplicate's parent edge moved to the survivor");
+        let sources = survivor.properties["source_chunks"].as_array().unwrap();
+        assert!(sources.len() >= 2, "provenance of both notes: {sources:?}");
+        // Reversible: roll both proposals back and the graph is as it was.
+        for id in ids.iter().rev() {
+            let mut out = Vec::new();
+            let done = rollback_interactive(&store, *id, now + 3000, &mut std::io::Cursor::new(format!("ROLLBACK {id}\n")), &mut out).unwrap();
+            assert!(done, "{}", String::from_utf8_lossy(&out));
+        }
+        let notes = store.load_all_notes().unwrap();
+        assert_eq!(notes.get(&b).unwrap().status, memb_core::NoteStatus::Active);
+        assert!(notes.get(&a).unwrap().properties.get("merged_from").is_none());
+        assert_eq!(notes.get(&a).unwrap().parents, vec![topic]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

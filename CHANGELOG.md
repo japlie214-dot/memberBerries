@@ -5,6 +5,11 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.7.0 (2026-11-26)
+
+- **Daily routine (Phase 4 maintenance):** thin scrolls (under 45 messages) idle for 14 days are pruned; near-duplicate knowledge or claim notes become reversible pending merge proposals (update the survivor, retract the duplicate; never applied by the daemon); `memory.redb` is compacted at the end of each run. `memb routine run-now` reports `pruned_scrolls`, `merges_proposed` and the database size before and after.
+- **Mirror:** files now carry `source_chunks` in the frontmatter and `## Children` wiki-links next to `## Parents`.
+
 ## 0.6.0 (2026-11-26)
 
 - **Diagnostics:** new `memb doctor`, `memb inspect session <id>`, `memb chunk read <chunk id>` (gated like the `scroll_chunk_read` tool), `memb routine run-now` (skips the schedule, not the lease) and `memb history` (the Phase 4 name for `memb revisions`, which still works). Output never contains note or chat text, except `chunk read`.

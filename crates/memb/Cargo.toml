@@ -11,6 +11,7 @@ memb-scroll = { path = "../memb-scroll" }
 memb-win = { path = "../memb-win" }
 memb-rag = { path = "../memb-rag" }
 memb-curator = { path = "../memb-curator" }
+memb-embed = { path = "../memb-embed" }
 memb-ops = { path = "../memb-ops" }
 serde.workspace = true
 serde_json.workspace = true

@@ -511,6 +511,53 @@ pub fn read_scroll(db: &Database, session_id: &str) -> Result<Option<ChatScroll>
     serde_json::from_slice(raw.value()).map(Some).map_err(|e| e.to_string())
 }
 
+/// Phase 4 storage hygiene: deletes scrolls with fewer than `thin_below` messages that
+/// have not changed for `older_than_ms` (what is left of a session after its chunks were
+/// saved, or a chat that never grew). Chunks and notes are never touched, and the
+/// per-session chunk counter is kept while the session has chunks (a new chunk must not
+/// reuse an old chunk id). Returns how many scrolls were removed.
+pub fn prune_thin_idle_scrolls(db: &Database, now_ms: u64, thin_below: usize, older_than_ms: u64) -> Result<usize, String> {
+    let w = db.begin_write().map_err(|e| e.to_string())?;
+    let mut doomed: Vec<String> = Vec::new();
+    {
+        let scrolls = w.open_table(SCROLLS_TABLE).map_err(|e| e.to_string())?;
+        for entry in scrolls.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            let scroll: ChatScroll = serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
+            if scroll.messages.len() < thin_below && now_ms.saturating_sub(scroll.updated_at_ms) > older_than_ms {
+                doomed.push(key.value().to_owned());
+            }
+        }
+    }
+    {
+        let mut scrolls = w.open_table(SCROLLS_TABLE).map_err(|e| e.to_string())?;
+        let mut metas = w.open_table(SESSION_META_TABLE).map_err(|e| e.to_string())?;
+        let mut injections = w.open_table(INJECTIONS_TABLE).map_err(|e| e.to_string())?;
+        for session in &doomed {
+            scrolls.remove(session.as_str()).map_err(|e| e.to_string())?;
+            let chunks = metas
+                .get(session.as_str())
+                .map_err(|e| e.to_string())?
+                .map(|v| serde_json::from_slice::<SessionMeta>(v.value()).map(|m| m.total_chunks).unwrap_or(1))
+                .unwrap_or(0);
+            if chunks == 0 {
+                metas.remove(session.as_str()).map_err(|e| e.to_string())?;
+            }
+            let prefix = format!("{}:{session}:", session.len());
+            let keys: Vec<String> = injections
+                .range(prefix.as_str()..)
+                .map_err(|e| e.to_string())?
+                .map_while(|entry| entry.ok().map(|(k, _)| k.value().to_owned()).filter(|k| k.starts_with(&prefix)))
+                .collect();
+            for key in keys {
+                injections.remove(key.as_str()).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    w.commit().map_err(|e| e.to_string())?;
+    Ok(doomed.len())
+}
+
 /// What `memb inspect session` shows about one scroll. No message text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionState {
@@ -670,6 +717,55 @@ mod tests {
         assert_eq!((swept[0].session_id.as_str(), swept[0].messages.len()), ("big", 45));
         assert_eq!(read_scroll(&db, "small").unwrap().unwrap().messages.len(), 44);
         assert_eq!(read_scroll(&db, "big").unwrap().unwrap().messages.len(), SCROLL_RETAIN_TAIL);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn only_the_thin_scroll_older_than_14_days_is_pruned_and_chunks_and_counters_stay() {
+        let path = std::env::temp_dir().join(format!("memb_scroll_prune_{}.redb", now_ms()));
+        let db = Database::create(&path).unwrap();
+        let day = 24 * 60 * 60 * 1000u64;
+        let put = |key: &str, count: usize| {
+            for i in 0..count {
+                append_message(&db, key, "cc", Role::User, format!("m{i}"), true).unwrap();
+            }
+        };
+        put("cc_thin_old", 5);
+        put("cc_thin_young", 5);
+        put("cc_thick_old", 45);
+        put("cc_thin_old_with_chunks", 10);
+        assert!(should_inject_and_mark(&db, "cc_thin_old", 9, 7).unwrap());
+        assert!(should_inject_and_mark(&db, "cc_thin_young", 9, 7).unwrap());
+        // Pretend a chunk was saved for one session (its counter must survive).
+        {
+            let w = db.begin_write().unwrap();
+            {
+                let mut metas = w.open_table(SESSION_META_TABLE).unwrap();
+                let meta = serde_json::to_vec(&SessionMeta { total_chunks: 3, last_active_ms: 1 }).unwrap();
+                metas.insert("cc_thin_old_with_chunks", meta.as_slice()).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let now = now_ms();
+        // Everything was just written: nothing is 14 days old yet.
+        assert_eq!(prune_thin_idle_scrolls(&db, now, 45, 14 * day).unwrap(), 0);
+        // 15 days later the thin ones are due; the 45-message scroll is not thin.
+        let later = now + 15 * day;
+        assert_eq!(prune_thin_idle_scrolls(&db, later, 45, 14 * day).unwrap(), 3);
+        assert!(read_scroll(&db, "cc_thin_old").unwrap().is_none());
+        assert!(read_scroll(&db, "cc_thin_young").unwrap().is_none(), "idle as long as the others here");
+        assert!(read_scroll(&db, "cc_thick_old").unwrap().is_some(), "45 messages is not thin");
+        assert!(session_state(&db, "cc_thick_old", 7).unwrap().is_some());
+        // The chunk counter of a session that has chunks is kept; one without is gone.
+        let r = db.begin_read().unwrap();
+        let metas = r.open_table(SESSION_META_TABLE).unwrap();
+        assert!(metas.get("cc_thin_old_with_chunks").unwrap().is_some());
+        assert!(metas.get("cc_thin_old").unwrap().is_none());
+        drop(metas);
+        drop(r);
+        // The pruned session's injection records are gone, so a fresh start is clean.
+        assert!(should_inject_and_mark(&db, "cc_thin_old", 9, 7).unwrap());
         drop(db);
         let _ = std::fs::remove_file(path);
     }

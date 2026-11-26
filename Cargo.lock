@@ -450,10 +450,11 @@ dependencies = [
 
 [[package]]
 name = "memb"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "memb-core",
  "memb-curator",
+ "memb-embed",
  "memb-ops",
  "memb-rag",
  "memb-scroll",
@@ -466,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "memb-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "regex",
  "serde",
@@ -475,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "memb-curator"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "memb-core",
  "memb-embed",
@@ -490,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "memb-embed"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ort",
  "redb",
@@ -502,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "memb-ops"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "memb-core",
  "memb-store",
@@ -513,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "memb-rag"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "memb-core",
  "memb-embed",
@@ -522,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "memb-scroll"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "memb-core",
  "redb",
@@ -532,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "memb-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "memb-core",
  "redb",
@@ -542,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "memb-win"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "windows-sys 0.59.0",
 ]

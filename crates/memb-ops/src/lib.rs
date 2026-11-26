@@ -201,7 +201,13 @@ pub fn write_obsidian_mirror(notes: &BTreeMap<u64, Note>, dir: &Path) -> Result<
         let properties = serde_json::to_string(&note.properties).map_err(|e| e.to_string())?;
         // JSON values are valid YAML scalars/collections and escape newlines.
         let title = serde_json::to_string(&note.title).map_err(|e| e.to_string())?;
-        let mut text = format!("---\nid: {}\nkind: {kind}\ntitle: {title}\nproperties: {properties}\n---\n\n# {}\n\n{}\n", note.id, note.title, note.desc);
+        // Provenance is also a key of its own, so a vault tool can list and filter by it.
+        let source_chunks = note
+            .properties
+            .get("source_chunks")
+            .map(|v| format!("source_chunks: {}\n", serde_json::to_string(v).unwrap_or_default()))
+            .unwrap_or_default();
+        let mut text = format!("---\nid: {}\nkind: {kind}\ntitle: {title}\n{source_chunks}properties: {properties}\n---\n\n# {}\n\n{}\n", note.id, note.title, note.desc);
         if !note.parents.is_empty() {
             text.push_str("\n## Parents\n");
             for parent in &note.parents {
@@ -209,6 +215,17 @@ pub fn write_obsidian_mirror(notes: &BTreeMap<u64, Note>, dir: &Path) -> Result<
                     let k = match p.kind { Kind::Topic => "topic", Kind::Knowledge => "knowledge", Kind::Claim => "claim" };
                     text.push_str(&format!("- [[{k}-{}]]\n", p.id));
                 }
+            }
+        }
+        let children: Vec<&Note> = notes
+            .values()
+            .filter(|c| c.status == NoteStatus::Active && c.parents.contains(&note.id))
+            .collect();
+        if !children.is_empty() {
+            text.push_str("\n## Children\n");
+            for c in children {
+                let k = match c.kind { Kind::Topic => "topic", Kind::Knowledge => "knowledge", Kind::Claim => "claim" };
+                text.push_str(&format!("- [[{k}-{}]]\n", c.id));
             }
         }
         let mut file = OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
@@ -375,6 +392,34 @@ mod tests {
         assert!(!output.contains("abcdefghijk"));
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn mirror_files_carry_wiki_links_both_ways_and_source_chunks_in_the_frontmatter() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("memb-ops-mirror-links-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut knowledge = note(2);
+        knowledge.kind = Kind::Knowledge;
+        knowledge.parents = vec![1];
+        knowledge.properties.insert("source_chunks".into(), serde_json::json!([{"session_id": "s", "chunk_id": "c1"}]));
+        let notes = BTreeMap::from([(1, note(1)), (2, knowledge)]);
+        assert_eq!(write_obsidian_mirror(&notes, &dir).unwrap(), 2);
+        let child = std::fs::read_to_string(dir.join("knowledge-2.md")).unwrap();
+        let (front, _) = child.split_once("\n---\n").unwrap();
+        assert!(front.contains("source_chunks: [{\"chunk_id\":\"c1\",\"session_id\":\"s\"}]"), "{front}");
+        assert!(child.contains("## Parents\n- [[topic-1]]"), "{child}");
+        let parent = std::fs::read_to_string(dir.join("topic-1.md")).unwrap();
+        assert!(parent.contains("## Children\n- [[knowledge-2]]"), "{parent}");
+        assert!(!parent.contains("source_chunks:"), "a note without provenance has no such key");
+        // A retracted child is not linked.
+        let mut gone = notes.clone();
+        gone.get_mut(&2).unwrap().status = NoteStatus::Retracted;
+        let dir2 = dir.join("second");
+        std::fs::create_dir(&dir2).unwrap();
+        write_obsidian_mirror(&gone, &dir2).unwrap();
+        assert!(!std::fs::read_to_string(dir2.join("topic-1.md")).unwrap().contains("Children"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn mirror_is_create_only() {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
