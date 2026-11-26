@@ -5,7 +5,7 @@ use memb_store::Store;
 /// Embeddings are opt-in. Set MEMB_EMBED_PORT for a loopback server and
 /// MEMB_EMBED_MODEL_ID to a stable model/version identifier to enable caches.
 pub fn search(store: &Store, query: &str) -> Result<Vec<Note>, String> {
-    store.search_lexical_ids(query, 1)?;
+    memb_core::validate_query(query).map_err(|e| e.to_string())?;
     // `embeddings.enabled = false` in config.toml (or MEMB_EMBED_DISABLE=1) forces lexical search.
     if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1") {
         return hybrid_search(store, query, None, &[]);
@@ -64,6 +64,9 @@ pub fn trim_caches() -> usize {
         .map(|models| models.values().filter(|m| m.unload()).count())
         .unwrap_or(0);
     clear_query_cache();
+    if let Ok(mut hot) = hot_cache().lock() {
+        hot.clear();
+    }
     dropped
 }
 
@@ -109,8 +112,14 @@ pub fn embed_text(text: &str, is_query: bool) -> Result<Option<(String, Quantize
         .filter(|s| !s.trim().is_empty() && s.len() <= 512);
     match (port, model) {
         (Some(port), Some(model)) => {
-            let v = memb_embed::local_embedding(port, text)?;
-            Ok(Some((memb_embed::mrl_tag(&model, mrl), v)))
+            // The same prompt formats as `search`: the query or document prefix of EmbeddingGemma.
+            let sent = if is_query {
+                memb_embed::server_query_text(text)
+            } else {
+                format!("{}{text}", memb_embed::gemma::DOC_PREFIX)
+            };
+            let v = memb_embed::local_embedding(port, &sent)?;
+            Ok(Some((server_tag(&model, mrl), v)))
         }
         _ => Ok(None),
     }
@@ -126,35 +135,132 @@ pub fn note_vectors(store: &Store) -> Result<Option<(String, Vec<(u64, Quantized
     let Some((tag, probe)) = embed_text("memb", false)? else {
         return Ok(None);
     };
+    let notes = store.load_all_notes()?;
+    let wanted: Vec<&Note> = notes
+        .values()
+        .filter(|n| {
+            n.status == memb_core::NoteStatus::Active
+                && matches!(n.kind, memb_core::Kind::Knowledge | memb_core::Kind::Claim)
+        })
+        .collect();
+    let keys: Vec<[u8; 32]> = wanted
+        .iter()
+        .map(|n| memb_embed::document_key(&tag, &n.title, &n.desc))
+        .collect();
     let cached = store
-        .with_db(|db| memb_embed::read_document_cache(db, &tag))
+        .with_db(|db| memb_embed::get_document_vectors(db, &keys))
         .unwrap_or_default();
     let mut fresh = Vec::new();
     let mut out = Vec::new();
-    for note in store.load_all_notes()?.values().filter(|n| {
-        n.status == memb_core::NoteStatus::Active
-            && matches!(n.kind, memb_core::Kind::Knowledge | memb_core::Kind::Claim)
-    }) {
-        let fingerprint = memb_embed::document_fingerprint(&note.title, &note.desc);
-        if let Some((_, v)) = cached
-            .get(&note.id)
-            .filter(|(f, v)| *f == fingerprint && v.data.len() == probe.data.len())
-        {
+    for (note, key) in wanted.iter().zip(&keys) {
+        if let Some(v) = cached.get(key).filter(|v| v.data.len() == probe.data.len()) {
             out.push((note.id, v.clone()));
             continue;
         }
-        match embed_text(&format!("{}\n{}", note.title, note.desc), false) {
+        match embed_text(&memb_embed::document_text(&note.title, &note.desc), false) {
             Ok(Some((t, v))) if t == tag && v.data.len() == probe.data.len() => {
-                fresh.push((note.id, fingerprint, v.clone()));
+                fresh.push((*key, v.clone()));
                 out.push((note.id, v));
             }
             _ => continue,
         }
     }
     if !fresh.is_empty() {
-        let _ = store.with_db(|db| memb_embed::write_document_cache(db, &tag, &fresh));
+        let _ = store.with_db(|db| memb_embed::put_document_vectors(db, &fresh));
     }
     Ok(Some((tag, out)))
+}
+
+type HotVectors = std::sync::Arc<Vec<(u64, QuantizedVec)>>;
+type HotCache = std::sync::Mutex<std::collections::HashMap<(std::path::PathBuf, String), (u64, HotVectors)>>;
+
+fn hot_cache() -> &'static HotCache {
+    static HOT: std::sync::OnceLock<HotCache> = std::sync::OnceLock::new();
+    HOT.get_or_init(Default::default)
+}
+
+/// The in-process copy of a hot set, if it was built at exactly `version`.
+pub fn hot_cache_lookup(root: &std::path::Path, tag: &str, version: u64) -> Option<HotVectors> {
+    let cache = hot_cache().lock().ok()?;
+    cache
+        .get(&(root.to_path_buf(), tag.to_owned()))
+        .filter(|(v, _)| *v == version)
+        .map(|(_, h)| h.clone())
+}
+
+fn hot_cache_store(root: &std::path::Path, tag: &str, version: u64, hot: HotVectors) {
+    if let Ok(mut cache) = hot_cache().lock() {
+        cache.insert((root.to_path_buf(), tag.to_owned()), (version, hot));
+    }
+}
+
+/// How `hot_set` found its answer (for tests and diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotSource {
+    Memory,
+    Disk,
+    Rebuilt { embedded: usize },
+}
+
+/// The working set for one model tag: the i8 vector of every active note, valid for one
+/// `project_kb_version`. Looks in this process first, then in the persisted row; only when
+/// the knowledge base changed since either was built are the notes read again, and then
+/// only notes whose content hash is not in the document cache are embedded. `embed_doc`
+/// returns `None` when a note cannot be embedded, which makes the whole call `Ok(None)`
+/// (the caller then falls back to lexical search rather than ranking a partial set).
+pub fn hot_set(
+    store: &Store,
+    tag: &str,
+    mut embed_doc: impl FnMut(&Note) -> Option<QuantizedVec>,
+) -> Result<Option<(HotVectors, HotSource)>, String> {
+    let version = store.kb_version()?;
+    if let Some(hit) = hot_cache_lookup(store.root(), tag, version) {
+        return Ok(Some((hit, HotSource::Memory)));
+    }
+    if let Some((built, entries)) = store.with_db(|db| memb_embed::read_hot_set(db, tag))? {
+        if built == version {
+            let hot = std::sync::Arc::new(entries);
+            hot_cache_store(store.root(), tag, version, hot.clone());
+            return Ok(Some((hot, HotSource::Disk)));
+        }
+    }
+    let notes = store.load_all_notes()?;
+    let active: Vec<&Note> = notes
+        .values()
+        .filter(|n| n.status == memb_core::NoteStatus::Active)
+        .collect();
+    let keys: Vec<[u8; 32]> = active
+        .iter()
+        .map(|n| memb_embed::document_key(tag, &n.title, &n.desc))
+        .collect();
+    let cached = store
+        .with_db(|db| memb_embed::get_document_vectors(db, &keys))
+        .unwrap_or_default();
+    let mut fresh = Vec::new();
+    let mut entries: Vec<(u64, QuantizedVec)> = Vec::new();
+    for (note, key) in active.iter().zip(&keys) {
+        let vector = match cached.get(key) {
+            Some(v) => v.clone(),
+            None => match embed_doc(note) {
+                Some(v) => {
+                    fresh.push((*key, v.clone()));
+                    v
+                }
+                None => return Ok(None),
+            },
+        };
+        if entries.first().is_some_and(|(_, f)| f.data.len() != vector.data.len()) {
+            return Ok(None);
+        }
+        entries.push((note.id, vector));
+    }
+    if !fresh.is_empty() {
+        let _ = store.with_db(|db| memb_embed::put_document_vectors(db, &fresh));
+    }
+    let _ = store.with_db(|db| memb_embed::write_hot_set(db, tag, version, &entries));
+    let hot = std::sync::Arc::new(entries);
+    hot_cache_store(store.root(), tag, version, hot.clone());
+    Ok(Some((hot, HotSource::Rebuilt { embedded: fresh.len() })))
 }
 
 fn search_with_gemma(
@@ -175,41 +281,23 @@ fn search_with_gemma(
         Ok((tag, v)) => (tag, QuantizedVec::from_f32(&v)),
         Err(_) => return hybrid_search(store, query, None, &[]),
     };
-    let cached = store
-        .with_db(|db| memb_embed::read_document_cache(db, &tag))
-        .unwrap_or_default();
-    let notes = store.load_all_notes()?;
-    let mut fresh = Vec::new();
-    let mut index = Vec::new();
-    for note in notes
-        .values()
-        .filter(|n| n.status == memb_core::NoteStatus::Active)
-    {
-        let fingerprint = memb_embed::document_fingerprint(&note.title, &note.desc);
-        let vector = match cached
-            .get(&note.id)
-            .filter(|(f, v)| *f == fingerprint && v.data.len() == q.data.len())
-        {
-            Some((_, v)) => v.clone(),
-            None => match model
-                .embed_tagged(&format!("{}\n{}", note.title, note.desc), false)
-                .and_then(|(t, v)| {
-                    Ok((memb_embed::mrl_tag(&t, mrl), memb_embed::apply_mrl(v, mrl)?))
-                }) {
-                Ok((doc_tag, v)) if doc_tag == tag && v.len() == q.data.len() => {
-                    let v = QuantizedVec::from_f32(&v);
-                    fresh.push((note.id, fingerprint, v.clone()));
-                    v
-                }
-                _ => return hybrid_search(store, query, None, &[]),
-            },
-        };
-        index.push((note.id, vector));
+    let hot = hot_set(store, &tag, |note| {
+        let (doc_tag, v) = model
+            .embed_tagged(&memb_embed::document_text(&note.title, &note.desc), false)
+            .ok()?;
+        let v = memb_embed::apply_mrl(v, mrl).ok()?;
+        (memb_embed::mrl_tag(&doc_tag, mrl) == tag && v.len() == q.data.len()).then(|| QuantizedVec::from_f32(&v))
+    })?;
+    match hot {
+        Some((index, _)) => fuse(store, query, Some(&q), &index, true),
+        None => hybrid_search(store, query, None, &[]),
     }
-    if !fresh.is_empty() {
-        let _ = store.with_db(|db| memb_embed::write_document_cache(db, &tag, &fresh));
-    }
-    hybrid_search(store, query, Some(&q), &index)
+}
+
+/// The tag of vectors made by a loopback server: the model identity, the prompt format
+/// (so vectors made without the EmbeddingGemma prefixes are never reused) and the truncation.
+pub fn server_tag(model: &str, mrl: Option<usize>) -> String {
+    memb_embed::mrl_tag(&format!("{model}|prompt:gemma-v1"), mrl)
 }
 
 fn search_with_server(
@@ -218,84 +306,66 @@ fn search_with_server(
     port: u16,
     model: Option<&str>,
 ) -> Result<Vec<Note>, String> {
-    store.search_lexical_ids(query, 1)?;
     let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
         return hybrid_search(store, query, None, &[]);
     };
-    // The truncation size is part of the identity of every cached vector.
-    let model = model.map(|m| memb_embed::mrl_tag(m, mrl));
-    let model = model.as_deref();
+    // Without a stable model identity a vector cannot be tagged or cached, and embedding
+    // every note on every query is not an option: lexical search only.
+    let Some(model) = model else {
+        return hybrid_search(store, query, None, &[]);
+    };
+    let tag = server_tag(model, mrl);
     let cache = query_cache();
-    let key = model.map(|m| format!("{port}:{m}:{}:{query}", query.len()));
-    let cached = key
-        .as_ref()
-        .and_then(|k| cache.lock().ok().and_then(|mut c| c.get(k).cloned()));
-    let query_vec = match cached.or_else(|| memb_embed::local_embedding(port, query).ok()) {
+    let key = format!("{port}:{tag}:{}:{query}", query.len());
+    let cached = cache.lock().ok().and_then(|mut c| c.get(&key).cloned());
+    let query_vec = match cached.or_else(|| memb_embed::local_embedding(port, &memb_embed::server_query_text(query)).ok()) {
         Some(v) => v,
         None => return hybrid_search(store, query, None, &[]),
     };
-    if let Some(key) = key {
-        if let Ok(mut c) = cache.lock() {
-            c.insert(key, query_vec.clone());
-        }
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, query_vec.clone());
     }
-    let notes = store.load_all_notes()?;
-    let cached_docs = model
-        .and_then(|m| {
-            store
-                .with_db(|db| memb_embed::read_document_cache(db, m))
-                .ok()
-        })
-        .unwrap_or_default();
-    let mut fresh = Vec::new();
-    let mut index = Vec::new();
-    for note in notes
-        .values()
-        .filter(|n| n.status == memb_core::NoteStatus::Active)
-    {
-        let fingerprint = memb_embed::document_fingerprint(&note.title, &note.desc);
-        let cached = cached_docs
-            .get(&note.id)
-            .filter(|(f, v)| *f == fingerprint && v.data.len() == query_vec.data.len())
-            .map(|(_, v)| v.clone());
-        let vector = match cached {
-            Some(v) => v,
-            None => {
-                match memb_embed::local_embedding(port, &format!("{}\n{}", note.title, note.desc)) {
-                    Ok(v) if v.data.len() == query_vec.data.len() => {
-                        fresh.push((note.id, fingerprint, v.clone()));
-                        v
-                    }
-                    _ => return hybrid_search(store, query, None, &[]),
-                }
-            }
-        };
-        index.push((note.id, vector));
+    let hot = hot_set(store, &tag, |note| {
+        memb_embed::local_embedding(port, &memb_embed::server_document_text(&note.title, &note.desc))
+            .ok()
+            .filter(|v| v.data.len() == query_vec.data.len())
+    })?;
+    match hot {
+        Some((index, _)) => fuse(store, query, Some(&query_vec), &index, true),
+        None => hybrid_search(store, query, None, &[]),
     }
-    if let Some(model) = model {
-        if !fresh.is_empty() {
-            let _ = store.with_db(|db| memb_embed::write_document_cache(db, model, &fresh));
-        }
-    }
-    hybrid_search(store, query, Some(&query_vec), &index)
 }
 
 /// Hybrid retrieval combining lexical ranking + quantized vector scan + RRF (k=60) + 1-hop graph expansion.
 /// Gracefully degrades to pure lexical search when `query_vec` is None (e.g. llama-server unavailable).
+/// `hot_index` may hold notes that are no longer active; they are filtered out here.
 pub fn hybrid_search(
     store: &Store,
     query: &str,
     query_vec: Option<&QuantizedVec>,
     hot_index: &[(u64, QuantizedVec)],
 ) -> Result<Vec<Note>, String> {
+    fuse(store, query, query_vec, hot_index, false)
+}
+
+/// `index_is_active`: every id in `hot_index` is an active note (a hot set is built from
+/// active notes at the current version), so no note needs to be read to check it.
+fn fuse(
+    store: &Store,
+    query: &str,
+    query_vec: Option<&QuantizedVec>,
+    hot_index: &[(u64, QuantizedVec)],
+    index_is_active: bool,
+) -> Result<Vec<Note>, String> {
     let lexical_ids = store.search_lexical_ids(query, 10)?;
     let fused_seeds = if let Some(qv) = query_vec {
-        let all = store.load_all_notes()?;
+        let all = if index_is_active { None } else { Some(store.load_all_notes()?) };
         let mut vec_scored: Vec<(f32, u64)> = hot_index
             .iter()
             .filter(|(id, _)| {
-                all.get(id)
-                    .is_some_and(|n| n.status == memb_core::NoteStatus::Active)
+                all.as_ref().is_none_or(|all| {
+                    all.get(id).is_some_and(|n| n.status == memb_core::NoteStatus::Active)
+                })
             })
             .map(|(id, nv)| (qv.cosine(nv), *id))
             .filter(|(s, _)| *s > 0.25)
@@ -317,6 +387,147 @@ mod tests {
 
     /// The environment is process-wide: serialize the tests that change it.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fake_vector(text: &str) -> QuantizedVec {
+        let mut x = text.bytes().fold(1469598103934665603u64, |h, b| (h ^ b as u64).wrapping_mul(1099511628211));
+        let v: Vec<f32> = (0..768)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            })
+            .collect();
+        QuantizedVec::from_f32(&v)
+    }
+
+    #[test]
+    fn the_hot_set_is_small_persistent_version_keyed_and_never_re_embeds_unchanged_notes() {
+        use memb_core::{Draft, Kind, NotePatch};
+        use std::collections::BTreeMap;
+        use std::time::Instant;
+        let root = std::env::temp_dir().join(format!(
+            "memb-rag-hot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let draft = |title: String, desc: String, kind: Kind, parents: Vec<u64>| Draft { title, desc, kind, parents, properties: BTreeMap::new() };
+        let topic = store.remember(draft("topic".into(), "root".into(), Kind::Topic, vec![])).unwrap();
+        let mut ids = vec![topic.id];
+        for i in 0..300 {
+            ids.push(
+                store
+                    .remember(draft(format!("note {i}"), format!("description of note {i} about subject {}", i % 37), Kind::Knowledge, vec![topic.id]))
+                    .unwrap()
+                    .id,
+            );
+        }
+        let tag = "test-model|768";
+        let embedded = std::cell::Cell::new(0usize);
+        let embed = |n: &Note| {
+            embedded.set(embedded.get() + 1);
+            Some(fake_vector(&memb_embed::document_text(&n.title, &n.desc)))
+        };
+
+        // First use builds the set: every active note is embedded once.
+        let (hot, source) = hot_set(&store, tag, embed).unwrap().unwrap();
+        assert_eq!(source, HotSource::Rebuilt { embedded: 301 });
+        assert_eq!((hot.len(), embedded.get()), (301, 301));
+        let bytes = memb_embed::hot_set_bytes(hot.len(), 768);
+        eprintln!("T023 hot set: {} notes x 768 dims = {} bytes ({:.2} MB)", hot.len(), bytes, bytes as f64 / 1e6);
+        assert!(bytes < 5_000_000, "{bytes}");
+        // The persisted row is exactly that size plus its 16-byte header.
+        let stored = store
+            .with_db(|db| {
+                let r = db.begin_read().map_err(|e| e.to_string())?;
+                let t = r.open_table(memb_embed::HOT_SET).map_err(|e| e.to_string())?;
+                let v = t.get(tag).map_err(|e| e.to_string())?.unwrap();
+                Ok(v.value().len())
+            })
+            .unwrap();
+        assert_eq!(stored, 16 + bytes);
+
+        // Unchanged knowledge base: answered from memory, no scan, no embedding.
+        let scans = memb_store::full_scan_count();
+        let started = Instant::now();
+        for _ in 0..200 {
+            let (_, source) = hot_set(&store, tag, embed).unwrap().unwrap();
+            assert_eq!(source, HotSource::Memory);
+        }
+        let with_version_check = started.elapsed() / 200;
+        let version = store.kb_version().unwrap();
+        let started = Instant::now();
+        for _ in 0..10_000 {
+            assert!(hot_cache_lookup(store.root(), tag, version).is_some());
+        }
+        let lookup = started.elapsed() / 10_000;
+        eprintln!("T023 cache hit: lookup {lookup:?}; with the version check (opens the database) {with_version_check:?}");
+        assert!(lookup < std::time::Duration::from_millis(1), "{lookup:?}");
+        assert_eq!(memb_store::full_scan_count(), scans, "a hit reads no notes");
+        assert_eq!(embedded.get(), 301);
+
+        // After a restart (nothing in memory): read from the persisted row, still no scan or embedding.
+        hot_cache().lock().unwrap().clear();
+        let started = Instant::now();
+        let (_, source) = hot_set(&store, tag, embed).unwrap().unwrap();
+        eprintln!("T023 persisted hot set load: {:?}", started.elapsed());
+        assert_eq!(source, HotSource::Disk);
+        assert_eq!(memb_store::full_scan_count(), scans);
+        assert_eq!(embedded.get(), 301);
+
+        // One note changes: the version moves, and exactly that note is embedded again.
+        store.update(ids[10], NotePatch { desc: Some("rewritten".into()), ..Default::default() }).unwrap();
+        let (_, source) = hot_set(&store, tag, embed).unwrap().unwrap();
+        assert_eq!(source, HotSource::Rebuilt { embedded: 1 });
+        assert_eq!(embedded.get(), 302);
+        // A new note with the same text as an existing one is a content-hash hit, whatever its id.
+        let twin = store
+            .remember(draft("note 20".into(), "description of note 20 about subject 20".into(), Kind::Knowledge, vec![topic.id]))
+            .unwrap();
+        let (hot, source) = hot_set(&store, tag, embed).unwrap().unwrap();
+        assert_eq!(source, HotSource::Rebuilt { embedded: 0 });
+        assert!(hot.iter().any(|(id, _)| *id == twin.id) && hot.len() == 302);
+        // A retracted note leaves the set; nothing is embedded.
+        store.retract(ids[5], None, false).unwrap();
+        let (hot, source) = hot_set(&store, tag, embed).unwrap().unwrap();
+        assert_eq!(source, HotSource::Rebuilt { embedded: 0 });
+        assert!(hot.iter().all(|(id, _)| *id != ids[5]) && hot.len() == 301);
+        // Another model or truncation is a different set with its own vectors.
+        let (_, source) = hot_set(&store, "other-model|768", embed).unwrap().unwrap();
+        assert_eq!(source, HotSource::Rebuilt { embedded: 301 });
+        // A note that cannot be embedded makes the whole set unavailable (the caller goes lexical).
+        store.remember(draft("fresh".into(), "unembeddable".into(), Kind::Knowledge, vec![topic.id])).unwrap();
+        assert!(hot_set(&store, tag, |_| None).unwrap().is_none());
+        // Ranking from the persisted set finds the note by its own vector.
+        let (hot, _) = hot_set(&store, tag, embed).unwrap().unwrap();
+        let q = fake_vector(&memb_embed::document_text("note 7", "description of note 7 about subject 7"));
+        let best = hot.iter().max_by(|a, b| q.cosine(&a.1).total_cmp(&q.cosine(&b.1))).unwrap().0;
+        assert_eq!(best, ids[8]);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_loopback_server_without_a_model_identity_is_lexical_only_and_embeds_nothing() {
+        let root = std::env::temp_dir().join(format!("memb-rag-nomodel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        store
+            .remember(memb_core::Draft {
+                title: "apples".into(),
+                desc: "fruit".into(),
+                kind: memb_core::Kind::Topic,
+                parents: vec![],
+                properties: Default::default(),
+            })
+            .unwrap();
+        // Port 1 accepts no connection: any attempt to embed would fail loudly or hang the test.
+        let found = search_with_server(&store, "apples", 1, None).unwrap();
+        assert_eq!(found.len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn embed_text_is_none_without_a_usable_backend_and_rejects_a_bad_truncation() {
@@ -383,10 +594,12 @@ mod tests {
         )
         .embed_tagged("x", true)
         .unwrap();
+        let tag = memb_embed::mrl_tag(&tag, mrl);
+        let key = memb_embed::document_key(&tag, &note.title, &note.desc);
         let cached = store
-            .with_db(|db| memb_embed::read_document_cache(db, &memb_embed::mrl_tag(&tag, mrl)))
+            .with_db(|db| memb_embed::get_document_vectors(db, &[key]))
             .unwrap();
-        assert_eq!(cached[&note.id].1.data.len(), mrl.unwrap_or(768));
+        assert_eq!(cached[&key].data.len(), mrl.unwrap_or(768));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -336,7 +336,7 @@ fn summaries_get_an_embedding_tagged_with_the_model_identity() {
         })
         .unwrap();
     let vector = stored.summary_vec.expect("the summary has a vector");
-    assert_eq!((vector.model.as_str(), vector.data.len()), ("synthetic-v1", 4));
+    assert_eq!((vector.model.as_str(), vector.data.len()), ("synthetic-v1|prompt:gemma-v1", 4));
     // Only the summary was sent for embedding, not the conversation text.
     let sent = bodies.lock().unwrap().join("\n");
     assert!(sent.contains("A synthetic summary bullet"), "{sent}");

@@ -13,7 +13,7 @@ use tokenizers::{utils::truncation::TruncationParams, Tokenizer};
 
 pub const MODEL_ID: &str =
     "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0-q4";
-pub const DOC_PREFIX: &str = "title: none | text: ";
+pub const DOC_PREFIX: &str = "title: ";
 pub const QUERY_PREFIX: &str = "task: search result | query: ";
 const MAX_TOKENS: usize = 8192;
 const QUERY_MAX_TOKENS: usize = 128;

@@ -5,6 +5,14 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.8.0 (2026-11-26)
+
+- **Retrieval caches:** the knowledge base has a version; the i8 hot working set is kept in memory and persisted with the version it was built at, so a search with an unchanged base reads and embeds nothing. Document vectors use a stable SHA-256 content key (model, truncation, title, description) instead of the note id plus a `DefaultHasher` fingerprint; unchanged notes are never embedded again and identical text shares a vector. Old cache tables are dropped.
+- **One-hop expansion** uses an adjacency index and point reads (no load of all notes) and adds at most 4 claims per knowledge note.
+- **Prompt formats:** the loopback server path now sends `task: search result | query: ...` and `title: ... | text: ...`; the in-process path puts the real title in the title slot. Vectors are re-embedded once after upgrading. Query truncation stays at 128 tokens (about 512 characters on the server path).
+- The loopback server path without `MEMB_EMBED_MODEL_ID` is lexical only (it used to embed every note on every query).
+- `search` no longer scans the notes just to validate the query.
+
 ## 0.7.1 (2026-11-26)
 
 - Consolidation compares at most the newest 2000 knowledge and claim notes per run, so a large store cannot make the routine slow.

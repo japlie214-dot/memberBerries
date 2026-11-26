@@ -15,6 +15,21 @@ const LEGACY_PROJECTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 const LEGACY_SNAPSHOT: TableDefinition<&str, &[u8]> = TableDefinition::new("legacy_snapshot_v2");
 pub const NOTES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("notes_v2");
 pub const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta_v2");
+/// Knowledge note id -> ids of its active claim children (JSON array, ascending). A derived
+/// index: it is valid for exactly the `kb_version` recorded under `adjacency_version`.
+const ADJACENCY_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("adjacency_v1");
+/// The most claims one knowledge note adds to a one-hop expansion, so a single busy
+/// knowledge note cannot fill the whole result.
+pub const CLAIMS_PER_KNOWLEDGE: usize = 4;
+thread_local! {
+    static FULL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times a store has read every note on the calling thread (a counter for tests
+/// and diagnostics: retrieval that is meant to avoid full scans can be checked against it).
+pub fn full_scan_count() -> usize {
+    FULL_SCANS.with(|c| c.get())
+}
 pub const REVISIONS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions_v2");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +327,7 @@ impl Store {
     }
 
     fn load_all_notes_locked(db: &Database) -> Result<BTreeMap<u64, Note>, String> {
+        FULL_SCANS.with(|c| c.set(c.get() + 1));
         let r = db.begin_read().map_err(|e| e.to_string())?;
         let table = r.open_table(NOTES_TABLE).map_err(|e| e.to_string())?;
         let mut out = BTreeMap::new();
@@ -910,9 +926,131 @@ impl Store {
         Ok(scored.into_iter().take(limit).map(|(_, id)| id).collect())
     }
 
+    /// The knowledge base version (`project_kb_version`): it changes with every note change
+    /// (create, update, supersede, retract, rollback), so anything derived from the notes can
+    /// record the version it was built at and be rebuilt only when this number moves.
+    pub fn kb_version(&self) -> Result<u64, String> {
+        let _lock = acquire_os_lock(&self.root)?;
+        let db = self.open_db()?;
+        Self::kb_version_locked(&db)
+    }
+
+    fn kb_version_locked(db: &Database) -> Result<u64, String> {
+        let r = db.begin_read().map_err(|e| e.to_string())?;
+        let meta = r.open_table(META_TABLE).map_err(|e| e.to_string())?;
+        let v = meta.get("next_rev").map_err(|e| e.to_string())?.ok_or("missing next_rev counter")?;
+        Ok(u64::from_le_bytes(v.value().try_into().map_err(|_| "invalid next_rev counter".to_string())?))
+    }
+
+    /// Rebuilds the adjacency index when the knowledge base changed since it was built
+    /// (one full read of the notes, on the first expansion after a change only).
+    fn ensure_adjacency(db: &Database) -> Result<(), String> {
+        let version = Self::kb_version_locked(db)?;
+        {
+            let r = db.begin_read().map_err(|e| e.to_string())?;
+            let meta = r.open_table(META_TABLE).map_err(|e| e.to_string())?;
+            let built = meta
+                .get("adjacency_version")
+                .map_err(|e| e.to_string())?
+                .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                .map(u64::from_le_bytes);
+            if built == Some(version) {
+                return Ok(());
+            }
+        }
+        let all = Self::load_all_notes_locked(db)?;
+        let mut claims: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for c in all.values().filter(|c| c.status == NoteStatus::Active && c.kind == Kind::Claim) {
+            for &pid in &c.parents {
+                if all.get(&pid).is_some_and(|p| p.status == NoteStatus::Active && p.kind == Kind::Knowledge) {
+                    claims.entry(pid).or_default().push(c.id);
+                }
+            }
+        }
+        let w = db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let _ = w.delete_table(ADJACENCY_TABLE);
+            let mut adj = w.open_table(ADJACENCY_TABLE).map_err(|e| e.to_string())?;
+            for (id, kids) in &claims {
+                let bytes = serde_json::to_vec(kids).map_err(|e| e.to_string())?;
+                adj.insert(*id, bytes.as_slice()).map_err(|e| e.to_string())?;
+            }
+            let mut meta = w.open_table(META_TABLE).map_err(|e| e.to_string())?;
+            meta.insert("adjacency_version", version.to_le_bytes().as_slice()).map_err(|e| e.to_string())?;
+        }
+        w.commit().map_err(|e| e.to_string())
+    }
+
+    /// One-hop expansion of retrieval seeds without reading every note: the seeds first, then
+    /// for each seed a claim adds its active parent knowledge and a knowledge note adds up to
+    /// `CLAIMS_PER_KNOWLEDGE` of its active claims, through the adjacency index and point reads.
     pub fn expand_one_hop(&self, seed_ids: &[u64], max_total: usize) -> Result<Vec<Note>, String> {
-        let all = self.load_all_notes()?;
-        Ok(Self::expand_from(&all, seed_ids, max_total))
+        let _lock = acquire_os_lock(&self.root)?;
+        let db = self.open_db()?;
+        Self::ensure_adjacency(&db)?;
+        let r = db.begin_read().map_err(|e| e.to_string())?;
+        let notes = r.open_table(NOTES_TABLE).map_err(|e| e.to_string())?;
+        let adj = r.open_table(ADJACENCY_TABLE).map_err(|e| e.to_string())?;
+        let mut memo: BTreeMap<u64, Option<Note>> = BTreeMap::new();
+        let mut active = |id: u64| -> Result<Option<Note>, String> {
+            if !memo.contains_key(&id) {
+                let note = match notes.get(id).map_err(|e| e.to_string())? {
+                    Some(v) => Some(serde_json::from_slice::<Note>(v.value()).map_err(|e| e.to_string())?),
+                    None => None,
+                };
+                memo.insert(id, note.filter(|n| n.status == NoteStatus::Active));
+            }
+            Ok(memo[&id].clone())
+        };
+        let mut selected: Vec<u64> = Vec::new();
+        for &id in seed_ids {
+            if selected.len() >= max_total {
+                break;
+            }
+            if !selected.contains(&id) && active(id)?.is_some() {
+                selected.push(id);
+            }
+        }
+        for &id in seed_ids {
+            if selected.len() >= max_total {
+                break;
+            }
+            let Some(n) = active(id)? else { continue };
+            match n.kind {
+                Kind::Claim => {
+                    for &pid in &n.parents {
+                        if selected.len() >= max_total {
+                            break;
+                        }
+                        if !selected.contains(&pid) && active(pid)?.is_some() {
+                            selected.push(pid);
+                        }
+                    }
+                }
+                Kind::Knowledge => {
+                    let kids: Vec<u64> = match adj.get(id).map_err(|e| e.to_string())? {
+                        Some(v) => serde_json::from_slice(v.value()).map_err(|e| e.to_string())?,
+                        None => Vec::new(),
+                    };
+                    for cid in kids.into_iter().take(CLAIMS_PER_KNOWLEDGE) {
+                        if selected.len() >= max_total {
+                            break;
+                        }
+                        if !selected.contains(&cid) && active(cid)?.is_some() {
+                            selected.push(cid);
+                        }
+                    }
+                }
+                Kind::Topic => {}
+            }
+        }
+        let mut out = Vec::new();
+        for id in selected {
+            if let Some(n) = active(id)? {
+                out.push(n);
+            }
+        }
+        Ok(out)
     }
 
     fn expand_from(all: &BTreeMap<u64, Note>, seed_ids: &[u64], max_total: usize) -> Vec<Note> {
@@ -940,7 +1078,7 @@ impl Store {
                             c.status == NoteStatus::Active
                                 && c.kind == Kind::Claim
                                 && c.parents.contains(&id)
-                        }) {
+                        }).take(CLAIMS_PER_KNOWLEDGE) {
                             if selected.len() >= max_total { break; }
                             if !selected.contains(&c.id) { selected.push(c.id); }
                         }
@@ -1077,6 +1215,46 @@ mod tests {
         // A larger configured value is clamped to the built-in cap; zero is clamped to one.
         assert_eq!(Store::open(&dir).unwrap().with_max_notes(usize::MAX).max_notes, MAX_NOTES);
         assert_eq!(Store::open(&dir).unwrap().with_max_notes(0).max_notes, 1);
+    }
+
+    #[test]
+    fn expansion_uses_the_adjacency_index_caps_claims_and_rebuilds_only_after_a_change() {
+        let dir = temp_dir("adjacency");
+        let store = Store::open(&dir).unwrap();
+        let note = |title: &str, kind: Kind, parents: Vec<u64>| Draft { title: title.into(), desc: "text".into(), kind, parents, properties: BTreeMap::new() };
+        let topic = store.remember(note("T", Kind::Topic, vec![])).unwrap();
+        let k = store.remember(note("K", Kind::Knowledge, vec![topic.id])).unwrap();
+        let other = store.remember(note("K2", Kind::Knowledge, vec![topic.id])).unwrap();
+        let claims: Vec<u64> = (0..6)
+            .map(|i| store.remember(note(&format!("c{i}"), Kind::Claim, vec![k.id])).unwrap().id)
+            .collect();
+        let version = store.kb_version().unwrap();
+        // The first expansion builds the index (one full read); later ones read no more than the few notes they need.
+        let before = full_scan_count();
+        let hop = store.expand_one_hop(&[k.id], 8).unwrap();
+        assert_eq!(full_scan_count() - before, 1, "index built once");
+        let ids: Vec<u64> = hop.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![k.id, claims[0], claims[1], claims[2], claims[3]], "the seed, then at most {CLAIMS_PER_KNOWLEDGE} claims in id order");
+        let before = full_scan_count();
+        for _ in 0..50 {
+            assert_eq!(store.expand_one_hop(&[k.id], 8).unwrap().len(), 1 + CLAIMS_PER_KNOWLEDGE);
+        }
+        // A claim brings its parent knowledge; a seed that is not active, or does not exist, brings nothing.
+        assert_eq!(store.expand_one_hop(&[claims[5]], 8).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![claims[5], k.id]);
+        assert!(store.expand_one_hop(&[9999], 8).unwrap().is_empty());
+        assert_eq!(store.expand_one_hop(&[other.id], 8).unwrap().len(), 1);
+        assert_eq!(full_scan_count(), before, "no expansion read every note");
+        assert_eq!(store.kb_version().unwrap(), version, "reads do not change the version");
+        // A change moves the version; the next expansion rebuilds once and sees it.
+        store.retract(claims[0], None, false).unwrap();
+        assert!(store.kb_version().unwrap() > version);
+        let before = full_scan_count(); // the retraction itself read the notes
+        let ids: Vec<u64> = store.expand_one_hop(&[k.id], 8).unwrap().iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![k.id, claims[1], claims[2], claims[3], claims[4]]);
+        assert_eq!(full_scan_count() - before, 1, "rebuilt once after the change");
+        store.expand_one_hop(&[k.id], 8).unwrap();
+        assert_eq!(full_scan_count() - before, 1);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
