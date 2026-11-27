@@ -1,6 +1,6 @@
 # Phase coverage and retirement gate
 
-This is a requirements ledger, not a release claim. **Implemented** means the current (workspace 0.16.1) implementation exists; native host verification is separate. **Replaced** means the design intention is addressed differently. **Open** means the phase software and notes must be retained until implementation or an approved disposition.
+This is a requirements ledger, not a release claim. **Implemented** means the current (workspace 0.16.2) implementation exists; native host verification is separate. **Replaced** means the design intention is addressed differently. **Open** means the phase software and notes must be retained until implementation or an approved disposition.
 
 | Source | Requirement | Current disposition |
 |---|---|---|

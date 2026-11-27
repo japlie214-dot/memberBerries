@@ -718,6 +718,11 @@ pub const GEMMA_SCORE_FLOOR: f32 = 0.60;
 /// 0.60 would drop every vector hit (hybrid recall@5 falls from 1.00 to 0.63). 0.25 keeps 29 of
 /// 30 right notes and lets 1 of 12 off-topic questions through (evidence/t045-score-floor-per-backend.md).
 pub const SNOWFLAKE_SCORE_FLOOR: f32 = 0.25;
+/// A loopback llama-server (EmbeddingGemma 300M Q8_0, `--embedding --pooling mean`): right
+/// notes 0.206 to 0.657 and the best off-topic match 0.166 at 768 wide, right notes 0.313 to 0.690
+/// and the best off-topic match 0.296 at 256 wide; 0.25 keeps 29 and 30 of 30 right notes and gives
+/// hybrid recall@5 1.00 and 0.97 (evidence/t045-score-floor-per-backend.md).
+pub const LOOPBACK_SCORE_FLOOR: f32 = 0.25;
 /// The floor for a backend whose scores were not measured: permissive on purpose, so an
 /// unmeasured backend can never lose all its vector hits to a floor tuned for another model.
 pub const UNMEASURED_SCORE_FLOOR: f32 = 0.25;
@@ -728,7 +733,8 @@ pub fn default_score_floor(backend: Backend) -> f32 {
     match backend {
         Backend::Gemma => GEMMA_SCORE_FLOOR,
         Backend::Snowflake => SNOWFLAKE_SCORE_FLOOR,
-        Backend::Loopback | Backend::Other => UNMEASURED_SCORE_FLOOR,
+        Backend::Loopback => LOOPBACK_SCORE_FLOOR,
+        Backend::Other => UNMEASURED_SCORE_FLOOR,
     }
 }
 
@@ -1699,10 +1705,11 @@ mod tests {
         // The measured Snowflake scores (right notes 0.239 to 0.577) mean the local floor would
         // drop all of its vector hits: the two defaults must stay different.
         assert!(default_score_floor(Backend::Snowflake) < 0.239 + 0.05 && default_score_floor(Backend::Snowflake) < default_score_floor(Backend::Gemma));
-        for unmeasured in [Backend::Loopback, Backend::Other] {
-            assert_eq!(default_score_floor(unmeasured), UNMEASURED_SCORE_FLOOR, "{unmeasured:?}");
-        }
+        assert_eq!(default_score_floor(Backend::Loopback), LOOPBACK_SCORE_FLOOR);
+        // Only vectors of an unknown origin fall back to the permissive floor.
+        assert_eq!(default_score_floor(Backend::Other), UNMEASURED_SCORE_FLOOR);
         assert!(UNMEASURED_SCORE_FLOOR <= GEMMA_SCORE_FLOOR, "an unmeasured backend is never stricter than the measured local one");
+        assert!(default_score_floor(Backend::Loopback) <= 0.206 + 0.05, "right notes of the measured loopback server score from 0.206");
         for backend in [Backend::Gemma, Backend::Snowflake, Backend::Loopback, Backend::Other] {
             assert_eq!(parse_params(None, None, backend).1, default_score_floor(backend));
             assert_eq!(parse_params(None, Some("0.33"), backend).1, 0.33, "an explicit floor wins for {backend:?}");
@@ -1716,7 +1723,8 @@ mod tests {
         let q = QuantizedVec::from_f32(&[1.0, 0.0]);
         let kept = |floor: f32| fuse_with(&store, "zzqq", Some(&q), &index, false, 5, floor).unwrap().len();
         assert_eq!(kept(default_score_floor(Backend::Gemma)), 0, "0.5 is below the local floor");
-        assert_eq!(kept(default_score_floor(Backend::Loopback)), 1, "0.5 is above the permissive unmeasured floor");
+        assert_eq!(kept(default_score_floor(Backend::Loopback)), 1, "0.5 is above the loopback floor");
+        assert_eq!(kept(default_score_floor(Backend::Other)), 1, "0.5 is above the permissive unmeasured floor");
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

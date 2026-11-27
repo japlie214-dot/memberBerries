@@ -45,7 +45,7 @@ enabled = true               # false forces lexical-only search
 [retrieval]                  # what a search returns and what a hook may put into a prompt (see wiki/Hooks.md)
 max_inject_tokens = 750      # 50..=8000: most text one hook injects, about 4 bytes a token (750 = 3000 bytes); notes are added best match first and one that would not fit is left out
 top_k = 5                    # 1..=20: notes a search starts from, before parents and children are added (at most 8, or top_k if larger)
-# score_floor = 0.60       # 0.0..=0.95, normally leave it unset: a vector match whose cosine is at or below this is dropped. Unset, the default of the embedding backend in use applies: 0.60 for the local EmbeddingGemma model and 0.25 for Snowflake (both measured; Snowflake scores run much lower), 0.25 for a backend that was not measured (see evidence/t045-score-floor-per-backend.md)
+# score_floor = 0.60       # 0.0..=0.95, normally leave it unset: a vector match whose cosine is at or below this is dropped. Unset, the default of the embedding backend in use applies: 0.60 for the local EmbeddingGemma model, 0.25 for Snowflake and 0.25 for a loopback llama-server (all measured; Snowflake and llama-server scores run much lower), 0.25 for vectors of an unknown origin (see evidence/t045-score-floor-per-backend.md)
 
 [curator]                    # used by `memb curate` (you run it; see wiki/Operations.md)
 backend = "cli"              # the only supported backend
