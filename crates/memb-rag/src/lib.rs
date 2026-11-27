@@ -315,7 +315,7 @@ fn search_with_snowflake(
         let texts: Vec<String> = notes.iter().map(|n| memb_embed::snowflake::document_text(&n.title, &n.desc)).collect();
         embed_snowflake(&client, &texts, mrl).ok().filter(|v| v.iter().all(|x| x.data.len() == width))
     });
-    search_with_index(store, query, &q, hot_set_nowait(store, &tag, embed)?)
+    search_with_index(store, query, &q, Backend::Snowflake, hot_set_nowait(store, &tag, embed)?)
 }
 
 /// What a note is embedded as by the active backend, with the tag of the vector.
@@ -506,6 +506,21 @@ fn builds_in_progress() -> &'static BuildGuard {
     BUILDS.get_or_init(Default::default)
 }
 
+/// Blocks until no background hot-set build is running in this process (or `timeout`
+/// passes); true if none is. For benchmarks and tools that need the complete index.
+pub fn wait_for_background_builds(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if builds_in_progress().lock().map(|b| b.is_empty()).unwrap_or(true) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Whether a background build of this set is running in this process.
 pub fn build_in_progress(root: &std::path::Path, tag: &str) -> bool {
     builds_in_progress().lock().map(|b| b.contains(&(root.to_path_buf(), tag.to_owned()))).unwrap_or(false)
@@ -606,7 +621,7 @@ fn search_with_gemma(
                 .collect()
         })
     };
-    search_with_index(store, query, &q, hot_set_nowait(store, &tag, embed)?)
+    search_with_index(store, query, &q, Backend::Gemma, hot_set_nowait(store, &tag, embed)?)
 }
 
 /// Embeds a list of notes; `None` when any of them cannot be embedded.
@@ -614,9 +629,9 @@ type NoteEmbedder = std::sync::Arc<dyn Fn(&[&Note]) -> Option<Vec<QuantizedVec>>
 
 /// Ranks with whatever vectors exist: the complete set, or the cached part of one that is
 /// still being built (the rest is found by lexical search until the build finishes).
-fn search_with_index(store: &Store, query: &str, q: &QuantizedVec, hot: HotAnswer) -> Result<Vec<Note>, String> {
+fn search_with_index(store: &Store, query: &str, q: &QuantizedVec, backend: Backend, hot: HotAnswer) -> Result<Vec<Note>, String> {
     match hot {
-        HotAnswer::Complete(index, _) | HotAnswer::Partial { vectors: index, .. } => fuse(store, query, Some(q), &index, true),
+        HotAnswer::Complete(index, _) | HotAnswer::Partial { vectors: index, .. } => fuse(store, query, Some(q), &index, true, backend),
     }
 }
 
@@ -662,7 +677,7 @@ fn search_with_server(
             })
             .collect()
     });
-    search_with_index(store, query, &query_vec, hot_set_nowait(store, &tag, embed)?)
+    search_with_index(store, query, &query_vec, Backend::Loopback, hot_set_nowait(store, &tag, embed)?)
 }
 
 /// Hybrid retrieval combining lexical ranking + quantized vector scan + RRF (k=60) + 1-hop graph expansion.
@@ -674,25 +689,61 @@ pub fn hybrid_search(
     query_vec: Option<&QuantizedVec>,
     hot_index: &[(u64, QuantizedVec)],
 ) -> Result<Vec<Note>, String> {
-    fuse(store, query, query_vec, hot_index, false)
+    fuse(store, query, query_vec, hot_index, false, Backend::Other)
 }
 
 /// Notes a search starts from (before one-hop expansion) when `MEMB_RETRIEVAL_TOP_K` is unset.
 pub const DEFAULT_TOP_K: usize = 5;
-/// A vector match scoring at or below this cosine is dropped when `MEMB_RETRIEVAL_SCORE_FLOOR`
-/// is unset. Decided from measurement on this model and quantization: evidence/t032-injection-floor.md.
-pub const DEFAULT_SCORE_FLOOR: f32 = 0.60;
+/// The embedding backend a vector score came from: cosine ranges differ per model, so the
+/// default score floor is chosen per backend (T032, T045).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// The local EmbeddingGemma model (in this process or through the shared service).
+    Gemma,
+    /// Snowflake `AI_EMBED`.
+    Snowflake,
+    /// A loopback llama-server.
+    Loopback,
+    /// Vectors handed in by a library caller: nothing is known about their scores.
+    Other,
+}
 
-/// `(top_k, score floor)` from the environment (`memb` fills them from `[retrieval]` in
-/// config.toml; an unset or invalid value means the default).
-pub fn retrieval_params() -> (usize, f32) {
+/// A vector match scoring at or below this cosine is dropped for a backend that was
+/// measured with the `injection_floor_sweep` benches. EmbeddingGemma q4 at 256 dimensions:
+/// unrelated notes score about 0.6 there, so the older 0.25 filtered nothing
+/// (evidence/t032-injection-floor.md).
+pub const GEMMA_SCORE_FLOOR: f32 = 0.60;
+/// Snowflake `AI_EMBED` (snowflake-arctic-embed-m-v1.5, 768-wide i8) scores much lower than
+/// the local model: right notes 0.239 to 0.577, the best off-topic match 0.260, so a floor of
+/// 0.60 would drop every vector hit (hybrid recall@5 falls from 1.00 to 0.63). 0.25 keeps 29 of
+/// 30 right notes and lets 1 of 12 off-topic questions through (evidence/t045-score-floor-per-backend.md).
+pub const SNOWFLAKE_SCORE_FLOOR: f32 = 0.25;
+/// The floor for a backend whose scores were not measured: permissive on purpose, so an
+/// unmeasured backend can never lose all its vector hits to a floor tuned for another model.
+pub const UNMEASURED_SCORE_FLOOR: f32 = 0.25;
+
+/// The score floor used for `backend` when `[retrieval] score_floor` / `MEMB_RETRIEVAL_SCORE_FLOOR`
+/// does not set one.
+pub fn default_score_floor(backend: Backend) -> f32 {
+    match backend {
+        Backend::Gemma => GEMMA_SCORE_FLOOR,
+        Backend::Snowflake => SNOWFLAKE_SCORE_FLOOR,
+        Backend::Loopback | Backend::Other => UNMEASURED_SCORE_FLOOR,
+    }
+}
+
+/// `(top_k, score floor)` for a search that used `backend`: from the environment (`memb`
+/// fills it from `[retrieval]` in config.toml; an unset or invalid value means the default,
+/// and the default floor depends on the backend).
+pub fn retrieval_params(backend: Backend) -> (usize, f32) {
     parse_params(
         std::env::var("MEMB_RETRIEVAL_TOP_K").ok().as_deref(),
         std::env::var("MEMB_RETRIEVAL_SCORE_FLOOR").ok().as_deref(),
+        backend,
     )
 }
 
-fn parse_params(top_k: Option<&str>, floor: Option<&str>) -> (usize, f32) {
+fn parse_params(top_k: Option<&str>, floor: Option<&str>, backend: Backend) -> (usize, f32) {
     let top_k = top_k
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|k| (1..=20).contains(k))
@@ -700,7 +751,7 @@ fn parse_params(top_k: Option<&str>, floor: Option<&str>) -> (usize, f32) {
     let floor = floor
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|f| (-1.0..=1.0).contains(f))
-        .unwrap_or(DEFAULT_SCORE_FLOOR);
+        .unwrap_or_else(|| default_score_floor(backend));
     (top_k, floor)
 }
 
@@ -712,8 +763,9 @@ fn fuse(
     query_vec: Option<&QuantizedVec>,
     hot_index: &[(u64, QuantizedVec)],
     index_is_active: bool,
+    backend: Backend,
 ) -> Result<Vec<Note>, String> {
-    let (top_k, floor) = retrieval_params();
+    let (top_k, floor) = retrieval_params(backend);
     fuse_with(store, query, query_vec, hot_index, index_is_active, top_k, floor)
 }
 
@@ -1620,20 +1672,51 @@ mod tests {
         let q = QuantizedVec::from_f32(&[1.0, 0.0]);
         let ids = |found: Vec<Note>| found.into_iter().map(|n| n.id).collect::<Vec<_>>();
         let run = |k: usize, f: f32| ids(fuse_with(&store, "zzqq", Some(&q), &index, false, k, f).unwrap());
-        assert_eq!(parse_params(None, None), (DEFAULT_TOP_K, DEFAULT_SCORE_FLOOR));
-        let (k, f) = parse_params(Some("7"), Some("0.42"));
+        assert_eq!(parse_params(None, None, Backend::Gemma), (DEFAULT_TOP_K, GEMMA_SCORE_FLOOR));
+        let (k, f) = parse_params(Some("7"), Some("0.42"), Backend::Gemma);
         assert_eq!((k, f), (7, 0.42));
         for junk in [("0", "banana"), ("99", "2.5"), ("-1", "")] {
-            assert_eq!(parse_params(Some(junk.0), Some(junk.1)), (DEFAULT_TOP_K, DEFAULT_SCORE_FLOOR), "{junk:?}");
+            assert_eq!(parse_params(Some(junk.0), Some(junk.1), Backend::Gemma), (DEFAULT_TOP_K, GEMMA_SCORE_FLOOR), "{junk:?}");
         }
-        let default = run(DEFAULT_TOP_K, DEFAULT_SCORE_FLOOR);
-        let expected: Vec<u64> = index.iter().filter(|(_, v)| q.cosine(v) > DEFAULT_SCORE_FLOOR).map(|(id, _)| *id).collect();
+        let default = run(DEFAULT_TOP_K, GEMMA_SCORE_FLOOR);
+        let expected: Vec<u64> = index.iter().filter(|(_, v)| q.cosine(v) > GEMMA_SCORE_FLOOR).map(|(id, _)| *id).collect();
         assert_eq!(default, expected, "the default floor decides");
         assert!(!default.contains(&index[3].0), "a note at 0.1 is below every floor");
         assert_eq!(run(5, 0.6), vec![index[0].0], "0.5 and 0.3 fall below a 0.6 floor");
         assert_eq!(run(5, 0.4), vec![index[0].0, index[1].0], "0.3 falls below a 0.4 floor");
         assert!(run(5, 0.95).is_empty(), "nothing clears 0.95");
         assert_eq!(run(2, 0.0).len(), 2, "top_k = 2 keeps two seeds");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The default floor depends on the backend that made the vectors, an unmeasured backend
+    /// is permissive, and an explicit setting beats every default (T045).
+    #[test]
+    fn the_default_score_floor_follows_the_backend_and_an_explicit_setting_overrides_it() {
+        assert_eq!(default_score_floor(Backend::Gemma), 0.60);
+        assert_eq!(default_score_floor(Backend::Snowflake), SNOWFLAKE_SCORE_FLOOR);
+        // The measured Snowflake scores (right notes 0.239 to 0.577) mean the local floor would
+        // drop all of its vector hits: the two defaults must stay different.
+        assert!(default_score_floor(Backend::Snowflake) < 0.239 + 0.05 && default_score_floor(Backend::Snowflake) < default_score_floor(Backend::Gemma));
+        for unmeasured in [Backend::Loopback, Backend::Other] {
+            assert_eq!(default_score_floor(unmeasured), UNMEASURED_SCORE_FLOOR, "{unmeasured:?}");
+        }
+        assert!(UNMEASURED_SCORE_FLOOR <= GEMMA_SCORE_FLOOR, "an unmeasured backend is never stricter than the measured local one");
+        for backend in [Backend::Gemma, Backend::Snowflake, Backend::Loopback, Backend::Other] {
+            assert_eq!(parse_params(None, None, backend).1, default_score_floor(backend));
+            assert_eq!(parse_params(None, Some("0.33"), backend).1, 0.33, "an explicit floor wins for {backend:?}");
+            assert_eq!(parse_params(None, Some("nonsense"), backend).1, default_score_floor(backend), "a junk floor falls back to the backend default");
+        }
+        // A vector whose cosine is 0.5 survives an unmeasured backend and not the local one.
+        let dir = std::env::temp_dir().join(format!("memb-rag-floor-backend-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Store::open(&dir).unwrap();
+        let note = store.remember(Draft { title: "middling".into(), desc: "synthetic".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() }).unwrap();
+        let index = vec![(note.id, QuantizedVec::from_f32(&[0.5, (1.0f32 - 0.25).sqrt()]))];
+        let q = QuantizedVec::from_f32(&[1.0, 0.0]);
+        let kept = |floor: f32| fuse_with(&store, "zzqq", Some(&q), &index, false, 5, floor).unwrap().len();
+        assert_eq!(kept(default_score_floor(Backend::Gemma)), 0, "0.5 is below the local floor");
+        assert_eq!(kept(default_score_floor(Backend::Loopback)), 1, "0.5 is above the permissive unmeasured floor");
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

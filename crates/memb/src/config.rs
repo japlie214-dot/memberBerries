@@ -106,13 +106,14 @@ pub struct Retrieval {
     pub max_inject_tokens: usize,
     /// Notes a search starts from, before the one-hop expansion adds parents and children.
     pub top_k: usize,
-    /// A vector match with a cosine at or below this is dropped.
-    pub score_floor: f64,
+    /// A vector match with a cosine at or below this is dropped. Unset: the default of the
+    /// embedding backend in use (measured per backend, see `memb_rag::default_score_floor`).
+    pub score_floor: Option<f64>,
 }
 
 impl Default for Retrieval {
     fn default() -> Self {
-        Self { max_inject_tokens: 750, top_k: memb_rag::DEFAULT_TOP_K, score_floor: 0.60 }
+        Self { max_inject_tokens: 750, top_k: memb_rag::DEFAULT_TOP_K, score_floor: None }
     }
 }
 
@@ -370,7 +371,9 @@ impl Config {
         let r = &self.retrieval;
         within("retrieval.max_inject_tokens", r.max_inject_tokens, 50, 8000)?;
         within("retrieval.top_k", r.top_k, 1, 20)?;
-        within("retrieval.score_floor", r.score_floor, 0.0, 0.95)?;
+        if let Some(floor) = r.score_floor {
+            within("retrieval.score_floor", floor, 0.0, 0.95)?;
+        }
         let d = &self.scheduler;
         within("scheduler.routine_wib_hour", d.routine_wib_hour, 0, 23)?;
         within("scheduler.routine_wib_minute", d.routine_wib_minute, 0, 59)?;
@@ -422,7 +425,12 @@ impl Config {
     /// Hand `[retrieval]` to the search code (explicit environment variables win).
     pub fn apply_retrieval_env(&self) {
         let r = &self.retrieval;
-        for (name, value) in [("MEMB_RETRIEVAL_TOP_K", r.top_k.to_string()), ("MEMB_RETRIEVAL_SCORE_FLOOR", r.score_floor.to_string())] {
+        // An unset floor is not exported: the search picks the default of the backend it used.
+        let mut settings = vec![("MEMB_RETRIEVAL_TOP_K", r.top_k.to_string())];
+        if let Some(floor) = r.score_floor {
+            settings.push(("MEMB_RETRIEVAL_SCORE_FLOOR", floor.to_string()));
+        }
+        for (name, value) in settings {
             if std::env::var_os(name).is_none() {
                 std::env::set_var(name, value);
             }
@@ -661,13 +669,13 @@ model = \"m;DROP\"
         let d = Config::default();
         assert_eq!((d.retrieval.max_inject_tokens, d.retrieval.top_k), (750, 5));
         assert_eq!(d.inject_budget_bytes(), 3000);
-        assert_eq!(d.retrieval.score_floor as f32, memb_rag::DEFAULT_SCORE_FLOOR, "config and search agree on the default floor");
+        assert_eq!(d.retrieval.score_floor, None, "no floor in the config: the search uses the default of its backend");
         let c = Config::parse("[retrieval]
 max_inject_tokens = 100
 top_k = 3
 score_floor = 0.5
 ").unwrap();
-        assert_eq!((c.inject_budget_bytes(), c.retrieval.top_k, c.retrieval.score_floor), (400, 3, 0.5));
+        assert_eq!((c.inject_budget_bytes(), c.retrieval.top_k, c.retrieval.score_floor), (400, 3, Some(0.5)));
         with_clean_env(|| {
             let saved = (std::env::var_os("MEMB_RETRIEVAL_TOP_K"), std::env::var_os("MEMB_RETRIEVAL_SCORE_FLOOR"));
             std::env::remove_var("MEMB_RETRIEVAL_TOP_K");
@@ -678,6 +686,11 @@ score_floor = 0.5
             std::env::set_var("MEMB_RETRIEVAL_TOP_K", "9");
             Config::default().apply_retrieval_env();
             assert_eq!(std::env::var("MEMB_RETRIEVAL_TOP_K").unwrap(), "9", "the environment wins");
+            // An unset floor exports nothing, so every backend keeps its own default.
+            std::env::remove_var("MEMB_RETRIEVAL_SCORE_FLOOR");
+            Config::default().apply_retrieval_env();
+            assert!(std::env::var_os("MEMB_RETRIEVAL_SCORE_FLOOR").is_none(), "no floor configured, none exported");
+            assert!(Config::parse("[retrieval]\nscore_floor = 0.99\n").is_err(), "a floor above 0.95 is refused");
             for (name, v) in [("MEMB_RETRIEVAL_TOP_K", saved.0), ("MEMB_RETRIEVAL_SCORE_FLOOR", saved.1)] {
                 match v {
                     Some(v) => std::env::set_var(name, v),

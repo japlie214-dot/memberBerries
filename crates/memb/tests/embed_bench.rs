@@ -389,9 +389,16 @@ fn snowflake_through_memb_search_live() {
     std::env::remove_var("MEMB_GEMMA_MODEL_DIR");
     std::env::remove_var("MEMB_EMBED_PORT");
     std::env::remove_var("MEMB_EMBED_DISABLE");
+    // Since T036 a search never waits for the index: the first one answers at once and the notes
+    // are embedded by a background build, which is timed separately.
+    memb_rag::set_background_build(true);
     let t = Instant::now();
     memb_rag::search(&store, QUERIES[0]).unwrap();
-    println!("first search (30 notes embedded in 2 statements + query): {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    println!("first search (index missing, answers at once): {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    let t = Instant::now();
+    assert!(memb_rag::wait_for_background_builds(std::time::Duration::from_secs(900)));
+    println!("background build (30 notes in 2 statements): {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    memb_rag::set_background_build(false);
     let mut warm = Vec::new();
     let mut ranked = Vec::new();
     for q in QUERIES.iter() {
@@ -423,26 +430,17 @@ const OFF_TOPIC: [&str; 12] = [
     "what is the plot of Romeo and Juliet?",
 ];
 
-/// Where a vector score floor should sit for this model and quantization: the scores of right
-/// notes, wrong notes and off-topic questions, and what each candidate floor keeps.
-///
-///   MEMB_BENCH_GEMMA_DIR=<model dir> MEMB_BENCH_OUT=<report file> \
-///     cargo test --release -p memb --test embed_bench injection_floor_sweep -- --ignored --nocapture
-#[test]
-#[ignore = "needs MEMB_BENCH_GEMMA_DIR with an installed model"]
-fn injection_floor_sweep() {
-    let dir = PathBuf::from(std::env::var_os("MEMB_BENCH_GEMMA_DIR").expect("MEMB_BENCH_GEMMA_DIR"));
+/// The sweep itself, for any backend: the scores of right notes, wrong notes and off-topic
+/// questions, and what each candidate floor keeps, then the same through the real store and
+/// hybrid search (`memb_rag::search` with the backend taken from the environment, the floor set
+/// the way config.toml sets it, and finally with no floor set so the backend default decides).
+/// `docs`, `on` and `off` are the stored-form vectors of the 30 notes, the 30 on-topic questions
+/// and the 12 off-topic questions made by the backend under test.
+fn floor_sweep(title: &str, backend: memb_rag::Backend, docs: &[QuantizedVec], on: &[QuantizedVec], off: &[QuantizedVec]) -> String {
     let mut report = String::new();
     macro_rules! line {
         ($($arg:tt)*) => {{ let l = format!($($arg)*); println!("{l}"); let _ = writeln!(report, "{l}"); }};
     }
-    let model = GemmaEmbedder::new(dir.clone());
-    let width = 256;
-    let embed = |text: &str, query: bool| QuantizedVec::from_f32(&apply_mrl(model.embed_tagged(text, query).unwrap().1, Some(width)).unwrap());
-    let docs: Vec<QuantizedVec> = NOTES.iter().map(|(t, d)| embed(&memb_embed::document_text(t, d), false)).collect();
-    let on: Vec<QuantizedVec> = QUERIES.iter().map(|q| embed(q, true)).collect();
-    let off: Vec<QuantizedVec> = OFF_TOPIC.iter().map(|q| embed(q, true)).collect();
-
     let mut gold: Vec<f64> = Vec::new();
     let mut wrong: Vec<f64> = Vec::new();
     for (qi, q) in on.iter().enumerate() {
@@ -453,7 +451,8 @@ fn injection_floor_sweep() {
     }
     let off_top: Vec<f64> = off.iter().map(|q| docs.iter().map(|d| f64::from(q.cosine(d))).fold(f64::MIN, f64::max)).collect();
     let on_wrong_top: Vec<f64> = on.iter().enumerate().map(|(qi, q)| docs.iter().enumerate().filter(|(di, _)| *di != qi).map(|(_, d)| f64::from(q.cosine(d))).fold(f64::MIN, f64::max)).collect();
-    line!("# Vector score floor sweep ({} notes, {} on-topic questions, {} off-topic questions; 256-wide i8 cosine as memb stores it)\n", NOTES.len(), QUERIES.len(), OFF_TOPIC.len());
+    line!("# Vector score floor sweep: {title} ({} notes, {} on-topic questions, {} off-topic questions, {}-wide i8 cosine as memb stores it)\n", NOTES.len(), QUERIES.len(), OFF_TOPIC.len(), docs[0].data.len());
+    line!("Backend default floor in this build: {:.2}\n", memb_rag::default_score_floor(backend));
     line!("| scores | n | min | p10 | p50 | p90 | max |");
     line!("|---|---|---|---|---|---|---|");
     for (label, mut v) in [
@@ -468,8 +467,9 @@ fn injection_floor_sweep() {
         line!("| {label} | {n} | {min:.3} | {:.3} | {:.3} | {:.3} | {max:.3} |", pct(&mut v.clone(), 0.1), pct(&mut v.clone(), 0.5), pct(&mut v, 0.9));
     }
 
-    // Through the real store and hybrid search, with the floor set the way config.toml sets it.
-    let root = std::env::temp_dir().join(format!("memb-floor-{}", std::process::id()));
+    // Through the real store and hybrid search. The vector index is built in the background
+    // since T036, so ask for it and wait: a search made before that is lexical only.
+    let root = std::env::temp_dir().join(format!("memb-floor-{}-{}", std::process::id(), title.replace(' ', "-")));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let store = Store::open(&root).unwrap();
@@ -477,12 +477,12 @@ fn injection_floor_sweep() {
         .iter()
         .map(|(t, d)| store.remember(Draft { title: (*t).into(), desc: (*d).into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() }).unwrap().id)
         .collect();
-    std::env::set_var("MEMB_GEMMA_MODEL_DIR", &dir);
-    std::env::set_var("MEMB_EMBED_MRL_DIM", "256");
-    std::env::remove_var("MEMB_EMBED_DISABLE");
-    std::env::remove_var("MEMB_EMBED_PORT");
     std::env::remove_var("MEMB_RETRIEVAL_TOP_K");
-    let _ = memb_rag::search(&store, QUERIES[0]).unwrap(); // builds the hot set
+    std::env::remove_var("MEMB_RETRIEVAL_SCORE_FLOOR");
+    memb_rag::set_background_build(true);
+    let _ = memb_rag::search(&store, QUERIES[0]).unwrap(); // starts the background build of the index
+    assert!(memb_rag::wait_for_background_builds(std::time::Duration::from_secs(900)), "the index build did not finish");
+    memb_rag::set_background_build(false);
 
     // The vector side alone: what the floor does to the vector candidates (at most 5 are used).
     let vector_list = |q: &QuantizedVec, floor: f64| -> Vec<usize> {
@@ -494,8 +494,18 @@ fn injection_floor_sweep() {
     line!("\nLexical search alone returns {lexical_off:.1} of at most 10 notes for an off-topic question on average (it has no score floor).\n");
     line!("| floor | right note clears it | vector only: right note in top 5 | vector only: notes per on-topic question | vector only: off-topic questions with any note | vector only: notes per off-topic question | hybrid: notes per on-topic question | hybrid: recall@5 | hybrid: notes per off-topic question | hybrid: JSON bytes per on-topic hook |");
     line!("|---|---|---|---|---|---|---|---|---|---|");
-    for floor in [0.0, 0.25, 0.42, 0.50, 0.55, 0.60, 0.625, 0.65, 0.675, 0.70, 0.75] {
-        std::env::set_var("MEMB_RETRIEVAL_SCORE_FLOOR", floor.to_string());
+    let default_floor = f64::from(memb_rag::default_score_floor(backend));
+    let candidates: Vec<(String, Option<f64>)> = [0.0, 0.25, 0.42, 0.50, 0.55, 0.60, 0.625, 0.65, 0.675, 0.70, 0.75]
+        .iter()
+        .map(|f| (format!("{f:.3}"), Some(*f)))
+        .chain(std::iter::once((format!("default ({default_floor:.2})"), None)))
+        .collect();
+    for (label, setting) in candidates {
+        match setting {
+            Some(f) => std::env::set_var("MEMB_RETRIEVAL_SCORE_FLOOR", f.to_string()),
+            None => std::env::remove_var("MEMB_RETRIEVAL_SCORE_FLOOR"),
+        }
+        let floor = setting.unwrap_or(default_floor);
         let clears = gold.iter().filter(|s| **s > floor).count();
         let on_lists_v: Vec<Vec<usize>> = on.iter().map(|q| vector_list(q, floor)).collect();
         let (_, _, v5, _) = score(&on_lists_v);
@@ -518,10 +528,68 @@ fn injection_floor_sweep() {
         let (on_n, on_lists, on_bytes) = run(&QUERIES);
         let (off_n, _, _) = run(&OFF_TOPIC);
         let (_, _, r5, _) = score(&on_lists);
-        line!("| {floor:.3} | {clears}/{} | {v5:.2} | {v_on_n:.1} | {v_off_any}/{} | {v_off_n:.1} | {on_n:.1} | {r5:.2} | {off_n:.1} | {on_bytes:.0} |", gold.len(), OFF_TOPIC.len());
+        line!("| {label} | {clears}/{} | {v5:.2} | {v_on_n:.1} | {v_off_any}/{} | {v_off_n:.1} | {on_n:.1} | {r5:.2} | {off_n:.1} | {on_bytes:.0} |", gold.len(), OFF_TOPIC.len());
     }
+    std::env::remove_var("MEMB_RETRIEVAL_SCORE_FLOOR");
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+    report
+}
+
+fn write_report(report: &str) {
     if let Some(out) = std::env::var_os("MEMB_BENCH_OUT") {
         std::fs::write(out, report).unwrap();
     }
-    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Where a vector score floor should sit for the local model and quantization.
+///
+///   MEMB_BENCH_GEMMA_DIR=<model dir> MEMB_BENCH_OUT=<report file> \
+///     cargo test --release -p memb --test embed_bench injection_floor_sweep -- --ignored --nocapture
+#[test]
+#[ignore = "needs MEMB_BENCH_GEMMA_DIR with an installed model"]
+fn injection_floor_sweep() {
+    let dir = PathBuf::from(std::env::var_os("MEMB_BENCH_GEMMA_DIR").expect("MEMB_BENCH_GEMMA_DIR"));
+    let model = GemmaEmbedder::new(dir.clone());
+    let width = 256;
+    let embed = |text: &str, query: bool| QuantizedVec::from_f32(&apply_mrl(model.embed_tagged(text, query).unwrap().1, Some(width)).unwrap());
+    let docs: Vec<QuantizedVec> = NOTES.iter().map(|(t, d)| embed(&memb_embed::document_text(t, d), false)).collect();
+    let on: Vec<QuantizedVec> = QUERIES.iter().map(|q| embed(q, true)).collect();
+    let off: Vec<QuantizedVec> = OFF_TOPIC.iter().map(|q| embed(q, true)).collect();
+    std::env::set_var("MEMB_GEMMA_MODEL_DIR", &dir);
+    std::env::set_var("MEMB_EMBED_MRL_DIM", "256");
+    std::env::remove_var("MEMB_EMBED_DISABLE");
+    std::env::remove_var("MEMB_EMBED_PORT");
+    write_report(&floor_sweep("local EmbeddingGemma 2 q4", memb_rag::Backend::Gemma, &docs, &on, &off));
+}
+
+/// The same sweep for whatever backend the environment configures, with the vectors made the
+/// way memb makes them (`memb_rag::embed_note` / `embed_text`, so prefixes, widths and tags
+/// are the production ones). Pick the backend with its own variables:
+///   Snowflake: MEMB_SNOWFLAKE_ACCOUNT / _USER / _WAREHOUSE / _KEY (sends the synthetic corpus to Snowflake)
+///   loopback llama-server: MEMB_EMBED_PORT and MEMB_EMBED_MODEL_ID
+/// and say which one it is with MEMB_BENCH_BACKEND=snowflake|loopback.
+///
+///   MEMB_BENCH_BACKEND=snowflake MEMB_BENCH_OUT=<report file> \
+///     cargo test --release -p memb --test embed_bench injection_floor_sweep_backend -- --ignored --nocapture
+#[test]
+#[ignore = "needs a configured backend and MEMB_BENCH_BACKEND=snowflake|loopback"]
+fn injection_floor_sweep_backend() {
+    let (backend, title) = match std::env::var("MEMB_BENCH_BACKEND").expect("MEMB_BENCH_BACKEND").as_str() {
+        "snowflake" => (memb_rag::Backend::Snowflake, "Snowflake AI_EMBED"),
+        "loopback" => (memb_rag::Backend::Loopback, "loopback llama-server"),
+        other => panic!("MEMB_BENCH_BACKEND must be snowflake or loopback, not {other}"),
+    };
+    // Nothing local may take precedence over the backend under test.
+    std::env::remove_var("MEMB_GEMMA_MODEL_DIR");
+    std::env::remove_var("MEMB_EMBED_DISABLE");
+    if backend == memb_rag::Backend::Snowflake {
+        std::env::remove_var("MEMB_EMBED_PORT");
+    }
+    let doc = |t: &str, d: &str| memb_rag::embed_note(t, d).expect("embedding the note failed").expect("the backend is not configured").1;
+    let query = |q: &str| memb_rag::embed_text(q, true).expect("embedding the question failed").expect("the backend is not configured").1;
+    let docs: Vec<QuantizedVec> = NOTES.iter().map(|(t, d)| doc(t, d)).collect();
+    let on: Vec<QuantizedVec> = QUERIES.iter().map(|q| query(q)).collect();
+    let off: Vec<QuantizedVec> = OFF_TOPIC.iter().map(|q| query(q)).collect();
+    write_report(&floor_sweep(title, backend, &docs, &on, &off));
 }
