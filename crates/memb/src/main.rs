@@ -330,6 +330,9 @@ fn main() {
     #[cfg(windows)]
     let _job = memb_win::attach_job_object_2gb_cap().ok();
     start_resource_governor();
+    // Long-lived, so a search that finds the vector index missing answers at once and builds it
+    // in the background instead of waiting for it (T036); hooks and the CLI never build.
+    memb_rag::set_background_build(true);
     if run().is_err() {
         eprintln!("memb: invalid startup configuration or stdio failure");
         std::process::exit(1);

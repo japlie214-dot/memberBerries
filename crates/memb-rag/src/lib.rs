@@ -287,7 +287,7 @@ fn embed_snowflake(
 fn search_with_snowflake(
     store: &Store,
     query: &str,
-    client: &memb_embed::snowflake::Client,
+    client: &std::sync::Arc<memb_embed::snowflake::Client>,
 ) -> Result<Vec<Note>, String> {
     let Ok(mrl) = memb_embed::mrl_dim_from_env() else {
         return hybrid_search(store, query, None, &[]);
@@ -310,14 +310,12 @@ fn search_with_snowflake(
         c.insert(key, q.clone());
     }
     // Notes that are not cached yet go out in batches (one statement per 16), not one by one.
-    let hot = hot_set_batch(store, &tag, |notes| {
+    let (client, width) = (client.clone(), q.data.len());
+    let embed: NoteEmbedder = std::sync::Arc::new(move |notes: &[&Note]| {
         let texts: Vec<String> = notes.iter().map(|n| memb_embed::snowflake::document_text(&n.title, &n.desc)).collect();
-        embed_snowflake(client, &texts, mrl).ok().filter(|v| v.iter().all(|x| x.data.len() == q.data.len()))
-    })?;
-    match hot {
-        Some((index, _)) => fuse(store, query, Some(&q), &index, true),
-        None => hybrid_search(store, query, None, &[]),
-    }
+        embed_snowflake(&client, &texts, mrl).ok().filter(|v| v.iter().all(|x| x.data.len() == width))
+    });
+    search_with_index(store, query, &q, hot_set_nowait(store, &tag, embed)?)
 }
 
 /// What a note is embedded as by the active backend, with the tag of the vector.
@@ -452,42 +450,132 @@ pub fn hot_set_batch(
         .iter()
         .map(|n| memb_embed::document_key(tag, &n.title, &n.desc))
         .collect();
-    let cached = store
+    let mut all = store
         .with_db(|db| memb_embed::get_document_vectors(db, &keys))
         .unwrap_or_default();
-    let missing: Vec<&Note> = active.iter().zip(&keys).filter(|(_, k)| !cached.contains_key(*k)).map(|(n, _)| *n).collect();
-    let mut made = if missing.is_empty() {
-        Vec::new()
-    } else {
-        match embed_docs(&missing) {
-            Some(v) if v.len() == missing.len() => v,
+    let missing: Vec<(&Note, [u8; 32])> = active
+        .iter()
+        .zip(&keys)
+        .filter(|(_, k)| !all.contains_key(*k))
+        .map(|(n, k)| (*n, *k))
+        .collect();
+    // Notes are embedded in chunks and every chunk is saved at once, so a build that is
+    // interrupted (a failed embedding, a killed process) resumes from the notes already done.
+    let mut embedded = 0usize;
+    for chunk in missing.chunks(HOT_CHUNK) {
+        let notes: Vec<&Note> = chunk.iter().map(|(n, _)| *n).collect();
+        let vectors = match embed_docs(&notes) {
+            Some(v) if v.len() == chunk.len() => v,
             _ => return Ok(None),
-        }
+        };
+        let done: Vec<([u8; 32], QuantizedVec)> = chunk.iter().map(|(_, k)| *k).zip(vectors).collect();
+        let _ = store.with_db(|db| memb_embed::put_document_vectors(db, &done));
+        embedded += done.len();
+        all.extend(done);
     }
-    .into_iter();
-    let mut fresh = Vec::new();
     let mut entries: Vec<(u64, QuantizedVec)> = Vec::new();
     for (note, key) in active.iter().zip(&keys) {
-        let vector = match cached.get(key) {
-            Some(v) => v.clone(),
-            None => {
-                let v = made.next().ok_or("batch embedding ran out of vectors")?;
-                fresh.push((*key, v.clone()));
-                v
-            }
-        };
+        let vector = all.get(key).ok_or("batch embedding ran out of vectors")?.clone();
         if entries.first().is_some_and(|(_, f)| f.data.len() != vector.data.len()) {
             return Ok(None);
         }
         entries.push((note.id, vector));
     }
-    if !fresh.is_empty() {
-        let _ = store.with_db(|db| memb_embed::put_document_vectors(db, &fresh));
-    }
     let _ = store.with_db(|db| memb_embed::write_hot_set(db, tag, version, &entries));
     let hot = std::sync::Arc::new(entries);
     hot_cache_store(store.root(), tag, version, hot.clone());
-    Ok(Some((hot, HotSource::Rebuilt { embedded: fresh.len() })))
+    Ok(Some((hot, HotSource::Rebuilt { embedded })))
+}
+
+/// How many notes are embedded (and saved) at a time while a hot set is built.
+pub const HOT_CHUNK: usize = 16;
+
+static BACKGROUND_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Long-lived processes (the MCP server, the daemon) call this so that a search that finds
+/// the hot set missing starts building it in the background. Short-lived ones (hooks, the
+/// CLI) leave it off: they answer from what is cached and never wait for, or start, a build.
+pub fn set_background_build(on: bool) {
+    BACKGROUND_BUILD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+type BuildGuard = std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, String)>>;
+
+fn builds_in_progress() -> &'static BuildGuard {
+    static BUILDS: std::sync::OnceLock<BuildGuard> = std::sync::OnceLock::new();
+    BUILDS.get_or_init(Default::default)
+}
+
+/// Whether a background build of this set is running in this process.
+pub fn build_in_progress(root: &std::path::Path, tag: &str) -> bool {
+    builds_in_progress().lock().map(|b| b.contains(&(root.to_path_buf(), tag.to_owned()))).unwrap_or(false)
+}
+
+/// What `hot_set_nowait` could give a search right now.
+pub enum HotAnswer {
+    /// The complete set for the current knowledge base.
+    Complete(HotVectors, HotSource),
+    /// The vectors that exist already (notes not embedded yet are missing): rank with these
+    /// plus lexical search. `building` says whether a background build is running.
+    Partial { vectors: HotVectors, embedded: usize, total: usize, building: bool },
+}
+
+/// Like `hot_set_batch`, but it never embeds on the caller's thread. A complete set (memory,
+/// disk, or every vector already cached) is returned as it is; otherwise the cached vectors
+/// are returned at once and, when `set_background_build(true)`, the missing ones are embedded
+/// in a background thread that saves its progress chunk by chunk.
+pub fn hot_set_nowait(
+    store: &Store,
+    tag: &str,
+    embed_docs: std::sync::Arc<dyn Fn(&[&Note]) -> Option<Vec<QuantizedVec>> + Send + Sync>,
+) -> Result<HotAnswer, String> {
+    let version = store.kb_version()?;
+    if let Some(hit) = hot_cache_lookup(store.root(), tag, version) {
+        return Ok(HotAnswer::Complete(hit, HotSource::Memory));
+    }
+    if let Some((built, entries)) = store.with_db(|db| memb_embed::read_hot_set(db, tag))? {
+        if built == version {
+            let hot = std::sync::Arc::new(entries);
+            hot_cache_store(store.root(), tag, version, hot.clone());
+            return Ok(HotAnswer::Complete(hot, HotSource::Disk));
+        }
+    }
+    let notes = store.load_all_notes()?;
+    let active: Vec<&Note> = notes.values().filter(|n| n.status == memb_core::NoteStatus::Active).collect();
+    let keys: Vec<[u8; 32]> = active.iter().map(|n| memb_embed::document_key(tag, &n.title, &n.desc)).collect();
+    let cached = store.with_db(|db| memb_embed::get_document_vectors(db, &keys)).unwrap_or_default();
+    if cached.len() >= active.len() && keys.iter().all(|k| cached.contains_key(k)) {
+        // Nothing to embed (a note was retracted, or reworded to text that is already cached):
+        // assembling the set embeds nothing, so the embedder is never called.
+        return match hot_set_batch(store, tag, |_| None)? {
+            Some((hot, source)) => Ok(HotAnswer::Complete(hot, source)),
+            None => Err("the hot set could not be assembled from cached vectors".into()),
+        };
+    }
+    let entries: Vec<(u64, QuantizedVec)> = active.iter().zip(&keys).filter_map(|(n, k)| cached.get(k).map(|v| (n.id, v.clone()))).collect();
+    let (embedded, total) = (entries.len(), active.len());
+    let mut building = build_in_progress(store.root(), tag);
+    if !building && BACKGROUND_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
+        let key = (store.root().to_path_buf(), tag.to_owned());
+        let started = builds_in_progress().lock().map(|mut b| b.insert(key.clone())).unwrap_or(false);
+        if started {
+            building = true;
+            let (store, tag) = (store.clone(), tag.to_owned());
+            std::thread::spawn(move || {
+                struct Done((std::path::PathBuf, String));
+                impl Drop for Done {
+                    fn drop(&mut self) {
+                        if let Ok(mut b) = builds_in_progress().lock() {
+                            b.remove(&self.0);
+                        }
+                    }
+                }
+                let _done = Done(key);
+                let _ = hot_set_batch(&store, &tag, |notes| embed_docs(notes));
+            });
+        }
+    }
+    Ok(HotAnswer::Partial { vectors: std::sync::Arc::new(entries), embedded, total, building })
 }
 
 fn search_with_gemma(
@@ -505,14 +593,30 @@ fn search_with_gemma(
         Ok((tag, v)) => (tag, QuantizedVec::from_f32(&v)),
         Err(_) => return hybrid_search(store, query, None, &[]),
     };
-    let hot = hot_set(store, &tag, |note| {
-        let (doc_tag, v) = gemma_embed(&directory, &memb_embed::document_text(&note.title, &note.desc), false).ok()?;
-        let v = memb_embed::apply_mrl(v, mrl).ok()?;
-        (memb_embed::mrl_tag(&doc_tag, mrl) == tag && v.len() == q.data.len()).then(|| QuantizedVec::from_f32(&v))
-    })?;
+    let embed: NoteEmbedder = {
+        let (tag, width) = (tag.clone(), q.data.len());
+        std::sync::Arc::new(move |notes: &[&Note]| {
+            notes
+                .iter()
+                .map(|note| {
+                    let (doc_tag, v) = gemma_embed(&directory, &memb_embed::document_text(&note.title, &note.desc), false).ok()?;
+                    let v = memb_embed::apply_mrl(v, mrl).ok()?;
+                    (memb_embed::mrl_tag(&doc_tag, mrl) == tag && v.len() == width).then(|| QuantizedVec::from_f32(&v))
+                })
+                .collect()
+        })
+    };
+    search_with_index(store, query, &q, hot_set_nowait(store, &tag, embed)?)
+}
+
+/// Embeds a list of notes; `None` when any of them cannot be embedded.
+type NoteEmbedder = std::sync::Arc<dyn Fn(&[&Note]) -> Option<Vec<QuantizedVec>> + Send + Sync>;
+
+/// Ranks with whatever vectors exist: the complete set, or the cached part of one that is
+/// still being built (the rest is found by lexical search until the build finishes).
+fn search_with_index(store: &Store, query: &str, q: &QuantizedVec, hot: HotAnswer) -> Result<Vec<Note>, String> {
     match hot {
-        Some((index, _)) => fuse(store, query, Some(&q), &index, true),
-        None => hybrid_search(store, query, None, &[]),
+        HotAnswer::Complete(index, _) | HotAnswer::Partial { vectors: index, .. } => fuse(store, query, Some(q), &index, true),
     }
 }
 
@@ -547,15 +651,18 @@ fn search_with_server(
     if let Ok(mut c) = cache.lock() {
         c.insert(key, query_vec.clone());
     }
-    let hot = hot_set(store, &tag, |note| {
-        memb_embed::local_embedding(port, &memb_embed::server_document_text(&note.title, &note.desc))
-            .ok()
-            .filter(|v| v.data.len() == query_vec.data.len())
-    })?;
-    match hot {
-        Some((index, _)) => fuse(store, query, Some(&query_vec), &index, true),
-        None => hybrid_search(store, query, None, &[]),
-    }
+    let width = query_vec.data.len();
+    let embed: NoteEmbedder = std::sync::Arc::new(move |notes: &[&Note]| {
+        notes
+            .iter()
+            .map(|note| {
+                memb_embed::local_embedding(port, &memb_embed::server_document_text(&note.title, &note.desc))
+                    .ok()
+                    .filter(|v| v.data.len() == width)
+            })
+            .collect()
+    });
+    search_with_index(store, query, &query_vec, hot_set_nowait(store, &tag, embed)?)
 }
 
 /// Hybrid retrieval combining lexical ranking + quantized vector scan + RRF (k=60) + 1-hop graph expansion.
@@ -670,6 +777,157 @@ mod tests {
 
     /// The environment is process-wide: serialize the tests that change it.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Waits until no background hot-set build is running in this process.
+    fn wait_for_builds() {
+        wait_for_builds_within(30);
+    }
+
+    fn wait_for_builds_within(seconds: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        while builds_in_progress().lock().map(|b| !b.is_empty()).unwrap_or(false) {
+            assert!(std::time::Instant::now() < deadline, "a background build did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A store with a topic and `n` knowledge notes (`n + 1` active notes).
+    fn store_with_notes(label: &str, n: usize) -> Store {
+        let root = std::env::temp_dir().join(format!(
+            "memb-rag-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let draft = |title: String, desc: String, kind: Kind, parents: Vec<u64>| Draft { title, desc, kind, parents, properties: BTreeMap::new() };
+        let topic = store.remember(draft("topic".into(), "root".into(), Kind::Topic, vec![])).unwrap();
+        for i in 0..n {
+            store
+                .remember(draft(format!("note {i}"), format!("description of note {i} about subject {}", i % 7), Kind::Knowledge, vec![topic.id]))
+                .unwrap();
+        }
+        store
+    }
+
+    /// A note embedder that takes `delay` per note and counts the notes it was asked for.
+    fn slow_embedder(delay: std::time::Duration, count: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> NoteEmbedder {
+        std::sync::Arc::new(move |notes: &[&Note]| {
+            let mut out = Vec::new();
+            for n in notes {
+                std::thread::sleep(delay);
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                out.push(fake_vector(&memb_embed::document_text(&n.title, &n.desc)));
+            }
+            Some(out)
+        })
+    }
+
+    #[test]
+    fn a_search_never_waits_for_the_vector_index_and_the_background_build_completes_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let store = store_with_notes("nowait", 40);
+        let tag = "nowait-model|768";
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        // 41 notes at 60 ms each: a blocking build would take about 2.5 s.
+        let embed = slow_embedder(Duration::from_millis(60), count.clone());
+        set_background_build(true);
+
+        let started = Instant::now();
+        let first = hot_set_nowait(&store, tag, embed.clone()).unwrap();
+        let first_took = started.elapsed();
+        assert!(first_took < Duration::from_millis(500), "the first search must not wait for the build, took {first_took:?}");
+        match first {
+            HotAnswer::Partial { vectors, embedded, total, building } => {
+                assert_eq!((vectors.len(), embedded, total), (0, 0, 41));
+                assert!(building, "the build runs in the background");
+            }
+            HotAnswer::Complete(..) => panic!("nothing was cached, the set cannot be complete yet"),
+        }
+        // A second search while the build runs neither waits nor starts a second build.
+        let started = Instant::now();
+        let again = hot_set_nowait(&store, tag, embed.clone()).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(again, HotAnswer::Partial { .. } | HotAnswer::Complete(..)));
+
+        // Results improve once the build has finished: the complete set appears.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let complete = loop {
+            match hot_set_nowait(&store, tag, embed.clone()).unwrap() {
+                HotAnswer::Complete(hot, source) => break (hot, source),
+                HotAnswer::Partial { .. } if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                HotAnswer::Partial { embedded, total, .. } => panic!("the build did not finish: {embedded} of {total}"),
+            }
+        };
+        assert_eq!(complete.0.len(), 41);
+        assert_eq!(count.load(Ordering::SeqCst), 41, "every note was embedded exactly once, by one build");
+        assert!(!build_in_progress(store.root(), tag));
+        set_background_build(false);
+    }
+
+    #[test]
+    fn without_background_building_a_search_uses_cached_vectors_and_starts_no_build() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_background_build(false);
+        let store = store_with_notes("nobuild", 20);
+        let tag = "nobuild-model|768";
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let embed = slow_embedder(Duration::from_millis(5), count.clone());
+        // Part of the notes are cached already (an earlier, interrupted build).
+        let notes = store.load_all_notes().unwrap();
+        let some: Vec<&Note> = notes.values().take(8).collect();
+        let keys: Vec<[u8; 32]> = some.iter().map(|n| memb_embed::document_key(tag, &n.title, &n.desc)).collect();
+        let vectors: Vec<QuantizedVec> = some.iter().map(|n| fake_vector(&memb_embed::document_text(&n.title, &n.desc))).collect();
+        let entries: Vec<_> = keys.into_iter().zip(vectors).collect();
+        store.with_db(|db| memb_embed::put_document_vectors(db, &entries)).unwrap();
+
+        match hot_set_nowait(&store, tag, embed.clone()).unwrap() {
+            HotAnswer::Partial { vectors, embedded, total, building } => {
+                assert_eq!((vectors.len(), embedded, total, building), (8, 8, 21, false));
+            }
+            HotAnswer::Complete(..) => panic!("13 notes have no vector"),
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(count.load(Ordering::SeqCst), 0, "a hook or CLI search embeds nothing and starts nothing");
+        assert!(!build_in_progress(store.root(), tag));
+    }
+
+    #[test]
+    fn an_interrupted_build_resumes_without_embedding_the_finished_notes_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = store_with_notes("resume", 40);
+        let tag = "resume-model|768";
+        // 41 notes go out in chunks of 16, 16 and 9. The second chunk fails: the build stops there.
+        let calls = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let interrupted = hot_set_batch(&store, tag, |notes| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                return None;
+            }
+            done.fetch_add(notes.len(), Ordering::SeqCst);
+            Some(notes.iter().map(|n| fake_vector(&memb_embed::document_text(&n.title, &n.desc))).collect())
+        })
+        .unwrap();
+        assert!(interrupted.is_none(), "an embedding failure leaves no hot set");
+        assert_eq!(done.load(Ordering::SeqCst), HOT_CHUNK, "the first chunk was embedded and saved");
+        assert!(store.with_db(|db| memb_embed::read_hot_set(db, tag)).unwrap().is_none());
+
+        // The next build only embeds what is still missing.
+        let again = AtomicUsize::new(0);
+        let (hot, source) = hot_set_batch(&store, tag, |notes| {
+            again.fetch_add(notes.len(), Ordering::SeqCst);
+            Some(notes.iter().map(|n| fake_vector(&memb_embed::document_text(&n.title, &n.desc))).collect())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(hot.len(), 41);
+        assert_eq!(source, HotSource::Rebuilt { embedded: 41 - HOT_CHUNK });
+        assert_eq!(again.load(Ordering::SeqCst), 41 - HOT_CHUNK, "the finished notes were not embedded again");
+    }
 
     fn fake_vector(text: &str) -> QuantizedVec {
         let mut x = text.bytes().fold(1469598103934665603u64, |h, b| (h ^ b as u64).wrapping_mul(1099511628211));
@@ -905,7 +1163,11 @@ mod tests {
         std::env::set_var("MEMB_SNOWFLAKE_KEY", &key);
         std::env::set_var("MEMB_SNOWFLAKE_BASE_URL", format!("http://127.0.0.1:{port}"));
 
-        // First search: one statement for the query, two for the 20 notes (16 + 4).
+        // The first search answers at once from lexical search (one statement, for the query);
+        // the 20 notes (16 + 4) are embedded by the background build in two more statements.
+        set_background_build(true);
+        let _ = search(&store, "scarlet apples").unwrap();
+        wait_for_builds();
         let found = search(&store, "scarlet apples").unwrap();
         assert_eq!(found.first().map(|n| n.id), Some(ids[0]), "the vector match comes first: {found:?}");
         let sent = bodies.lock().unwrap().clone();
@@ -926,6 +1188,7 @@ mod tests {
         // One edited note: its vector alone is embedded again (query + a batch of one).
         store.update(ids[3], NotePatch { desc: Some("tasks that run on windows".into()), ..Default::default() }).unwrap();
         search(&store, "windows tasks").unwrap();
+        wait_for_builds();
         let sent = bodies.lock().unwrap().clone();
         assert_eq!(sent.len(), 6);
         assert_eq!(sent[5]["bindings"].as_object().unwrap().len(), 1);
@@ -947,6 +1210,7 @@ mod tests {
         // A partial setup is an error from the embedding functions, not a silent fallback.
         std::env::remove_var("MEMB_SNOWFLAKE_USER");
         assert!(embed_text("x", true).is_err());
+        set_background_build(false);
         for (k, v) in saved {
             match v {
                 Some(v) => std::env::set_var(k, v),
@@ -986,6 +1250,47 @@ mod tests {
         }
     }
 
+    /// T036 evidence: the real model on 100 notes. A search must answer at once while the
+    /// vector index builds in the background, and answer from vectors once it is done.
+    /// `cargo test --release -p memb-rag real_model_hot_set -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires MEMB_TEST_GEMMA_DIR and MEMB_TEST_SCRATCH"]
+    fn real_model_hot_set_builds_in_the_background_on_100_notes() {
+        use std::time::Instant;
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::path::PathBuf::from(std::env::var_os("MEMB_TEST_GEMMA_DIR").unwrap());
+        let root = std::path::PathBuf::from(std::env::var_os("MEMB_TEST_SCRATCH").unwrap())
+            .join(format!("hot-100-{}", std::process::id()));
+        assert!(!root.exists());
+        let store = Store::open(&root).unwrap();
+        let draft = |title: String, desc: String| Draft { title, desc, kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() };
+        let target = store.remember(draft("scarlet apples".into(), "fresh red fruit from the orchard".into())).unwrap();
+        for i in 0..99 {
+            store.remember(draft(format!("database lock note {i}"), format!("how write lock number {i} is taken and released by the store"))).unwrap();
+        }
+        // The model load is not what is measured here (a hook or the MCP server pays it elsewhere).
+        let started = Instant::now();
+        gemma_embed(&directory, "warm up", true).unwrap();
+        eprintln!("T036 model load + first query embedding: {:?}", started.elapsed());
+
+        set_background_build(true);
+        let started = Instant::now();
+        let first = search_with_gemma(&store, "bright red apple", directory.clone()).unwrap();
+        let first_took = started.elapsed();
+        eprintln!("T036 first search (index missing, 100 notes): {first_took:?}, {} results, build running: {}", first.len(), builds_in_progress().lock().unwrap().len() == 1);
+        assert!(first_took < std::time::Duration::from_secs(1), "the first search must not wait for the build: {first_took:?}");
+        let started = Instant::now();
+        wait_for_builds_within(600);
+        eprintln!("T036 background build of 100 notes: {:?}", started.elapsed());
+        set_background_build(false);
+        let started = Instant::now();
+        let after = search_with_gemma(&store, "bright red apple", directory).unwrap();
+        eprintln!("T036 search after the build: {:?}, first result id {} (target {})", started.elapsed(), after[0].id, target.id);
+        assert_eq!(after[0].id, target.id, "the vector match comes first once the index is complete");
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     #[ignore = "requires MEMB_TEST_GEMMA_DIR and MEMB_TEST_SCRATCH"]
     fn real_gemma_synthetic_retrieval_and_fallback() {
@@ -1006,6 +1311,12 @@ mod tests {
             .unwrap()
             .is_empty());
         let directory = std::path::PathBuf::from(std::env::var_os("MEMB_TEST_GEMMA_DIR").unwrap());
+        // A search answers at once; the vector of the note is made by the background build.
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_background_build(true);
+        let _ = search_with_gemma(&store, "bright red apple", directory.clone()).unwrap();
+        wait_for_builds();
+        set_background_build(false);
         assert!(search_with_gemma(&store, "bright red apple", directory)
             .unwrap()
             .iter()
@@ -1202,6 +1513,11 @@ mod tests {
                 .unwrap()
                 .id;
         }
+        // A search answers at once and the notes are embedded by the background build.
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_background_build(true);
+        let _ = search_with_server(&store, "semanticquery", port, Some("model-v1")).unwrap();
+        wait_for_builds();
         let results = search_with_server(&store, "semanticquery", port, Some("model-v1")).unwrap();
         assert_eq!(results[0].id, target);
         assert_eq!(count.load(Ordering::Relaxed), 66);
@@ -1221,16 +1537,21 @@ mod tests {
                 },
             )
             .unwrap();
+        let _ = search_with_server(&store, "semanticquery", port, Some("model-v1")).unwrap();
+        wait_for_builds();
         assert_eq!(
             search_with_server(&store, "semanticquery", port, Some("model-v1")).unwrap()[0].id,
             target
         );
         assert_eq!(count.load(Ordering::Relaxed), 67);
+        let _ = search_with_server(&store, "semanticquery", port, Some("model-v2")).unwrap();
+        wait_for_builds();
         assert_eq!(
             search_with_server(&store, "semanticquery", port, Some("model-v2")).unwrap()[0].id,
             target
         );
         assert_eq!(count.load(Ordering::Relaxed), 133);
+        set_background_build(false);
         drop(store);
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();

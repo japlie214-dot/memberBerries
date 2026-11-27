@@ -5,6 +5,10 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.14.0 (2026-11-27)
+
+- **Change (T036):** a search never waits for the vector index. When the index is missing or out of date, a search answers at once from lexical search plus the vectors already saved (0.5 s for 100 notes with the real model, where building the index inside the search took 33 s), and the MCP server embeds the missing notes in a background thread, 16 at a time, saving each chunk so an interrupted build resumes without embedding finished notes again. Hooks and `memb search` never start a build. `memb doctor` has a new `vector index` line (up to date, unfinished with the number of saved vectors, or not built yet). Evidence: `evidence/t036-hot-set-background.md`.
+
 ## 0.13.3 (2026-11-27)
 
 - **Test (T044):** the hook deadline is now proven against a real pipe service whose handler takes 3 s: a hook (kick mode) gives up at 2 s, the rest of that hook skips the service at once, and a search (wait mode) still gets the answer. The same build was timed live with the model unloaded after idle (kick-mode search 2.5 s, 2.5 s, then 0.7 s) and with `memb hook` against a freshly started service (2.5 s while the model loads, then 0.8 s). Corrects the T043 timings, which came from runs that never reached the service. No change in behaviour.

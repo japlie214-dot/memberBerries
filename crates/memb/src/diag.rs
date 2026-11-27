@@ -184,6 +184,33 @@ fn memb_embed_hint() -> String {
     }
 }
 
+/// Whether the vector index is built for the current notes, and how much of an unfinished
+/// build is already saved (a search never waits for it; the MCP server builds it in the
+/// background and resumes from what is saved).
+fn vector_index_check(store: &Store) -> Check {
+    let (Ok(version), Ok(status), Ok(notes)) = (
+        store.kb_version(),
+        store.with_db(memb_embed::index_status),
+        store.load_all_notes(),
+    ) else {
+        return Check::new("vector index", Status::Info, "could not be read");
+    };
+    let active = notes.values().filter(|n| n.status == memb_core::NoteStatus::Active).count();
+    if status.hot_sets.is_empty() && status.cached_vectors == 0 {
+        return Check::new("vector index", Status::Info, format!("not built yet ({active} active notes); searches use lexical search until the MCP server has built it in the background"));
+    }
+    let current = status.hot_sets.iter().filter(|(_, built, _)| *built == version).count();
+    if current > 0 {
+        Check::new("vector index", Status::Ok, format!("up to date for {active} active notes ({} saved document vectors)", status.cached_vectors))
+    } else {
+        Check::new(
+            "vector index",
+            Status::Info,
+            format!("out of date or unfinished: {} document vectors saved for {active} active notes; the MCP server completes it in the background, searches meanwhile use the saved vectors plus lexical search", status.cached_vectors),
+        )
+    }
+}
+
 fn embedding_check(root: &Path, snowflake: Option<&crate::config::Snowflake>) -> Check {
     if std::env::var("MEMB_EMBED_DISABLE").ok().as_deref() == Some("1") {
         return Check::new("embeddings", Status::Info, "disabled: lexical-only search");
@@ -300,6 +327,9 @@ pub fn doctor(root: &Path, config: &Result<Config, String>, store: Option<&Store
         Ok(cfg) => {
             checks.push(Check::new("config", Status::Ok, "config.toml is valid (or absent: defaults)"));
             checks.push(embedding_check(root, cfg.embeddings.snowflake.as_ref()));
+            if let Some(store) = store {
+                checks.push(vector_index_check(store));
+            }
             checks.push(command_check("curation model", &cfg.curator.cli_command, "main model"));
             if let Some(fallback) = cfg.curator.fallback() {
                 checks.push(command_check("curation fallback", fallback, "fallback model"));

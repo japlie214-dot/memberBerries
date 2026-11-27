@@ -28,7 +28,7 @@ To uninstall, remove only the `memb` extension/plugin or configuration entry and
 
 ### Verification matrix
 
-v0.13.3: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
+v0.14.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
 
 ### Cross-client smoke test
 
@@ -76,5 +76,5 @@ memb reads your machine (CPU features, physical cores, RAM) and picks the build 
 - `MEMB_EMBED_THREADS` (1 to 64, default 2) sets the threads ONNX Runtime uses for one embedding. On a 12-core machine a short query took 154 ms with 2 threads and 86 ms with 12; see evidence/t036-embeddinggemma-q4-benchmark.md for the full measurements, including what to expect from a first search (the index is built then, about 0.3 s per note).
 - To let memb do this on its own, set `embeddings.auto_download = true`: the daily routine then downloads the model once if none is installed and no other backend is chosen.
 - An explicit choice always wins: `embeddings.gemma_model_dir`, `embeddings.port` or `embeddings.enabled = false`.
-- The first search after the model appears embeds your existing notes once; after that only changed notes are embedded.
+- A search never waits for the vector index. After the model appears (or after notes change) a search answers at once from lexical search plus the vectors that are already saved, and the MCP server embeds the missing notes in the background (about 0.3 s per note: 100 notes took 33 s), saving its progress every 16 notes so an interrupted build resumes where it stopped. Hooks and `memb search` never start a build. `memb doctor` shows whether the index is up to date.
 - It needs Windows' own `curl.exe` (present on Windows 10 and later).

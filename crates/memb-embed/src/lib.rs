@@ -167,6 +167,42 @@ pub fn write_hot_set(
     write.commit().map_err(|e| e.to_string())
 }
 
+/// What is persisted of the vector index (for `memb doctor`): one `(tag, built at version,
+/// notes)` per hot set, and how many document vectors are cached (the part of a build that
+/// survives an interruption).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexStatus {
+    pub hot_sets: Vec<(String, u64, usize)>,
+    pub cached_vectors: usize,
+}
+
+pub fn index_status(db: &Database) -> Result<IndexStatus, String> {
+    use redb::{ReadableTable, ReadableTableMetadata};
+    let read = db.begin_read().map_err(|e| e.to_string())?;
+    let mut status = IndexStatus::default();
+    match read.open_table(HOT_SET) {
+        Ok(table) => {
+            for row in table.iter().map_err(|e| e.to_string())? {
+                let (tag, value) = row.map_err(|e| e.to_string())?;
+                let b = value.value();
+                if b.len() >= 16 {
+                    let version = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                    let n = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+                    status.hot_sets.push((tag.value().to_owned(), version, n));
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    match read.open_table(DOC_EMBED_CACHE) {
+        Ok(table) => status.cached_vectors = table.len().map_err(|e| e.to_string())? as usize,
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    Ok(status)
+}
+
 /// The persisted working set for `tag` and the `project_kb_version` it was built at.
 /// A missing or malformed row is `None` (the caller rebuilds it).
 #[allow(clippy::type_complexity)]
@@ -489,8 +525,10 @@ mod tests {
         assert_eq!((back[&key].scale, &back[&key].data), (v.scale, &v.data));
         // Hot set: absent, then present at its version, byte-exact.
         assert!(read_hot_set(&db, "m").unwrap().is_none());
+        assert_eq!(index_status(&db).unwrap(), IndexStatus { hot_sets: vec![], cached_vectors: 1 }, "one cached vector, no hot set yet");
         let entries: Vec<(u64, QuantizedVec)> = (1..=5).map(|i| (i, QuantizedVec::from_f32(&lcg_vec(i, 64)))).collect();
         write_hot_set(&db, "m", 42, &entries).unwrap();
+        assert_eq!(index_status(&db).unwrap(), IndexStatus { hot_sets: vec![("m".to_string(), 42, 5)], cached_vectors: 1 });
         let (version, got) = read_hot_set(&db, "m").unwrap().unwrap();
         assert_eq!(version, 42);
         assert_eq!(got.len(), 5);
