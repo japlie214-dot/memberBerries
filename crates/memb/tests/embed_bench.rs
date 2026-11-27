@@ -406,3 +406,122 @@ fn snowflake_through_memb_search_live() {
     drop(store);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Questions about nothing in the corpus: a good floor lets (almost) none of them through.
+const OFF_TOPIC: [&str; 12] = [
+    "what is the capital city of France?",
+    "give me a recipe for banana bread",
+    "who won the football world cup in 2014?",
+    "how tall is Mount Everest?",
+    "what is the best way to learn the guitar?",
+    "translate good morning into Spanish",
+    "how do vaccines train the immune system?",
+    "what time does the sun set in winter?",
+    "explain how a rainbow forms",
+    "which planet has the most moons?",
+    "how long should I boil an egg?",
+    "what is the plot of Romeo and Juliet?",
+];
+
+/// Where a vector score floor should sit for this model and quantization: the scores of right
+/// notes, wrong notes and off-topic questions, and what each candidate floor keeps.
+///
+///   MEMB_BENCH_GEMMA_DIR=<model dir> MEMB_BENCH_OUT=<report file> \
+///     cargo test --release -p memb --test embed_bench injection_floor_sweep -- --ignored --nocapture
+#[test]
+#[ignore = "needs MEMB_BENCH_GEMMA_DIR with an installed model"]
+fn injection_floor_sweep() {
+    let dir = PathBuf::from(std::env::var_os("MEMB_BENCH_GEMMA_DIR").expect("MEMB_BENCH_GEMMA_DIR"));
+    let mut report = String::new();
+    macro_rules! line {
+        ($($arg:tt)*) => {{ let l = format!($($arg)*); println!("{l}"); let _ = writeln!(report, "{l}"); }};
+    }
+    let model = GemmaEmbedder::new(dir.clone());
+    let width = 256;
+    let embed = |text: &str, query: bool| QuantizedVec::from_f32(&apply_mrl(model.embed_tagged(text, query).unwrap().1, Some(width)).unwrap());
+    let docs: Vec<QuantizedVec> = NOTES.iter().map(|(t, d)| embed(&memb_embed::document_text(t, d), false)).collect();
+    let on: Vec<QuantizedVec> = QUERIES.iter().map(|q| embed(q, true)).collect();
+    let off: Vec<QuantizedVec> = OFF_TOPIC.iter().map(|q| embed(q, true)).collect();
+
+    let mut gold: Vec<f64> = Vec::new();
+    let mut wrong: Vec<f64> = Vec::new();
+    for (qi, q) in on.iter().enumerate() {
+        for (di, d) in docs.iter().enumerate() {
+            let s = f64::from(q.cosine(d));
+            if di == qi { gold.push(s) } else { wrong.push(s) }
+        }
+    }
+    let off_top: Vec<f64> = off.iter().map(|q| docs.iter().map(|d| f64::from(q.cosine(d))).fold(f64::MIN, f64::max)).collect();
+    let on_wrong_top: Vec<f64> = on.iter().enumerate().map(|(qi, q)| docs.iter().enumerate().filter(|(di, _)| *di != qi).map(|(_, d)| f64::from(q.cosine(d))).fold(f64::MIN, f64::max)).collect();
+    line!("# Vector score floor sweep ({} notes, {} on-topic questions, {} off-topic questions; 256-wide i8 cosine as memb stores it)\n", NOTES.len(), QUERIES.len(), OFF_TOPIC.len());
+    line!("| scores | n | min | p10 | p50 | p90 | max |");
+    line!("|---|---|---|---|---|---|---|");
+    for (label, mut v) in [
+        ("right note for its question", gold.clone()),
+        ("best wrong note per on-topic question", on_wrong_top),
+        ("all wrong notes (on-topic questions)", wrong),
+        ("best note per off-topic question", off_top.clone()),
+    ] {
+        let n = v.len();
+        let min = v.iter().cloned().fold(f64::MAX, f64::min);
+        let max = v.iter().cloned().fold(f64::MIN, f64::max);
+        line!("| {label} | {n} | {min:.3} | {:.3} | {:.3} | {:.3} | {max:.3} |", pct(&mut v.clone(), 0.1), pct(&mut v.clone(), 0.5), pct(&mut v, 0.9));
+    }
+
+    // Through the real store and hybrid search, with the floor set the way config.toml sets it.
+    let root = std::env::temp_dir().join(format!("memb-floor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let store = Store::open(&root).unwrap();
+    let ids: Vec<u64> = NOTES
+        .iter()
+        .map(|(t, d)| store.remember(Draft { title: (*t).into(), desc: (*d).into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() }).unwrap().id)
+        .collect();
+    std::env::set_var("MEMB_GEMMA_MODEL_DIR", &dir);
+    std::env::set_var("MEMB_EMBED_MRL_DIM", "256");
+    std::env::remove_var("MEMB_EMBED_DISABLE");
+    std::env::remove_var("MEMB_EMBED_PORT");
+    std::env::remove_var("MEMB_RETRIEVAL_TOP_K");
+    let _ = memb_rag::search(&store, QUERIES[0]).unwrap(); // builds the hot set
+
+    // The vector side alone: what the floor does to the vector candidates (at most 5 are used).
+    let vector_list = |q: &QuantizedVec, floor: f64| -> Vec<usize> {
+        let mut s: Vec<(f32, usize)> = docs.iter().enumerate().map(|(i, d)| (q.cosine(d), i)).filter(|(c, _)| f64::from(*c) > floor).collect();
+        s.sort_by(|a, b| b.0.total_cmp(&a.0));
+        s.into_iter().take(5).map(|x| x.1).collect()
+    };
+    let lexical_off: f64 = OFF_TOPIC.iter().map(|q| store.search_lexical_ids(q, 10).unwrap_or_default().len() as f64).sum::<f64>() / OFF_TOPIC.len() as f64;
+    line!("\nLexical search alone returns {lexical_off:.1} of at most 10 notes for an off-topic question on average (it has no score floor).\n");
+    line!("| floor | right note clears it | vector only: right note in top 5 | vector only: notes per on-topic question | vector only: off-topic questions with any note | vector only: notes per off-topic question | hybrid: notes per on-topic question | hybrid: recall@5 | hybrid: notes per off-topic question | hybrid: JSON bytes per on-topic hook |");
+    line!("|---|---|---|---|---|---|---|---|---|---|");
+    for floor in [0.0, 0.25, 0.42, 0.50, 0.55, 0.60, 0.625, 0.65, 0.675, 0.70, 0.75] {
+        std::env::set_var("MEMB_RETRIEVAL_SCORE_FLOOR", floor.to_string());
+        let clears = gold.iter().filter(|s| **s > floor).count();
+        let on_lists_v: Vec<Vec<usize>> = on.iter().map(|q| vector_list(q, floor)).collect();
+        let (_, _, v5, _) = score(&on_lists_v);
+        let v_on_n = on_lists_v.iter().map(|l| l.len() as f64).sum::<f64>() / on.len() as f64;
+        let off_lists_v: Vec<Vec<usize>> = off.iter().map(|q| vector_list(q, floor)).collect();
+        let v_off_any = off_lists_v.iter().filter(|l| !l.is_empty()).count();
+        let v_off_n = off_lists_v.iter().map(|l| l.len() as f64).sum::<f64>() / off.len() as f64;
+        let run = |qs: &[&str]| -> (f64, Vec<Vec<usize>>, f64) {
+            let mut counts = 0.0;
+            let mut bytes = 0.0;
+            let mut lists = Vec::new();
+            for q in qs {
+                let found = memb_rag::search(&store, q).unwrap();
+                counts += found.len() as f64;
+                bytes += serde_json::to_string(&found).unwrap().len() as f64;
+                lists.push(found.iter().map(|n| ids.iter().position(|x| *x == n.id).unwrap()).collect());
+            }
+            (counts / qs.len() as f64, lists, bytes / qs.len() as f64)
+        };
+        let (on_n, on_lists, on_bytes) = run(&QUERIES);
+        let (off_n, _, _) = run(&OFF_TOPIC);
+        let (_, _, r5, _) = score(&on_lists);
+        line!("| {floor:.3} | {clears}/{} | {v5:.2} | {v_on_n:.1} | {v_off_any}/{} | {v_off_n:.1} | {on_n:.1} | {r5:.2} | {off_n:.1} | {on_bytes:.0} |", gold.len(), OFF_TOPIC.len());
+    }
+    if let Some(out) = std::env::var_os("MEMB_BENCH_OUT") {
+        std::fs::write(out, report).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

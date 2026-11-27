@@ -28,7 +28,7 @@ To uninstall, remove only the `memb` extension/plugin or configuration entry and
 
 ### Verification matrix
 
-v0.14.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
+v0.15.0: `scripts/smoke-packages.py` runs the three packaged binaries as separate stdio processes against one data directory (remember, search, update, retract, inspect) and asserts the exact ten-tool list, so `open_inspector` and the old project tools cannot ship unnoticed. Real-host installs of the v0.4 packages (Claude Desktop, Codex, AGY) are not yet verified; earlier checks covered v0.1.0 only (Cowork import and a native `search` call, Codex CLI 0.156.0 manual registration in an isolated profile, AGY 1.5.14 CLI syntax). The MCP App panel was dropped because Claude Desktop strips the UI metadata; use `memb.exe web` instead.
 
 ### Cross-client smoke test
 

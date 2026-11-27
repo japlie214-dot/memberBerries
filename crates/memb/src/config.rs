@@ -20,6 +20,7 @@ pub struct Config {
     pub embeddings: Embeddings,
     pub curator: Curator,
     pub scheduler: Scheduler,
+    pub retrieval: Retrieval,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -93,6 +94,24 @@ pub struct Curator {
     pub auto_apply: bool,
     /// Most proposals one run may apply automatically; the rest wait for review.
     pub max_auto_edits: u32,
+}
+
+/// `[retrieval]`: what a search returns and what a hook may inject into a prompt.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Retrieval {
+    /// Most tokens of note text one hook injects into a prompt, approximated as 4 bytes a token.
+    pub max_inject_tokens: usize,
+    /// Notes a search starts from, before the one-hop expansion adds parents and children.
+    pub top_k: usize,
+    /// A vector match with a cosine at or below this is dropped.
+    pub score_floor: f64,
+}
+
+impl Default for Retrieval {
+    fn default() -> Self {
+        Self { max_inject_tokens: 750, top_k: memb_rag::DEFAULT_TOP_K, score_floor: 0.60 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -340,6 +359,10 @@ impl Config {
         }
         within("curator.staging_ttl_days", c.staging_ttl_days, 1, 365)?;
         within("curator.max_auto_edits", c.max_auto_edits, 1, 50)?;
+        let r = &self.retrieval;
+        within("retrieval.max_inject_tokens", r.max_inject_tokens, 50, 8000)?;
+        within("retrieval.top_k", r.top_k, 1, 20)?;
+        within("retrieval.score_floor", r.score_floor, 0.0, 0.95)?;
         let d = &self.scheduler;
         within("scheduler.routine_wib_hour", d.routine_wib_hour, 0, 23)?;
         within("scheduler.routine_wib_minute", d.routine_wib_minute, 0, 59)?;
@@ -385,6 +408,21 @@ impl Config {
             set("MEMB_SNOWFLAKE_KEY", Some(key.to_string_lossy().into_owned()));
         }
         Ok(())
+    }
+
+    /// Hand `[retrieval]` to the search code (explicit environment variables win).
+    pub fn apply_retrieval_env(&self) {
+        let r = &self.retrieval;
+        for (name, value) in [("MEMB_RETRIEVAL_TOP_K", r.top_k.to_string()), ("MEMB_RETRIEVAL_SCORE_FLOOR", r.score_floor.to_string())] {
+            if std::env::var_os(name).is_none() {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
+    /// The most bytes of context a hook may inject (4 bytes approximate one token).
+    pub fn inject_budget_bytes(&self) -> usize {
+        self.retrieval.max_inject_tokens * 4
     }
 
     /// The directory the daemon mirrors into: a command-line directory wins over the config.
@@ -605,6 +643,37 @@ model = \"m;DROP\"
         }
         assert!(Config::parse("[scroll]\nmax_messages = 20\nretain_tail = 10\n[scheduler]\nidle_sweep_min_messages = 11\n").is_ok());
         assert!(Config::parse("[scheduler]\nroutine_wib_hour = 0\nroutine_wib_minute = 0\n").is_ok());
+    }
+
+    #[test]
+    fn retrieval_settings_default_export_to_the_environment_and_never_override_it() {
+        let d = Config::default();
+        assert_eq!((d.retrieval.max_inject_tokens, d.retrieval.top_k), (750, 5));
+        assert_eq!(d.inject_budget_bytes(), 3000);
+        assert_eq!(d.retrieval.score_floor as f32, memb_rag::DEFAULT_SCORE_FLOOR, "config and search agree on the default floor");
+        let c = Config::parse("[retrieval]
+max_inject_tokens = 100
+top_k = 3
+score_floor = 0.5
+").unwrap();
+        assert_eq!((c.inject_budget_bytes(), c.retrieval.top_k, c.retrieval.score_floor), (400, 3, 0.5));
+        with_clean_env(|| {
+            let saved = (std::env::var_os("MEMB_RETRIEVAL_TOP_K"), std::env::var_os("MEMB_RETRIEVAL_SCORE_FLOOR"));
+            std::env::remove_var("MEMB_RETRIEVAL_TOP_K");
+            std::env::remove_var("MEMB_RETRIEVAL_SCORE_FLOOR");
+            c.apply_retrieval_env();
+            assert_eq!(std::env::var("MEMB_RETRIEVAL_TOP_K").unwrap(), "3");
+            assert_eq!(std::env::var("MEMB_RETRIEVAL_SCORE_FLOOR").unwrap(), "0.5");
+            std::env::set_var("MEMB_RETRIEVAL_TOP_K", "9");
+            Config::default().apply_retrieval_env();
+            assert_eq!(std::env::var("MEMB_RETRIEVAL_TOP_K").unwrap(), "9", "the environment wins");
+            for (name, v) in [("MEMB_RETRIEVAL_TOP_K", saved.0), ("MEMB_RETRIEVAL_SCORE_FLOOR", saved.1)] {
+                match v {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        });
     }
 
     #[test]

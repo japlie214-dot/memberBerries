@@ -41,6 +41,11 @@ enabled = true               # false forces lexical-only search
 
 # The kit's `binary` and `model_path` keys are rejected: memb never starts an embedding server.
 
+[retrieval]                  # what a search returns and what a hook may put into a prompt (see wiki/Hooks.md)
+max_inject_tokens = 750      # 50..=8000: most text one hook injects, about 4 bytes a token (750 = 3000 bytes); notes are added best match first and one that would not fit is left out
+top_k = 5                    # 1..=20: notes a search starts from, before parents and children are added (at most 8, or top_k if larger)
+score_floor = 0.60           # 0.0..=0.95: a vector match whose cosine is at or below this is dropped (see evidence/t032-injection-floor.md)
+
 [curator]                    # used by `memb curate` (you run it; see wiki/Operations.md)
 backend = "cli"              # the only supported backend
 cli_command = "agy --model gemini-4-hydrogen-medium --disable-slash-commands --input-format stream-json --output-format stream-json --print-timeout 150s"

@@ -5,6 +5,10 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.15.0 (2026-11-27)
+
+- **Change (T032):** what a hook injects into a prompt is bounded: at most `retrieval.max_inject_tokens` (750 tokens, counted as 4 bytes each: 3000 bytes) of context, best match first; a note that does not fit is skipped and not marked as injected, so a later prompt can still bring it. Before, a hook could inject about 34 KB (8 notes of about 4 KB). New `[retrieval]` settings `max_inject_tokens`, `top_k` (5) and `score_floor`. **The vector score floor default is now 0.60 (was 0.25), chosen by measurement on the local EmbeddingGemma 2 q4 model only** (unrelated notes score about 0.6 there, so 0.25 filtered nothing; right notes scored 0.617 to 0.839). The floor applies to every embedding backend and Snowflake and loopback-server scores were not measured: if their right-note scores sit below 0.60 their vector hits are dropped and only lexical hits remain; set `retrieval.score_floor` to adjust. Evidence: `evidence/t032-injection-floor.md`.
+
 ## 0.14.0 (2026-11-27)
 
 - **Change (T036):** a search never waits for the vector index. When the index is missing or out of date, a search answers at once from lexical search plus the vectors already saved (0.5 s for 100 notes with the real model, where building the index inside the search took 33 s), and the MCP server embeds the missing notes in a background thread, 16 at a time, saving each chunk so an interrupted build resumes without embedding finished notes again. Hooks and `memb search` never start a build. `memb doctor` has a new `vector index` line (up to date, unfinished with the number of saved vectors, or not built yet). Evidence: `evidence/t036-hot-set-background.md`.

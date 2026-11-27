@@ -677,6 +677,33 @@ pub fn hybrid_search(
     fuse(store, query, query_vec, hot_index, false)
 }
 
+/// Notes a search starts from (before one-hop expansion) when `MEMB_RETRIEVAL_TOP_K` is unset.
+pub const DEFAULT_TOP_K: usize = 5;
+/// A vector match scoring at or below this cosine is dropped when `MEMB_RETRIEVAL_SCORE_FLOOR`
+/// is unset. Decided from measurement on this model and quantization: evidence/t032-injection-floor.md.
+pub const DEFAULT_SCORE_FLOOR: f32 = 0.60;
+
+/// `(top_k, score floor)` from the environment (`memb` fills them from `[retrieval]` in
+/// config.toml; an unset or invalid value means the default).
+pub fn retrieval_params() -> (usize, f32) {
+    parse_params(
+        std::env::var("MEMB_RETRIEVAL_TOP_K").ok().as_deref(),
+        std::env::var("MEMB_RETRIEVAL_SCORE_FLOOR").ok().as_deref(),
+    )
+}
+
+fn parse_params(top_k: Option<&str>, floor: Option<&str>) -> (usize, f32) {
+    let top_k = top_k
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|k| (1..=20).contains(k))
+        .unwrap_or(DEFAULT_TOP_K);
+    let floor = floor
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|f| (-1.0..=1.0).contains(f))
+        .unwrap_or(DEFAULT_SCORE_FLOOR);
+    (top_k, floor)
+}
+
 /// `index_is_active`: every id in `hot_index` is an active note (a hot set is built from
 /// active notes at the current version), so no note needs to be read to check it.
 fn fuse(
@@ -685,6 +712,19 @@ fn fuse(
     query_vec: Option<&QuantizedVec>,
     hot_index: &[(u64, QuantizedVec)],
     index_is_active: bool,
+) -> Result<Vec<Note>, String> {
+    let (top_k, floor) = retrieval_params();
+    fuse_with(store, query, query_vec, hot_index, index_is_active, top_k, floor)
+}
+
+fn fuse_with(
+    store: &Store,
+    query: &str,
+    query_vec: Option<&QuantizedVec>,
+    hot_index: &[(u64, QuantizedVec)],
+    index_is_active: bool,
+    top_k: usize,
+    floor: f32,
 ) -> Result<Vec<Note>, String> {
     let lexical_ids = store.search_lexical_ids(query, 10)?;
     let fused_seeds = if let Some(qv) = query_vec {
@@ -697,17 +737,17 @@ fn fuse(
                 })
             })
             .map(|(id, nv)| (qv.cosine(nv), *id))
-            .filter(|(s, _)| *s > 0.25)
+            .filter(|(s, _)| *s > floor)
             .collect();
         vec_scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let vector_ids: Vec<u64> = vec_scored.into_iter().take(10).map(|(_, id)| id).collect();
         // A note retracted after the hot set was built must not take a seed slot.
         let vector_ids = if index_is_active { store.filter_active(&vector_ids)? } else { vector_ids };
-        reciprocal_rank_fusion(&lexical_ids, &vector_ids, 5)
+        reciprocal_rank_fusion(&lexical_ids, &vector_ids, top_k)
     } else {
-        lexical_ids.into_iter().take(5).collect()
+        lexical_ids.into_iter().take(top_k).collect()
     };
-    store.expand_one_hop(&fused_seeds, 8)
+    store.expand_one_hop(&fused_seeds, 8.max(top_k))
 }
 
 #[cfg(test)]
@@ -831,14 +871,15 @@ mod tests {
         let store = store_with_notes("nowait", 40);
         let tag = "nowait-model|768";
         let count = std::sync::Arc::new(AtomicUsize::new(0));
-        // 41 notes at 60 ms each: a blocking build would take about 2.5 s.
-        let embed = slow_embedder(Duration::from_millis(60), count.clone());
+        // 41 notes at 150 ms each: a blocking build would take about 6 s, so a search that
+        // returns within 2 s (generous: the machine may be busy) cannot have waited for it.
+        let embed = slow_embedder(Duration::from_millis(150), count.clone());
         set_background_build(true);
 
         let started = Instant::now();
         let first = hot_set_nowait(&store, tag, embed.clone()).unwrap();
         let first_took = started.elapsed();
-        assert!(first_took < Duration::from_millis(500), "the first search must not wait for the build, took {first_took:?}");
+        assert!(first_took < Duration::from_secs(2), "the first search must not wait for the build, took {first_took:?}");
         match first {
             HotAnswer::Partial { vectors, embedded, total, building } => {
                 assert_eq!((vectors.len(), embedded, total), (0, 0, 41));
@@ -849,11 +890,11 @@ mod tests {
         // A second search while the build runs neither waits nor starts a second build.
         let started = Instant::now();
         let again = hot_set_nowait(&store, tag, embed.clone()).unwrap();
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(matches!(again, HotAnswer::Partial { .. } | HotAnswer::Complete(..)));
 
         // Results improve once the build has finished: the complete set appears.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let complete = loop {
             match hot_set_nowait(&store, tag, embed.clone()).unwrap() {
                 HotAnswer::Complete(hot, source) => break (hot, source),
@@ -1557,6 +1598,41 @@ mod tests {
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// Notes whose vector scores at or below the floor are dropped; the floor and top_k come
+    /// from the environment (set by `[retrieval]` in config.toml) and fall back to the defaults.
+    #[test]
+    fn notes_below_the_score_floor_are_dropped_and_top_k_limits_the_seeds() {
+        let dir = std::env::temp_dir().join(format!("memb-rag-floor-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Store::open(&dir).unwrap();
+        // Cosine against the query (1, 0) is the first component of a unit vector.
+        let make = |title: &str, cosine: f32| {
+            let note = store
+                .remember(Draft { title: title.into(), desc: "synthetic".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() })
+                .unwrap();
+            (note.id, QuantizedVec::from_f32(&[cosine, (1.0 - cosine * cosine).sqrt()]))
+        };
+        let index = vec![make("near", 0.9), make("middle", 0.5), make("weak", 0.3), make("far", 0.1)];
+        let q = QuantizedVec::from_f32(&[1.0, 0.0]);
+        let ids = |found: Vec<Note>| found.into_iter().map(|n| n.id).collect::<Vec<_>>();
+        let run = |k: usize, f: f32| ids(fuse_with(&store, "zzqq", Some(&q), &index, false, k, f).unwrap());
+        assert_eq!(parse_params(None, None), (DEFAULT_TOP_K, DEFAULT_SCORE_FLOOR));
+        let (k, f) = parse_params(Some("7"), Some("0.42"));
+        assert_eq!((k, f), (7, 0.42));
+        for junk in [("0", "banana"), ("99", "2.5"), ("-1", "")] {
+            assert_eq!(parse_params(Some(junk.0), Some(junk.1)), (DEFAULT_TOP_K, DEFAULT_SCORE_FLOOR), "{junk:?}");
+        }
+        let default = run(DEFAULT_TOP_K, DEFAULT_SCORE_FLOOR);
+        let expected: Vec<u64> = index.iter().filter(|(_, v)| q.cosine(v) > DEFAULT_SCORE_FLOOR).map(|(id, _)| *id).collect();
+        assert_eq!(default, expected, "the default floor decides");
+        assert!(!default.contains(&index[3].0), "a note at 0.1 is below every floor");
+        assert_eq!(run(5, 0.6), vec![index[0].0], "0.5 and 0.3 fall below a 0.6 floor");
+        assert_eq!(run(5, 0.4), vec![index[0].0, index[1].0], "0.3 falls below a 0.4 floor");
+        assert!(run(5, 0.95).is_empty(), "nothing clears 0.95");
+        assert_eq!(run(2, 0.0).len(), 2, "top_k = 2 keeps two seeds");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn hybrid_finds_vector_only_notes_and_falls_back() {
         let dir = std::env::temp_dir().join(format!(
