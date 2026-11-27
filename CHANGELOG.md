@@ -5,6 +5,10 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.13.3 (2026-11-27)
+
+- **Test (T044):** the hook deadline is now proven against a real pipe service whose handler takes 3 s: a hook (kick mode) gives up at 2 s, the rest of that hook skips the service at once, and a search (wait mode) still gets the answer. The same build was timed live with the model unloaded after idle (kick-mode search 2.5 s, 2.5 s, then 0.7 s) and with `memb hook` against a freshly started service (2.5 s while the model loads, then 0.8 s). Corrects the T043 timings, which came from runs that never reached the service. No change in behaviour.
+
 ## 0.13.2 (2026-11-27)
 
 - **Fix (T043):** a hook no longer waits for the embedding model to reload. When the shared service is running but has unloaded its model after 5 idle minutes, loading it takes longer than the 10 s hook timeout; hooks now give up after 2 s (and skip the service for the rest of that hook), answer lexically, and the model is warm for the next request. Searches from the MCP server and CLI still wait.

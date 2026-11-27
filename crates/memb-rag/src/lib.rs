@@ -605,16 +605,68 @@ fn fuse(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_hook_gives_up_on_a_slow_service_far_sooner_than_the_hook_timeout() {
-        let hook = super::call_deadline(super::StartMode::Kick);
-        assert!(hook <= std::time::Duration::from_secs(3), "well inside the 10 s hook timeout");
-        assert!(super::call_deadline(super::StartMode::Wait) >= std::time::Duration::from_secs(60), "a search waits for the model to load");
-    }
-
     use super::*;
     use memb_core::{Draft, Kind};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_hook_gives_up_on_a_slow_service_far_sooner_than_the_hook_timeout() {
+        let hook = call_deadline(StartMode::Kick);
+        assert!(hook <= std::time::Duration::from_secs(3), "well inside the 10 s hook timeout");
+        assert!(call_deadline(StartMode::Wait) >= std::time::Duration::from_secs(60), "a search waits for the model to load");
+    }
+
+    /// A real pipe service whose model "takes 3 s to load": a hook (kick mode) must give up
+    /// after its 2 s deadline and then skip the service at once, while a search (wait mode)
+    /// gets the answer.
+    #[cfg(windows)]
+    #[test]
+    fn a_slow_service_makes_a_hook_give_up_after_the_deadline_and_a_search_wait_for_the_answer() {
+        use memb_embed::service::{call, serve, Request, Response};
+        use std::time::{Duration, Instant};
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("memb-rag-slow-{}-{nanos}", std::process::id());
+        let slow = |request: Request| match request {
+            Request::Embed { query, .. } => {
+                std::thread::sleep(Duration::from_secs(3));
+                Response { ok: true, tag: Some(if query { "slow|query" } else { "slow|doc" }.into()), vector: Some(vec![1.0, 2.0]), ..Response::default() }
+            }
+            _ => Response { ok: true, version: Some("test".into()), ..Response::default() },
+        };
+        let server = {
+            let name = name.clone();
+            std::thread::spawn(move || serve(&name, std::sync::Arc::new(slow), Duration::from_secs(5)))
+        };
+        let mut up = false;
+        for _ in 0..100 {
+            if call(&name, &Request::Ping, Duration::from_secs(2)).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(up, "the test service came up");
+        let config = |start| ServiceConfig { name: name.clone(), exe: std::path::PathBuf::from("not-started-by-this-test"), start };
+
+        SERVICE_GAVE_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+        let started = Instant::now();
+        let first = service_embed(&config(StartMode::Kick), "hello", true);
+        let first_took = started.elapsed();
+        assert!(first.is_err(), "a hook does not wait for the slow service: {first:?}");
+        assert!(first_took >= Duration::from_millis(1800) && first_took < Duration::from_millis(2900), "it gave up at its 2 s deadline, took {first_took:?}");
+
+        let started = Instant::now();
+        let second = service_embed(&config(StartMode::Kick), "world", false);
+        assert!(second.is_err());
+        assert!(started.elapsed() < Duration::from_millis(300), "after the first failure the rest of the hook skips the service, took {:?}", started.elapsed());
+        SERVICE_GAVE_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let started = Instant::now();
+        let waited = service_embed(&config(StartMode::Wait), "hello", true).expect("a search waits for the answer");
+        assert_eq!(waited, ("slow|query".to_string(), vec![1.0, 2.0]));
+        assert!(started.elapsed() >= Duration::from_millis(2900), "it really waited for the slow handler, took {:?}", started.elapsed());
+        drop(server);
+    }
 
     /// The environment is process-wide: serialize the tests that change it.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
