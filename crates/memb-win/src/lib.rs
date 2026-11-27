@@ -1,5 +1,7 @@
 #[cfg(windows)]
 pub mod pipe;
+#[cfg(windows)]
+pub mod spawn;
 
 pub const HARD_CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const GOVERNOR_WARN_MIB: usize = 1200;

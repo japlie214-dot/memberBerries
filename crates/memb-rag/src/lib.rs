@@ -67,24 +67,10 @@ pub fn configure_service(config: ServiceConfig) {
 /// with it when it exits); if that is refused it starts the service the ordinary way.
 #[cfg(windows)]
 pub fn start_service(exe: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    let spawn = |flags: u32| {
-        Command::new(exe)
-            .arg("embed-service")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(flags)
-            .spawn()
-            .map(|_| ())
-    };
-    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
-    spawn(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base))
+    // No inherited handles: otherwise a caller that captures this process's output (a host,
+    // a shell, a hook runner) would wait for the service to exit before seeing end-of-output.
+    memb_win::spawn::spawn_detached(exe, &["embed-service"], true)
+        .or_else(|_| memb_win::spawn::spawn_detached(exe, &["embed-service"], false))
 }
 
 /// Embeds through the shared service. `Err` means "no vector now": the callers fall back
