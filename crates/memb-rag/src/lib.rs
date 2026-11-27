@@ -879,7 +879,12 @@ mod tests {
         let started = Instant::now();
         let first = hot_set_nowait(&store, tag, embed.clone()).unwrap();
         let first_took = started.elapsed();
-        assert!(first_took < Duration::from_secs(2), "the first search must not wait for the build, took {first_took:?}");
+        // Wall-clock limits are unreliable on a busy machine, so the proof that the search did
+        // not wait is the state at the moment it returned: the build is still running and most
+        // notes are not embedded yet (a search that waited would see all 41 done).
+        assert!(count.load(Ordering::SeqCst) < 41, "the build had already finished when the search returned (took {first_took:?})");
+        assert!(build_in_progress(store.root(), tag), "the build runs in the background (took {first_took:?})");
+        assert!(first_took < Duration::from_secs(5), "the first search took far too long: {first_took:?}");
         match first {
             HotAnswer::Partial { vectors, embedded, total, building } => {
                 assert_eq!((vectors.len(), embedded, total), (0, 0, 41));
@@ -890,7 +895,7 @@ mod tests {
         // A second search while the build runs neither waits nor starts a second build.
         let started = Instant::now();
         let again = hot_set_nowait(&store, tag, embed.clone()).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(matches!(again, HotAnswer::Partial { .. } | HotAnswer::Complete(..)));
 
         // Results improve once the build has finished: the complete set appears.

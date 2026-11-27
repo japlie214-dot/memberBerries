@@ -21,6 +21,11 @@ const ADJACENCY_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("adjac
 /// The most claims one knowledge note adds to a one-hop expansion, so a single busy
 /// knowledge note cannot fill the whole result.
 pub const CLAIMS_PER_KNOWLEDGE: usize = 4;
+#[cfg(test)]
+thread_local! {
+    static SKIP_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SLOW_VERSION_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 thread_local! {
     static FULL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -115,6 +120,46 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// An open database handle that is only ever held under the store lock. When it is closed
+/// it reads the committed version, closes the database, and records the version with the
+/// database's final length and modification time in `kb.version` (see `Store::kb_version`),
+/// so the record is written in the same critical section as the commit it describes.
+struct StoreDb<'a> {
+    db: Option<Database>,
+    store: &'a Store,
+}
+
+impl std::ops::Deref for StoreDb<'_> {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        self.db.as_ref().expect("database handle is open until dropped")
+    }
+}
+
+impl std::ops::DerefMut for StoreDb<'_> {
+    fn deref_mut(&mut self) -> &mut Database {
+        self.db.as_mut().expect("database handle is open until dropped")
+    }
+}
+
+impl Drop for StoreDb<'_> {
+    fn drop(&mut self) {
+        let Some(db) = self.db.take() else { return };
+        #[cfg(test)]
+        if SKIP_PUBLISH.with(|c| c.get()) {
+            return;
+        }
+        let version = Store::kb_version_locked(&db);
+        drop(db); // closing rewrites redb's header: stamp the final state
+        match version {
+            Ok(v) => self.store.write_version_file(v),
+            Err(_) => {
+                let _ = fs::remove_file(self.store.version_path());
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
@@ -130,6 +175,7 @@ impl Store {
         let _lock = acquire_os_lock(root)?;
         let db = store.open_db()?;
         Self::init_and_migrate_locked(&db)?;
+        drop(db); // publishes the version record (under the lock) before `store` moves
         Ok(store)
     }
 
@@ -140,11 +186,11 @@ impl Store {
         self
     }
 
-    fn open_db(&self) -> Result<Database, String> {
+    fn open_db(&self) -> Result<StoreDb<'_>, String> {
         let db = Database::builder().set_cache_size(16 * 1024 * 1024)
             .create(self.db_path()).map_err(|e| format!("open redb: {e}"))?;
         Self::verify_legacy(&db)?;
-        Ok(db)
+        Ok(StoreDb { db: Some(db), store: self })
     }
 
     fn verify_legacy(db: &Database) -> Result<(), String> {
@@ -929,10 +975,71 @@ impl Store {
     /// The knowledge base version (`project_kb_version`): it changes with every note change
     /// (create, update, supersede, retract, rollback), so anything derived from the notes can
     /// record the version it was built at and be rebuilt only when this number moves.
+    ///
+    /// The fast path trusts the small `kb.version` file only while it is self-validating: it
+    /// records the version with the length and modification time of `memory.redb` as they
+    /// were when the last database handle was closed, still under the store lock (`StoreDb`
+    /// does this for every handle `open_db` hands out, so every committing writer publishes
+    /// in the same critical section as its commit). One `stat` of the database then shows
+    /// whether anything touched it since, by this or any other writer: a writer that died
+    /// before publishing, or an older build that never publishes, still changes the length
+    /// or the time (opening and closing redb alone rewrites its header). Otherwise the
+    /// database is opened, the counter read, and the file rewritten.
     pub fn kb_version(&self) -> Result<u64, String> {
+        if let Some(v) = self.validated_version() {
+            return Ok(v);
+        }
+        #[cfg(test)]
+        SLOW_VERSION_CHECKS.with(|c| c.set(c.get() + 1));
         let _lock = acquire_os_lock(&self.root)?;
         let db = self.open_db()?;
-        Self::kb_version_locked(&db)
+        Self::kb_version_locked(&db) // `db` publishes the version when it closes
+    }
+
+    fn version_path(&self) -> PathBuf {
+        self.root.join("kb.version")
+    }
+
+    fn db_stamp(&self) -> Option<(u64, u128)> {
+        let m = fs::metadata(self.db_path()).ok()?;
+        let ns = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+        Some((m.len(), ns))
+    }
+
+    /// The recorded version, only if the file parses and its (length, mtime) equals the
+    /// database's right now.
+    fn validated_version(&self) -> Option<u64> {
+        let stamp = self.db_stamp()?;
+        let text = fs::read_to_string(self.version_path()).ok()?;
+        let mut f = text.split_whitespace();
+        if f.next()? != "v3" {
+            return None;
+        }
+        let version: u64 = f.next()?.parse().ok()?;
+        let len: u64 = f.next()?.parse().ok()?;
+        let mtime: u128 = f.next()?.parse().ok()?;
+        if f.next().is_some() || (len, mtime) != stamp {
+            return None;
+        }
+        Some(version)
+    }
+
+    /// Writes `kb.version` for version `v`, stamping the database as it is now (all handles
+    /// closed, store lock held). Any failure removes the file; if even that fails, the old
+    /// record's stamp no longer matches the database, so it is never trusted.
+    fn write_version_file(&self, v: u64) {
+        let ok = (|| {
+            let (len, mtime) = self.db_stamp()?;
+            let tmp = self.root.join(format!("kb.version.{}.tmp", std::process::id()));
+            if fs::write(&tmp, format!("v3 {v} {len} {mtime}")).is_err() || fs::rename(&tmp, self.version_path()).is_err() {
+                let _ = fs::remove_file(&tmp);
+                return None;
+            }
+            Some(())
+        })();
+        if ok.is_none() {
+            let _ = fs::remove_file(self.version_path());
+        }
     }
 
     fn kb_version_locked(db: &Database) -> Result<u64, String> {
@@ -1198,6 +1305,161 @@ mod tests {
                 Err(e) => panic!("cannot create test directory: {e}"),
             }
         }
+    }
+
+    /// Child half of the cross-process version tests. `MEMB_TEST_NO_PUBLISH` makes it behave
+    /// like a writer that never writes `kb.version` (an older build, or one that died first).
+    #[test]
+    fn version_check_child_writer() {
+        let Ok(dir) = std::env::var("MEMB_TEST_VERSION_CHILD") else { return };
+        if std::env::var("MEMB_TEST_NO_PUBLISH").is_ok() {
+            SKIP_PUBLISH.with(|c| c.set(true));
+        }
+        let store = Store::open(Path::new(&dir)).unwrap();
+        store
+            .remember(Draft { title: "from the child".into(), desc: "text".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() })
+            .unwrap();
+    }
+
+    fn run_child(dir: &Path, no_publish: bool) {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "tests::version_check_child_writer", "--nocapture"]).env("MEMB_TEST_VERSION_CHILD", dir);
+        if no_publish {
+            cmd.env("MEMB_TEST_NO_PUBLISH", "1");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn slow_checks() -> usize {
+        SLOW_VERSION_CHECKS.with(|c| c.get())
+    }
+
+    /// Checks the version, then that further calls are answered from the file (no database open).
+    fn assert_fast_once_settled(store: &Store, expect: u64) {
+        assert_eq!(store.kb_version().unwrap(), expect); // may repair the file (slow)
+        let before = slow_checks();
+        for _ in 0..5 {
+            assert_eq!(store.kb_version().unwrap(), expect);
+        }
+        assert_eq!(slow_checks(), before, "an unchanged knowledge base is answered from the file");
+    }
+
+    #[test]
+    fn a_note_change_from_another_process_is_seen_by_the_next_version_check() {
+        let dir = temp_dir("xproc");
+        let store = Store::open(&dir).unwrap();
+        let v0 = store.kb_version().unwrap();
+        assert_fast_once_settled(&store, v0);
+        run_child(&dir, false);
+        let v1 = store.kb_version().unwrap();
+        assert!(v1 > v0, "the other process's note moved the version ({v0} -> {v1})");
+        assert_eq!(store.load_all_notes().unwrap().len(), 1);
+        assert_fast_once_settled(&store, v1);
+        run_child(&dir, false);
+        assert!(store.kb_version().unwrap() > v1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_writer_that_never_publishes_is_still_seen() {
+        let dir = temp_dir("foreign");
+        let store = Store::open(&dir).unwrap();
+        let v0 = store.kb_version().unwrap();
+        assert_fast_once_settled(&store, v0);
+        let published = fs::read_to_string(dir.join("kb.version")).unwrap();
+        run_child(&dir, true);
+        assert_eq!(fs::read_to_string(dir.join("kb.version")).unwrap(), published, "the foreign writer left kb.version alone");
+        let v1 = store.kb_version().unwrap();
+        assert!(v1 > v0, "a commit by a writer that does not publish moved the version ({v0} -> {v1})");
+        assert_fast_once_settled(&store, v1);
+        // And again, with the file already settled at the new value.
+        run_child(&dir, true);
+        assert!(store.kb_version().unwrap() > v1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_writer_that_dies_between_commit_and_publish_is_seen_and_the_file_is_repaired() {
+        let dir = temp_dir("crash");
+        let store = Store::open(&dir).unwrap();
+        let v0 = store.kb_version().unwrap();
+        assert_fast_once_settled(&store, v0);
+        SKIP_PUBLISH.with(|c| c.set(true)); // the commit happens, the publish does not
+        let note = store
+            .remember(Draft { title: "committed, never published".into(), desc: "text".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() })
+            .unwrap();
+        SKIP_PUBLISH.with(|c| c.set(false));
+        assert!(fs::read_to_string(dir.join("kb.version")).unwrap().starts_with(&format!("v3 {v0} ")), "still the old record");
+        let v1 = store.kb_version().unwrap();
+        assert!(v1 > v0, "the committed change is visible ({v0} -> {v1}, note {})", note.id);
+        assert_fast_once_settled(&store, v1);
+        assert!(fs::read_to_string(dir.join("kb.version")).unwrap().starts_with(&format!("v3 {v1} ")), "the file was repaired");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_garbled_or_stale_version_file_falls_back_to_the_database() {
+        let dir = temp_dir("garbled");
+        let store = Store::open(&dir).unwrap();
+        store
+            .remember(Draft { title: "n".into(), desc: "text".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() })
+            .unwrap();
+        let v = store.kb_version().unwrap();
+        for bad in ["", "garbage", "0", "v3 0 0 0 0", "v3 999 1 2 3", "v3 7 notanumber 1 2", "v3 1 2 3 4 5"] {
+            fs::write(dir.join("kb.version"), bad).unwrap();
+            assert_eq!(store.kb_version().unwrap(), v, "file {bad:?}");
+        }
+        fs::remove_file(dir.join("kb.version")).unwrap();
+        assert_eq!(store.kb_version().unwrap(), v, "a missing file");
+        assert!(fs::read_to_string(dir.join("kb.version")).unwrap().starts_with(&format!("v3 {v} ")), "is rewritten");
+        // A record that validates against a database that has since changed is never trusted:
+        // keep an old record, change the database, put the record back.
+        store.kb_version().unwrap();
+        let old = fs::read_to_string(dir.join("kb.version")).unwrap();
+        store
+            .remember(Draft { title: "m".into(), desc: "text".into(), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() })
+            .unwrap();
+        fs::write(dir.join("kb.version"), old).unwrap();
+        assert!(store.kb_version().unwrap() > v, "an old record does not validate against a newer database");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Release-build breakdown of the version check: `cargo test -p memb-store --release -- --ignored --nocapture version_check_cost`
+    #[test]
+    #[ignore]
+    fn version_check_cost() {
+        let dir = temp_dir("cost");
+        let store = Store::open(&dir).unwrap();
+        for i in 0..500 {
+            store
+                .remember(Draft { title: format!("note {i}"), desc: "some text about the thing ".repeat(8), kind: Kind::Topic, parents: vec![], properties: BTreeMap::new() })
+                .unwrap();
+        }
+        let n = 50u32;
+        let time = |label: &str, f: &dyn Fn()| {
+            f();
+            let t = Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            println!("{label}: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        };
+        time("os lock only", &|| drop(acquire_os_lock(&dir).unwrap()));
+        time("open redb (no legacy check)", &|| drop(Database::builder().set_cache_size(16 * 1024 * 1024).create(store.db_path()).unwrap()));
+        let db = store.open_db().unwrap();
+        time("legacy verification (open handle)", &|| Store::verify_legacy(&db).unwrap());
+        time("read next_rev (open handle)", &|| { let _ = Store::kb_version_locked(&db).unwrap(); });
+        drop(db);
+        time("slow-path kb_version (lock + open + legacy + read + publish on close)", &|| {
+            let _lock = acquire_os_lock(&dir).unwrap();
+            let db = store.open_db().unwrap();
+            Store::kb_version_locked(&db).unwrap();
+        });
+        store.kb_version().unwrap();
+        time("fast-path kb_version (stat + version file)", &|| { let _ = store.kb_version().unwrap(); });
+        time("filter_active, one id (one open, publishes on close)", &|| { let _ = store.filter_active(&[1]).unwrap(); });
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
