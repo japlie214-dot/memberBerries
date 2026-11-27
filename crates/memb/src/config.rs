@@ -71,6 +71,8 @@ pub struct Embeddings {
     pub auto_download: bool,
     pub snowflake: Option<Snowflake>,
     pub mrl_dim: Option<u32>,
+    /// ONNX Runtime threads for one embedding; unset means a default chosen from the cores.
+    pub threads: Option<u32>,
     // Accepted only to give a clear error: memb does not launch an embedding server.
     pub binary: Option<String>,
     pub model_path: Option<String>,
@@ -153,6 +155,7 @@ impl Default for Embeddings {
             auto_download: false,
             snowflake: None,
             mrl_dim: None,
+            threads: None,
             binary: None,
             model_path: None,
         }
@@ -341,6 +344,11 @@ impl Config {
                 return Err(format!("embeddings.mrl_dim must be one of {MRL_DIMS:?}"));
             }
         }
+        if let Some(t) = e.threads {
+            if !(1..=64).contains(&t) {
+                return Err("embeddings.threads must be 1 to 64".into());
+            }
+        }
         let c = &self.curator;
         if c.backend != "cli" {
             return Err("curator.backend must be \"cli\", the only supported backend".into());
@@ -394,6 +402,7 @@ impl Config {
         set("MEMB_EMBED_PORT", e.port.map(|p| p.to_string()));
         set("MEMB_EMBED_MODEL_ID", e.model_id.clone());
         set("MEMB_EMBED_MRL_DIM", e.mrl_dim.map(|d| d.to_string()));
+        set("MEMB_EMBED_THREADS", e.threads.map(|t| t.to_string()));
         if let Some(dir) = &e.gemma_model_dir {
             let dir = expand_path(dir, "embeddings.gemma_model_dir")?;
             set("MEMB_GEMMA_MODEL_DIR", Some(dir.to_string_lossy().into_owned()));
@@ -451,7 +460,7 @@ mod tests {
     use super::*;
 
     use super::ENV_LOCK as ENV;
-    const EMBED_VARS: [&str; 12] = [
+    const EMBED_VARS: [&str; 13] = [
         "MEMB_SNOWFLAKE_ACCOUNT",
         "MEMB_SNOWFLAKE_USER",
         "MEMB_SNOWFLAKE_ROLE",
@@ -461,6 +470,7 @@ mod tests {
         "MEMB_EMBED_PORT",
         "MEMB_EMBED_MODEL_ID",
         "MEMB_EMBED_MRL_DIM",
+        "MEMB_EMBED_THREADS",
         "MEMB_GEMMA_MODEL_DIR",
         "MEMB_EMBED_DISABLE",
         "MEMB_CFG_TEST_ROOT",
@@ -582,8 +592,8 @@ model = \"m;DROP\"
         let example = include_str!("../../../config.example.toml");
         assert_eq!(Config::parse(example).unwrap(), Config::default());
         // Every commented-out optional line must also be valid once uncommented.
-        const OPTIONAL: [&str; 5] =
-            ["port =", "model_id =", "gemma_model_dir =", "mrl_dim =", "obsidian_mirror_dir ="];
+        const OPTIONAL: [&str; 6] =
+            ["port =", "model_id =", "gemma_model_dir =", "mrl_dim =", "threads =", "obsidian_mirror_dir ="];
         let uncommented: String = example
             .lines()
             .map(|l| match l.strip_prefix("# ") {
@@ -599,6 +609,7 @@ model = \"m;DROP\"
             let all = Config::parse(&uncommented).unwrap();
             assert_eq!(all.embeddings.port, Some(18432));
             assert_eq!(all.embeddings.mrl_dim, Some(256));
+            assert_eq!(all.embeddings.threads, Some(4));
             assert!(all.scheduler.obsidian_mirror_dir.is_some());
             assert!(all.embeddings.gemma_model_dir.is_some());
         });
@@ -773,13 +784,14 @@ cli_command = \"{default}\"
         with_clean_env(|| {
             std::env::set_var("MEMB_CFG_TEST_ROOT", if cfg!(windows) { r"C:\models" } else { "/models" });
             let cfg = Config::parse(
-                "[embeddings]\nport = 18432\nmodel_id = \"m-1\"\nmrl_dim = 256\ngemma_model_dir = \"%MEMB_CFG_TEST_ROOT%/gemma\"\n",
+                "[embeddings]\nport = 18432\nmodel_id = \"m-1\"\nmrl_dim = 256\nthreads = 3\ngemma_model_dir = \"%MEMB_CFG_TEST_ROOT%/gemma\"\n",
             )
             .unwrap();
             cfg.apply_embedding_env().unwrap();
             assert_eq!(std::env::var("MEMB_EMBED_PORT").unwrap(), "18432");
             assert_eq!(std::env::var("MEMB_EMBED_MODEL_ID").unwrap(), "m-1");
             assert_eq!(std::env::var("MEMB_EMBED_MRL_DIM").unwrap(), "256");
+            assert_eq!(std::env::var("MEMB_EMBED_THREADS").unwrap(), "3");
             let dir = std::env::var("MEMB_GEMMA_MODEL_DIR").unwrap();
             assert!(dir.contains("models") && dir.ends_with("gemma") && !dir.contains('%'), "{dir}");
             assert!(std::env::var_os("MEMB_EMBED_DISABLE").is_none());

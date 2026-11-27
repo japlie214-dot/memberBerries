@@ -18,13 +18,24 @@ pub const QUERY_PREFIX: &str = "task: search result | query: ";
 const MAX_TOKENS: usize = 8192;
 const QUERY_MAX_TOKENS: usize = 512;
 
-/// Threads ONNX Runtime may use inside one embedding: 2 unless `MEMB_EMBED_THREADS` (1 to 64) says otherwise.
-fn intra_threads() -> usize {
+/// Highest default thread count: more threads than this stopped paying for themselves in
+/// the measurements (evidence/t038-embedding-threads.md).
+pub const MAX_DEFAULT_THREADS: usize = 8;
+
+/// Default ONNX Runtime threads for one embedding on a machine with `physical_cores`:
+/// half of the physical cores, at least 2, never above `MAX_DEFAULT_THREADS`.
+pub fn default_threads(physical_cores: usize) -> usize {
+    (physical_cores / 2).clamp(2, MAX_DEFAULT_THREADS)
+}
+
+/// Threads ONNX Runtime may use inside one embedding: `MEMB_EMBED_THREADS` (1 to 64, also
+/// set from `embeddings.threads`) when valid, else `default_threads` for this machine.
+pub fn intra_threads() -> usize {
     std::env::var("MEMB_EMBED_THREADS")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| (1..=64).contains(n))
-        .unwrap_or(2)
+        .unwrap_or_else(|| default_threads(memb_win::probe_hardware().physical_cores))
 }
 
 fn tokens(values: &[u32], query: bool) -> Vec<i64> {
@@ -299,6 +310,12 @@ mod tests {
         // Identical bytes in the two variants still give different identities (so vectors never mix).
         assert_ne!(model_identity(&q4).unwrap(), model_identity(&q8).unwrap());
         std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn default_threads_is_half_the_cores_between_2_and_8() {
+        let got: Vec<usize> = [1, 2, 4, 8, 12, 16, 64].iter().map(|c| default_threads(*c)).collect();
+        assert_eq!(got, [2, 2, 2, 4, 6, 8, 8]);
+        assert!((2..=MAX_DEFAULT_THREADS).contains(&default_threads(memb_win::probe_hardware().physical_cores)));
     }
     #[test]
     fn missing_model_returns_error() {

@@ -21,6 +21,7 @@ ignore_dirs = []             # patterns such as "*/tmp/*": matching working dire
 
 [embeddings]
 enabled = true               # false forces lexical-only search
+# threads = 4    # 1..=64: ONNX Runtime threads per embedding; unset picks half the physical cores (2 to 8), see wiki/Configuration.md
 # Off by default. Setting a port SENDS note text and queries to that loopback service
 # (a llama-server you start yourself; memb does not launch it).
 # port = 18432

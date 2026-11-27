@@ -5,6 +5,10 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.16.0 (2026-11-27)
+
+- **Change (T038):** `embeddings.threads` (1 to 64) sets the ONNX Runtime threads used for one embedding; `MEMB_EMBED_THREADS` still overrides it (the environment wins over the file). The default is half the physical cores, at least 2 and at most 8, replacing the fixed 2: 6 on a 12-core machine, 2 on a 4-core one. Measured short-query p50 on the 12-core test machine: 154 ms at 2 threads (quiet run), then 87, 97 and 94 ms at 6, 8 and 12 threads; those last three are within noise of each other, so the rule is a resource-based rule of thumb that the data supports, not a measured optimum. The 2- and 4-thread rows of the new sweep ran on a busy machine (see `evidence/t038-embedding-threads.md`).
+
 ## 0.15.1 (2026-11-27)
 
 - **Fix (T029):** the knowledge-base version check on every search no longer opens the database (about 34-58 ms in a release build). A small `kb.version` file records the version together with the length and modified time of `memory.redb`; a reader trusts it only while those still match, otherwise it reads the database (about 24 ms) and rewrites the file, so a change made by another process, a writer that crashed before updating the file, or an older memb that never writes it is still seen on the next query. A check that hits takes about 1.5 ms. Residual: a non-publishing writer that commits at an identical file length inside the same file-timestamp tick as the last publish would go unnoticed (opening the database takes longer than a tick, see `evidence/t029-version-check.md`). Every database open now also rewrites the small file on close.
