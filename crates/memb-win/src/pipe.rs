@@ -7,7 +7,7 @@
 use std::fs::File;
 use std::io;
 use std::os::windows::io::FromRawHandle;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -149,7 +149,6 @@ impl Drop for PipeListener {
         if !self.pending.is_null() {
             unsafe { CloseHandle(self.pending) };
         }
-        let _ = null::<u8>();
     }
 }
 

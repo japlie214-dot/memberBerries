@@ -5,6 +5,10 @@ One iteration is one version. Before a new package is built, the number goes up
 entry for the new version). While the version is below 1.0.0: **minor** = an iteration that
 adds or changes behaviour, **patch** = an iteration of fixes only. 1.0.0 is the release gate (T014). Commits that change only evidence or wiki text and ship in no package do not need their own number.
 
+## 0.13.2 (2026-11-27)
+
+- **Fix (T043):** a hook no longer waits for the embedding model to reload. When the shared service is running but has unloaded its model after 5 idle minutes, loading it takes longer than the 10 s hook timeout; hooks now give up after 2 s (and skip the service for the rest of that hook), answer lexically, and the model is warm for the next request. Searches from the MCP server and CLI still wait.
+
 ## 0.13.1 (2026-11-27)
 
 - **Fix (T042):** the shared embedding service no longer keeps the caller waiting. It was started with the caller's inherited handles, so anything that captured memb's output (a host, a shell, a hook runner) saw no end-of-output until the service exited 15 minutes later. It is now started by `memb_win::spawn::spawn_detached`, which passes no handles at all.

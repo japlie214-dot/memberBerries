@@ -58,6 +58,10 @@ pub enum StartMode {
 
 static SERVICE: std::sync::OnceLock<ServiceConfig> = std::sync::OnceLock::new();
 
+/// Set by a `Kick` (hook) process after its first failed or timed-out service request.
+#[cfg(windows)]
+static SERVICE_GAVE_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn configure_service(config: ServiceConfig) {
     let _ = SERVICE.set(config);
 }
@@ -71,6 +75,17 @@ pub fn start_service(exe: &std::path::Path) -> std::io::Result<()> {
     // a shell, a hook runner) would wait for the service to exit before seeing end-of-output.
     memb_win::spawn::spawn_detached(exe, &["embed-service"], true)
         .or_else(|_| memb_win::spawn::spawn_detached(exe, &["embed-service"], false))
+}
+
+/// How long one request to a running service may take. A hook must answer within its host's
+/// timeout, and a service whose model was unloaded while idle needs 10 s or more to load it
+/// again, so a hook gives up quickly (lexical answer now; the request has already made the
+/// service start loading, so the next one is fast).
+pub fn call_deadline(mode: StartMode) -> std::time::Duration {
+    match mode {
+        StartMode::Kick => std::time::Duration::from_secs(2),
+        StartMode::Wait => std::time::Duration::from_secs(90),
+    }
 }
 
 /// Embeds through the shared service. `Err` means "no vector now": the callers fall back
@@ -90,9 +105,19 @@ fn service_embed(config: &ServiceConfig, text: &str, is_query: bool) -> Result<(
             Err(r.error.unwrap_or_else(|| "the embedding service failed".into()))
         }
     };
-    match call(&config.name, &request, Duration::from_secs(90)) {
+    // A hook embeds several texts; once one request has failed or timed out the rest would each
+    // wait the full deadline again, so they are answered lexically at once.
+    if config.start == StartMode::Kick && SERVICE_GAVE_UP.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("the embedding service is not answering in time; lexical search for now".into());
+    }
+    match call(&config.name, &request, call_deadline(config.start)) {
         Ok(r) => answer(r),
-        Err(CallError::Failed(reason)) => Err(reason),
+        Err(CallError::Failed(reason)) => {
+            if config.start == StartMode::Kick {
+                SERVICE_GAVE_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(reason)
+        }
         Err(CallError::NotRunning) => {
             start_service(&config.exe).map_err(|e| format!("cannot start the embedding service: {e}"))?;
             if config.start == StartMode::Kick {
@@ -580,6 +605,13 @@ fn fuse(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_hook_gives_up_on_a_slow_service_far_sooner_than_the_hook_timeout() {
+        let hook = super::call_deadline(super::StartMode::Kick);
+        assert!(hook <= std::time::Duration::from_secs(3), "well inside the 10 s hook timeout");
+        assert!(super::call_deadline(super::StartMode::Wait) >= std::time::Duration::from_secs(60), "a search waits for the model to load");
+    }
+
     use super::*;
     use memb_core::{Draft, Kind};
     use std::collections::BTreeMap;
